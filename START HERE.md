@@ -19,7 +19,7 @@ The setup screen walks you through 5 steps, with instructions on each:
 |---|---|---|
 | 1. Google Sheet | An empty Google Sheet + a **service account key (.json)** | sheets.new and console.cloud.google.com (enable Google Sheets API → Credentials → Service account → Keys → JSON). Then **share the sheet** with the service account email as **Editor** |
 | 2. Gmail | A Gmail **App Password** for aavoraa.marketing@gmail.com | myaccount.google.com → Security → 2-Step Verification ON → "App passwords". Also turn on IMAP in Gmail settings |
-| 3. Gemini AI | API key | aistudio.google.com → Get API key |
+| 3. ChatGPT AI | OpenAI API key (starts with `sk-`) | platform.openai.com → Billing → add credit (e.g. $5), then platform.openai.com/api-keys → Create new secret key. A ChatGPT Plus plan does not include API use |
 | 4. Apify | API token | apify.com → Settings → API & Integrations |
 | 5. Owner login | Your username + password | You choose |
 

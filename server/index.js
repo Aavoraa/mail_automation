@@ -80,7 +80,7 @@ async function canEditConnections(req) {
 app.get('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
   const c = config.get(); const mask = v => v ? '•••• saved' : '';
-  res.json({ sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), network: lanUrls() });
+  res.json({ sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), network: lanUrls() });
 }));
 app.post('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
@@ -93,6 +93,11 @@ app.post('/api/connections', wrap(async (req, res) => {
   }
   if (b.gmailUser) patch.gmailUser = String(b.gmailUser).trim();
   if (b.gmailAppPassword && !String(b.gmailAppPassword).startsWith('••')) patch.gmailAppPassword = String(b.gmailAppPassword).replace(/\s+/g, '');
+  if (b.openaiKey && !String(b.openaiKey).startsWith('••')) {
+    const k = String(b.openaiKey).trim();
+    if (!/^sk-[A-Za-z0-9_-]{20,}$/.test(k)) throw new Error('That does not look like a ChatGPT (OpenAI) API key. It starts with "sk-" and comes from platform.openai.com/api-keys.');
+    patch.openaiKey = k;
+  }
   if (b.geminiKey && !String(b.geminiKey).startsWith('••')) patch.geminiKey = String(b.geminiKey).trim();
   if (b.apifyToken && !String(b.apifyToken).startsWith('••')) patch.apifyToken = String(b.apifyToken).trim();
   config.set(patch);
@@ -103,7 +108,14 @@ app.post('/api/connections/test', wrap(async (req, res) => {
   const what = (req.body || {}).what;
   if (what === 'sheet') { const r = await store.ensureTabs(); return res.json({ ok: true, msg: `Connected to "${r.title}". Tabs are ready.` }); }
   if (what === 'gmail') { await mail.test(); return res.json({ ok: true, msg: 'Gmail connected (sending and reading).' }); }
-  if (what === 'gemini') { const a = await gemini('Return ONLY this JSON: {"ok": true}', 'auto'); if (!a) throw new Error('Gemini answered but not as expected.'); const { currentModel } = require('./ai'); return res.json({ ok: true, msg: `Gemini AI is working (model: ${currentModel() || 'auto'}).` }); }
+  if (what === 'openai' || what === 'gemini') {
+    const ai = require('./ai');
+    if (what === 'openai' && !config.get().openaiKey) throw new Error('Paste your ChatGPT (OpenAI) API key first.');
+    ai.configure(await store.settings().catch(() => ({})));
+    const a = await gemini('Return ONLY this JSON: {"ok": true}', 'auto', { priority: 'reply' });
+    if (!a) throw new Error(`${ai.aiName()} answered but not as expected.`);
+    return res.json({ ok: true, msg: `${ai.aiName()} is working (model: ${ai.currentModel() || 'auto'}).` });
+  }
   if (what === 'apify') {
     if (process.env.AAVORAA_MOCK === '1') return res.json({ ok: true, msg: 'Apify connected.' });
     const r = await fetch('https://api.apify.com/v2/users/me?token=' + encodeURIComponent(config.get().apifyToken || ''));
@@ -271,7 +283,7 @@ app.post('/api/templates/preview', need('owner', 'leader'), wrap(async (req, res
     const tpl = { Name: b.Name || 'Preview', Subject: b.Subject || '', Body: b.Body || '', 'AI Personalise': b['AI Personalise'] || 'yes' };
     const vars = leadVars(lead, s);
     if (tpl['AI Personalise'] === 'no') out = { subject: fill(tpl.Subject || (stage === 0 ? 'quick idea for {{business}}' : ''), vars), body: fill(tpl.Body, vars) };
-    else { const a = await gemini(P.email(s, lead, stage, tpl.Body ? { ...tpl, Body: fill(tpl.Body, vars), Subject: fill(tpl.Subject, vars) } : null), s.GEMINI_MODEL); if (!a) throw new Error('AI did not answer, try again.'); out = { subject: clean(a.subject), body: clean(a.body) }; }
+    else { const a = await gemini(P.email(s, lead, stage, tpl.Body ? { ...tpl, Body: fill(tpl.Body, vars), Subject: fill(tpl.Subject, vars) } : null), s.GEMINI_MODEL, { priority: 'send' }); if (!a) throw new Error('AI did not answer, try again.'); out = { subject: clean(a.subject), body: clean(a.body) }; }
     if (stage > 0) out.subject = 'Re: ' + (lead['Email Subject'] || 'quick idea');
   } else out = { subject: '', body: fill(b.Body, leadVars(lead, s)) };
   const sig = ['Warm regards,', s.SENDER_NAME, [s.SENDER_TITLE, s.COMPANY].filter(Boolean).join(' | '), [s.WEBSITE, s.COMPANY_ADDRESS].filter(Boolean).join(' | ')].join('\n');

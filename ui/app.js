@@ -76,8 +76,8 @@ async function pageSetup() {
   let conn = {}; try { conn = await api('/connections'); } catch (e) {}
   const st = S.state;
   let step = st.configured ? 5 : (Number(sessionStorage.getItem('aav_step')) || 1);
-  const done = { 1: !!conn.serviceAccountEmail && !!conn.sheetUrl, 2: !!conn.gmailUser && !!conn.gmailAppPassword, 3: !!conn.geminiKey, 4: !!conn.apifyToken };
-  const names = ['Google Sheet', 'Gmail', 'Gemini AI', 'Apify', 'Owner account'];
+  const done = { 1: !!conn.serviceAccountEmail && !!conn.sheetUrl, 2: !!conn.gmailUser && !!conn.gmailAppPassword, 3: !!(conn.openaiKey || conn.geminiKey), 4: !!conn.apifyToken };
+  const names = ['Google Sheet', 'Gmail', 'ChatGPT AI', 'Apify', 'Owner account'];
   const go = n => { sessionStorage.setItem('aav_step', n); pageSetup(); };
   const body = {
     1: `<h2>1. Connect your Google Sheet</h2>
@@ -99,9 +99,9 @@ async function pageSetup() {
       <li>In Gmail → Settings → See all settings → Forwarding and POP/IMAP → <b>Enable IMAP</b> → Save.</li></ol></div>
       <div class="row2"><label class="f"><span>Gmail address</span><input type="email" id="gmailUser" value="${esc(conn.gmailUser || 'aavoraa.marketing@gmail.com')}"></label>
       <label class="f"><span>App password (16 letters)</span><input type="password" id="gmailAppPassword" value="${esc(conn.gmailAppPassword || '')}" placeholder="abcd efgh ijkl mnop" autocomplete="off"></label></div>`,
-    3: `<h2>3. Connect Gemini AI (free)</h2>
-      <div class="how"><ol><li>Open <b>aistudio.google.com</b> → sign in → <b>Get API key</b> → Create API key.</li><li>Copy it and paste it below.</li></ol></div>
-      <label class="f"><span>Gemini API key</span><input type="password" id="geminiKey" value="${esc(conn.geminiKey || '')}" autocomplete="off"></label>`,
+    3: `<h2>3. Connect ChatGPT (OpenAI)</h2>
+      <div class="how">ChatGPT writes every email and every reply to your leads.<ol><li>Open <b>platform.openai.com</b> and sign in (a ChatGPT Plus plan does not include this, the API is billed separately).</li><li>Settings → <b>Billing</b> → add a little credit, e.g. $5. Without credit the key does not work.</li><li>Open <b>platform.openai.com/api-keys</b> → <b>Create new secret key</b> → copy it (it starts with <code>sk-</code>) and paste it below.</li></ol>A typical day of emails and replies costs a few cents.</div>
+      <label class="f"><span>ChatGPT (OpenAI) API key</span><input type="password" id="openaiKey" value="${esc(conn.openaiKey || '')}" placeholder="sk-…" autocomplete="off"></label>`,
     4: `<h2>4. Connect Apify (free $5 credit every month)</h2>
       <div class="how">Apify searches Google Maps and Google for new leads.<ol><li>Sign up free at <b>apify.com</b>.</li><li>Settings → <b>API &amp; Integrations</b> → copy the Personal API token → paste below.</li></ol></div>
       <label class="f"><span>Apify API token</span><input type="password" id="apifyToken" value="${esc(conn.apifyToken || '')}" autocomplete="off"></label>`,
@@ -132,10 +132,10 @@ async function pageSetup() {
   }
   const save = async () => {
     const b = {};
-    for (const id of ['sheetUrl', 'gmailUser', 'gmailAppPassword', 'geminiKey', 'apifyToken']) if ($('#' + id)) b[id] = $('#' + id).value.trim();
+    for (const id of ['sheetUrl', 'gmailUser', 'gmailAppPassword', 'openaiKey', 'apifyToken']) if ($('#' + id)) b[id] = $('#' + id).value.trim();
     await api('/connections', { method: 'POST', body: b });
   };
-  const testName = { 1: 'sheet', 2: 'gmail', 3: 'gemini', 4: 'apify' }[step];
+  const testName = { 1: 'sheet', 2: 'gmail', 3: 'openai', 4: 'apify' }[step];
   const test = async () => { await save(); const r = await api('/connections/test', { method: 'POST', body: { what: testName } }); msg(r.msg, 'ok'); return r; };
   if ($('#back')) $('#back').onclick = () => go(step - 1);
   if ($('#test')) $('#test').onclick = e => busy(e.currentTarget, test);
@@ -444,10 +444,10 @@ async function pageConnections(el) {
       <label class="f"><span>Service account</span><input type="text" value="${esc(c.serviceAccountEmail)}" disabled><small>Replace the key: <a href="#" id="rk">upload a new .json</a></small><input type="file" id="saFile" class="hidden" accept=".json"></label>
       <label class="f"><span>Gmail address</span><input type="email" id="gmailUser" value="${esc(c.gmailUser)}"></label>
       <label class="f"><span>Gmail app password</span><input type="password" id="gmailAppPassword" value="${esc(c.gmailAppPassword)}" autocomplete="off"></label>
-      <label class="f"><span>Gemini API key</span><input type="password" id="geminiKey" value="${esc(c.geminiKey)}" autocomplete="off"></label>
+      <label class="f"><span>ChatGPT (OpenAI) API key</span><input type="password" id="openaiKey" value="${esc(c.openaiKey)}" placeholder="sk-…" autocomplete="off"><small>From platform.openai.com/api-keys (needs credit on your OpenAI account)${!c.openaiKey && c.geminiKey ? '. Until you add it, your old Gemini key is used.' : ''}</small></label>
       <label class="f"><span>Apify token</span><input type="password" id="apifyToken" value="${esc(c.apifyToken)}" autocomplete="off"></label></div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn primary" id="sv">Save</button>${['sheet', 'gmail', 'gemini', 'apify'].map(w => `<button class="btn" data-t="${w}">Test ${w === 'sheet' ? 'Google Sheet' : w === 'gmail' ? 'Gmail' : w === 'gemini' ? 'Gemini' : 'Apify'}</button>`).join('')}</div><div id="msg" style="margin-top:14px"></div></div>`;
-  const save = async () => { const b = {}; for (const id of ['sheetUrl', 'gmailUser', 'gmailAppPassword', 'geminiKey', 'apifyToken']) b[id] = $('#' + id).value.trim(); await api('/connections', { method: 'POST', body: b }); };
+      <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn primary" id="sv">Save</button>${['sheet', 'gmail', 'openai', 'apify'].map(w => `<button class="btn" data-t="${w}">Test ${w === 'sheet' ? 'Google Sheet' : w === 'gmail' ? 'Gmail' : w === 'openai' ? 'ChatGPT' : 'Apify'}</button>`).join('')}</div><div id="msg" style="margin-top:14px"></div></div>`;
+  const save = async () => { const b = {}; for (const id of ['sheetUrl', 'gmailUser', 'gmailAppPassword', 'openaiKey', 'apifyToken']) b[id] = $('#' + id).value.trim(); await api('/connections', { method: 'POST', body: b }); };
   $('#sv').onclick = e => busy(e.currentTarget, async () => { await save(); toast('Saved'); });
   $$('[data-t]').forEach(b => b.onclick = () => busy(b, async () => { try { await save(); const r = await api('/connections/test', { method: 'POST', body: { what: b.dataset.t } }); $('#msg').innerHTML = `<div class="notice ok">${esc(r.msg)}</div>`; } catch (err) { $('#msg').innerHTML = `<div class="notice err">${esc(err.message)}</div>`; } }));
   $('#rk').onclick = e => { e.preventDefault(); $('#saFile').click(); };

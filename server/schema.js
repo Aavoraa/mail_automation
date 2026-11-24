@@ -46,7 +46,11 @@ const SETTINGS = [
   ['INDUSTRIES', INDUSTRIES, 'Comma separated. One is picked at random each search', 'Targets', 'textarea'],
   ['CITIES', CITIES, 'Comma separated. Any city or country', 'Targets', 'textarea'],
   ['SERVICES', SERVICES, 'What the AI is allowed to offer', 'Targets', 'textarea'],
-  ['GEMINI_MODEL', 'auto', 'auto = always use the newest Gemini Flash model your key can use (recommended). Or type an exact model name', 'Advanced', 'text'],
+  ['OPENAI_MODEL', 'auto', 'ChatGPT model. auto = a fast, low-cost model your key can use (recommended). Or type an exact name, e.g. gpt-4.1-mini', 'Advanced', 'text'],
+  ['OPENAI_DAILY_LIMIT', '500', 'Most ChatGPT requests per day, to cap your OpenAI bill (about 1 request per email or reply). Some are always kept for answering customer replies', 'Advanced', 'number'],
+  ['AI_FALLBACK', 'template', 'When the AI is out of requests: template = still send pitches using your template (or a plain email), wait = hold pitches until the AI is back', 'Advanced', 'select', ['template', 'wait']],
+  ['AI_DAILY_LIMIT', '20', 'Only used if no ChatGPT key is saved (old Gemini key): Gemini requests per day (free keys: 20)', 'Advanced', 'number'],
+  ['GEMINI_MODEL', 'auto', 'Only used if no ChatGPT key is saved (old Gemini key). auto = newest Gemini Flash model', 'Advanced', 'text'],
 ];
 
 const TONES = {
