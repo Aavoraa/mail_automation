@@ -94,8 +94,14 @@ app.post('/api/connections', wrap(async (req, res) => {
   if (b.gmailUser) patch.gmailUser = String(b.gmailUser).trim();
   if (b.gmailAppPassword && !String(b.gmailAppPassword).startsWith('••')) patch.gmailAppPassword = String(b.gmailAppPassword).replace(/\s+/g, '');
   if (b.openaiKey && !String(b.openaiKey).startsWith('••')) {
-    const k = String(b.openaiKey).trim();
-    if (!/^sk-[A-Za-z0-9_-]{20,}$/.test(k)) throw new Error('That does not look like a ChatGPT (OpenAI) API key. It starts with "sk-" and comes from platform.openai.com/api-keys.');
+    // forgive copy problems: spaces or line breaks inside, quotes around it, invisible characters
+    const k = String(b.openaiKey).replace(/[\s​-‍﻿"'`]/g, '');
+    if (!/^sk-[A-Za-z0-9_\-.]{20,}$/.test(k)) {
+      const what = k ? `What was pasted starts with "${k.slice(0, 6)}…" and is ${k.length} characters long` : 'Nothing was pasted';
+      throw new Error(`That is not a ChatGPT (OpenAI) API key. ${what}, but an OpenAI key starts with "sk-" and is much longer. ` +
+        (/^AQ\.|^AIza/.test(k) ? 'This looks like the old Google Gemini key. ' : '') +
+        'On the OpenAI page, select the whole key and press Ctrl+C (the Copy button may not reach Windows), then paste it here with Ctrl+V.');
+    }
     patch.openaiKey = k;
   }
   if (b.geminiKey && !String(b.geminiKey).startsWith('••')) patch.geminiKey = String(b.geminiKey).trim();

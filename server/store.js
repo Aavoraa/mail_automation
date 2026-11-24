@@ -29,7 +29,7 @@ class SheetStore {
   async api(method, path, body, attempt = 0) {
     const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${this.sheetId}${path}`, {
       method, headers: { Authorization: `Bearer ${await this.token()}`, 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined,
+      body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(60000), // never wait forever
     });
     if (res.status === 429 && attempt < 4) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return this.api(method, path, body, attempt + 1); }
     const text = await res.text();

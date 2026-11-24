@@ -15,6 +15,7 @@ const TABS = {
 // [key, default, help, group, type, options]
 const SETTINGS = [
   ['AGENT_ON', 'yes', 'Master switch for the whole agent', 'Agent', 'switch'],
+  ['REPLY_FALLBACK_MINUTES', '60', 'If the AI is unavailable when a lead replies, wait this many minutes, then send a short polite holding reply and alert the team leader. Type off to always wait for the AI', 'Agent', 'text'],
   ['REPLY_MODE', 'send', 'send = agent replies by itself. draft = replies are saved as Gmail drafts for you to check', 'Agent', 'select', ['send', 'draft']],
   ['TONE', 'Warm & friendly', 'How every email and message sounds', 'Writing', 'select', ['Warm & friendly', 'Formal & professional', 'Short & direct', 'Consultative expert']],
   ['EMAIL_LANGUAGE', 'auto', 'auto = the language of the lead\'s website, or type a language like English', 'Writing', 'text'],

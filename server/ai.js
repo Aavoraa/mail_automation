@@ -10,7 +10,7 @@ async function listModels(key) {
   if (modelCache.key === key && modelCache.list && Date.now() - modelCache.at < 6 * 3600e3) return modelCache.list;
   const out = []; let page = '';
   for (let i = 0; i < 5; i++) {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200${page ? '&pageToken=' + page : ''}`, { headers: { 'x-goog-api-key': key } });
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200${page ? '&pageToken=' + page : ''}`, { headers: { 'x-goog-api-key': key }, signal: AbortSignal.timeout(30000) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error('Gemini: ' + ((j.error && j.error.message) || r.status));
     for (const m of j.models || []) if ((m.supportedGenerationMethods || []).includes('generateContent')) out.push(String(m.name).replace(/^models\//, ''));
@@ -37,7 +37,12 @@ function bestModel(list) {
 const retired = new Set();
 async function pickModel(key, wanted) {
   const w = String(wanted || '').trim().replace(/^models\//, '');
-  if (w && w.toLowerCase() !== 'auto' && !retired.has(w)) return w; // a specific model typed in Settings
+  if (w && w.toLowerCase() !== 'auto' && !retired.has(w)) {
+    // a specific model typed in Settings: use it only if Google still offers it, otherwise choose automatically
+    const have = await listModels(key).catch(() => null);
+    if (!have || have.includes(w)) return w;
+    retired.add(w); console.warn(`[ai] GEMINI_MODEL "${w}" does not exist for this key, choosing a model automatically`);
+  }
   if (modelCache.key === key && modelCache.chosen && !retired.has(modelCache.chosen)) return modelCache.chosen;
   const list = (await listModels(key)).filter(n => !retired.has(n));
   if (!list.length) throw new Error('Gemini: your API key has no text models available. Create a new key at aistudio.google.com.');
@@ -119,7 +124,7 @@ async function gemini(prompt, model, opts = {}) {
   let res;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(use)}:generateContent`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: AbortSignal.timeout(90000), // never wait forever
       body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.7, responseMimeType: 'application/json' } }),
     });
   } catch (e) {
@@ -164,7 +169,7 @@ async function openaiPick(key) {
   if (oaCache.key === key && oaCache.chosen && !oaRetired.has(oaCache.chosen) && Date.now() - oaCache.at < 6 * 3600e3) return oaCache.chosen;
   let ids = [];
   try {
-    const r = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: 'Bearer ' + key } });
+    const r = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(30000) });
     const j = await r.json().catch(() => ({}));
     if (r.status === 401) throw new Error('ChatGPT: this API key was not accepted. Create a new one at platform.openai.com/api-keys.');
     ids = (j.data || []).map(m => m.id);
@@ -182,7 +187,7 @@ async function openaiCall(prompt, opts = {}) {
   let res;
   try {
     res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(90000), // never wait forever
       body: JSON.stringify({ model: use, messages: [{ role: 'user', content: prompt }], response_format: { type: 'json_object' } }),
     });
   } catch (e) {

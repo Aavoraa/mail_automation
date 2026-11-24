@@ -29,8 +29,8 @@ function dailyLimit(s) {
 function sentOn(rows, d) { return rows.filter(r => [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(d)).length; }
 
 // ---------------------------------------------------------------- state + log
-const state = Object.assign({ lastRun: {}, lastResult: {}, seen: [], reportDay: '', tries: {} }, config.loadState());
-state.tries = state.tries || {};
+const state = Object.assign({ lastRun: {}, lastResult: {}, seen: [], reportDay: '', tries: {}, firstSeen: {} }, config.loadState());
+state.tries = state.tries || {}; state.firstSeen = state.firstSeen || {};
 const running = {};
 const logs = [];
 function log(job, msg, level = 'info') {
@@ -154,8 +154,10 @@ async function sendEmails(s, opts = {}) {
   }
   const jobs = [...due, ...fresh].slice(0, slots);
   let sent = 0;
+  if (jobs.length) log('send', `Emailing ${jobs.length} lead(s) now (${due.length} follow-ups due, ${fresh.length} new waiting, ${slots} allowed this hour)`);
   for (const [i, { lead, stage }] of jobs.entries()) {
     if (!yes((await store.settings()).AGENT_ON)) { log('send', 'Agent switched off, stopping'); break; }
+    log('send', `${i + 1}/${jobs.length}: writing ${['first email', 'follow-up 1', 'follow-up 2'][stage]} for ${lead['Business Name']}`);
     let e;
     try { e = await writeEmail(s, lead, stage); } catch (err) {
       if (aiUnavailable(err)) { log('send', `Waiting for the AI before emailing more leads: ${err.message}`, 'warn'); break; } // lead stays as it is and is tried next hour
@@ -187,6 +189,23 @@ async function sendEmails(s, opts = {}) {
 }
 
 // ---------------------------------------------------------------- 03 replies
+// Reply without AI: only safe, factual sentences. Never a pitch to someone who said stop, never an answer to an auto-reply.
+function safeReply(s, lead, m, text) {
+  const t = (String(m.subject || '') + '\n' + text).toLowerCase();
+  const name = ai.firstName(lead['Contact Name'] || m.fromName || '');
+  const base = { lead_score: 'Warm', safe: true, next_step: 'Answer them personally from Gmail' };
+  if (/unsubscribe|remove (me|us)|take (me|us) off|stop (emailing|sending|contacting)|do ?n[o']t (contact|email|send)|^\s*(no|stop)\.?\s*$/.test(text.toLowerCase()) || /unsubscribe/.test(t))
+    return { ...base, category: 'unsubscribe', reply: '', summary: 'Asked us to stop emailing' };
+  if (/out of (the )?office|automatic reply|auto[- ]?reply|autoreply|on (annual |maternity |paternity )?leave|away (from|until)|vacation|limited access to (my )?e-?mail/.test(t))
+    return { ...base, category: 'out_of_office', reply: '', summary: 'Automatic out-of-office reply' };
+  if (/not interested|no,? thanks|no thank you|not (a )?(right )?fit|we('| a)re (all )?(set|good)|already (have|work with)|not (looking|needed)|no need/.test(t))
+    return { ...base, category: 'not_interested', summary: 'Not interested', reply: `Hi ${name}, thank you for letting me know. I won't email again. Wishing you and ${shortName(lead['Business Name'])} all the best.` };
+  const interested = /interest|yes|sure|call|meet|meeting|price|pricing|quote|cost|budget|details|more info|tell me more|send (me|over)|proposal|audit|demo|available|when can/.test(t);
+  const booking = s.BOOKING_LINK ? `\n\nIf it's easier, you can pick a time for a short call here: ${s.BOOKING_LINK}` : '';
+  return { ...base, category: interested ? 'interested' : 'question', summary: 'Replied while the AI was unavailable, holding reply sent, please answer personally',
+    reply: `Hi ${name}, thank you for getting back to me. ${s.TEAM_LEADER_NAME ? s.TEAM_LEADER_NAME + ' from our team' : 'Someone from our team'} will reply to you personally with the details very shortly.${booking}` };
+}
+
 async function checkReplies(s) {
   const since = new Date(Date.now() - 3 * 86400000);
   const seen = new Set(state.seen);
@@ -221,11 +240,18 @@ async function checkReplies(s) {
     let a;
     try { a = (await ask()) || (await ask()); } catch (e) {
       if (aiUnavailable(e)) {
-        // do NOT mark this email as read: it is answered on the next check, as soon as the AI is available
-        waiting++; log('replies', `Reply from ${lead['Business Name']} (${from}) is waiting for the AI: ${e.message}`, 'warn');
-        continue;
-      }
-      log('replies', 'AI error: ' + e.message, 'warn'); a = null;
+        // wait for the AI first (best answer); if it is still out after REPLY_FALLBACK_MINUTES, send a safe reply without it
+        if (!state.firstSeen[m.messageId]) { state.firstSeen[m.messageId] = Date.now(); persist(); }
+        const got = Math.min(state.firstSeen[m.messageId], new Date(m.date || Date.now()).getTime() || Date.now());
+        const waited = (Date.now() - got) / 60000, limit = Number(s.REPLY_FALLBACK_MINUTES ?? 60);
+        if (!(limit >= 0) || waited < limit) {
+          // NOT marked as read: answered on a later check
+          waiting++; log('replies', `Reply from ${lead['Business Name']} (${from}) is waiting for the AI${limit >= 0 ? ` (a short reply goes out after ${limit} min if the AI is still out)` : ''}: ${e.message}`, 'warn');
+          continue;
+        }
+        log('replies', `AI still unavailable after ${Math.round(waited)} min, answering ${from} without it`, 'warn');
+        a = safeReply(s, lead, m, text);
+      } else { log('replies', 'AI error: ' + e.message, 'warn'); a = null; }
     }
     a = a || { category: 'other', reply: '', summary: 'AI could not read this reply - please check it in Gmail.' };
     const reply = clean(a.reply);
@@ -241,7 +267,7 @@ async function checkReplies(s) {
         a.summary = (a.summary || '') + ' (reply could not be sent, please answer from Gmail)';
       }
     }
-    done(m); handled++; delete state.tries[m.messageId];
+    done(m); handled++; delete state.tries[m.messageId]; delete state.firstSeen[m.messageId];
     const map = { interested: 'Interested', question: 'Replied', referral: 'Replied', other: 'Replied', not_interested: 'Not Interested', unsubscribe: 'Do Not Contact' };
     const set = { 'Last Reply On': today(), 'Reply Category': a.category, Notes: [lead.Notes, `${today()}: ${a.summary || a.category} (${replied ? (draft ? 'reply saved as draft' : 'agent replied') : 'no reply sent'})`].filter(Boolean).join(' | ').slice(0, 1500) };
     if (map[a.category]) set.Status = map[a.category];
@@ -253,6 +279,10 @@ async function checkReplies(s) {
       await upsertQualified(q);
       if (alert) await alertTeam(s, `Hot lead (email): ${q['Business Name']} - ${q['Service Needed']}`,
         `A lead replied to our email and is interested.\n\nBusiness: ${q['Business Name']}\nContact: ${q['Contact Name'] || '-'} | ${q.Email} | ${q.Phone || '-'}\nWebsite: ${q.Website}\nLinkedIn: ${q.LinkedIn || '-'}\nCountry: ${q.Country}\nService needed: ${q['Service Needed']}\nLead score: ${q['Lead Score']}\nBudget: ${q.Budget || '-'} | Timeline: ${q.Timeline || '-'}\n\nWhat they said:\n${q['Their Message']}\n\nSummary: ${q.Summary}\nSuggested next step: ${q['Next Step']}`);
+    } else if (a.safe && replied && a.category === 'question' && s.TEAM_LEADER_EMAIL) {
+      // the AI could not answer properly: a person must follow up
+      await alertTeam(s, `Lead replied, please answer: ${lead['Business Name']}`,
+        `${lead['Business Name']} (${from}) replied while the AI was unavailable. The agent sent a short holding reply saying our team will get back to them.\n\nWhat they said:\n${text.slice(0, 1500)}\n\nPlease answer them personally from Gmail (aavoraa.marketing@gmail.com).`);
     }
   }
   return `Checked ${msgs.length} new emails, ${handled} from leads answered` + (waiting ? `, ${waiting} waiting to be answered` : '');
