@@ -3,23 +3,74 @@ const config = require('./config');
 const { TONES } = require('./schema');
 
 let last = 0;
+// ---- model picking: uses the newest Gemini "flash" model your key can use, so Google retiring a model never breaks the agent
+let modelCache = { key: '', list: null, at: 0, chosen: '' };
+const verOf = n => { const m = String(n).match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
+async function listModels(key) {
+  if (modelCache.key === key && modelCache.list && Date.now() - modelCache.at < 6 * 3600e3) return modelCache.list;
+  const out = []; let page = '';
+  for (let i = 0; i < 5; i++) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200${page ? '&pageToken=' + page : ''}`, { headers: { 'x-goog-api-key': key } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error('Gemini: ' + ((j.error && j.error.message) || r.status));
+    for (const m of j.models || []) if ((m.supportedGenerationMethods || []).includes('generateContent')) out.push(String(m.name).replace(/^models\//, ''));
+    if (!j.nextPageToken) break; page = j.nextPageToken;
+  }
+  modelCache = { key, list: out, at: Date.now(), chosen: '' };
+  return out;
+}
+function bestModel(list) {
+  const skip = /image|tts|audio|live|embed|vision|thinking|robotics|computer|native|search|lite|nano|gemma|learnlm|aqa/i;
+  const score = n => {
+    let s = verOf(n) * 100;
+    if (/^gemini-\d+(\.\d+)?-flash$/.test(n)) s += 50;          // stable flash
+    else if (/^gemini-\d+(\.\d+)?-flash-latest$/.test(n)) s += 45;
+    else if (/flash/.test(n) && !/preview|exp/.test(n)) s += 30;
+    else if (/flash/.test(n)) s += 10;                            // preview flash
+    else if (/pro/.test(n) && !/preview|exp/.test(n)) s += 5;
+    else s -= 1000;
+    return s;
+  };
+  const c = list.filter(n => /^gemini-/.test(n) && !skip.test(n)).sort((a, b) => score(b) - score(a));
+  return c[0] || list.find(n => /flash/.test(n)) || list[0];
+}
+const retired = new Set();
+async function pickModel(key, wanted) {
+  const w = String(wanted || '').trim().replace(/^models\//, '');
+  if (w && w.toLowerCase() !== 'auto' && !retired.has(w)) return w; // a specific model typed in Settings
+  if (modelCache.key === key && modelCache.chosen && !retired.has(modelCache.chosen)) return modelCache.chosen;
+  const list = (await listModels(key)).filter(n => !retired.has(n));
+  if (!list.length) throw new Error('Gemini: your API key has no text models available. Create a new key at aistudio.google.com.');
+  modelCache.chosen = bestModel(list);
+  return modelCache.chosen;
+}
+const gone = msg => /no longer available|not found|is not supported|deprecated|retired|update your code/i.test(msg);
+
 async function gemini(prompt, model, attempt = 0) {
   if (process.env.AAVORAA_MOCK === '1') return mockAI(prompt);
   const key = config.get().geminiKey;
   if (!key) throw new Error('Gemini API key is missing (Connections page).');
+  const use = await pickModel(key, model);
   const gap = 6500 - (Date.now() - last); // free tier: about 10 requests a minute
   if (gap > 0) await new Promise(r => setTimeout(r, gap));
   last = Date.now();
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model || 'gemini-2.5-flash'}:generateContent`, {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(use)}:generateContent`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.7, responseMimeType: 'application/json' } }),
   });
-  if ((res.status === 429 || res.status >= 500) && attempt < 3) { await new Promise(r => setTimeout(r, 20000 * (attempt + 1))); return gemini(prompt, model, attempt + 1); }
   const j = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error('Gemini: ' + ((j.error && j.error.message) || res.status));
+  const msg = (j.error && j.error.message) || String(res.status);
+  if (!res.ok && (res.status === 404 || res.status === 400) && gone(msg) && attempt < 2) {
+    // the chosen model was retired: forget it and pick the newest available one
+    retired.add(use); modelCache.chosen = ''; modelCache.list = null;
+    return gemini(prompt, 'auto', attempt + 1);
+  }
+  if ((res.status === 429 || res.status >= 500) && attempt < 3) { await new Promise(r => setTimeout(r, 20000 * (attempt + 1))); return gemini(prompt, model, attempt + 1); }
+  if (!res.ok) throw new Error('Gemini: ' + msg);
   const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).filter(p => !p.thought).map(p => p.text || '').join('');
   return parseJSON(text);
 }
+const currentModel = () => modelCache.chosen || '';
 function parseJSON(text) {
   let t = String(text || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
   const s = t.indexOf('{'), e = t.lastIndexOf('}');
@@ -117,4 +168,4 @@ function mockAI(prompt) {
   return { subject: 'quick idea for you', body: 'Hi there, I noticed your website could load faster on mobile. Would a free short audit help?\n\nIf this isn\'t relevant, just reply \'no\' and I won\'t email again.' };
 }
 
-module.exports = { gemini, P, clean, fill, leadVars, firstName };
+module.exports = { gemini, currentModel, bestModel, P, clean, fill, leadVars, firstName };

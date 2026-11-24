@@ -103,7 +103,7 @@ app.post('/api/connections/test', wrap(async (req, res) => {
   const what = (req.body || {}).what;
   if (what === 'sheet') { const r = await store.ensureTabs(); return res.json({ ok: true, msg: `Connected to "${r.title}". Tabs are ready.` }); }
   if (what === 'gmail') { await mail.test(); return res.json({ ok: true, msg: 'Gmail connected (sending and reading).' }); }
-  if (what === 'gemini') { const a = await gemini('Return ONLY this JSON: {"ok": true}'); if (!a) throw new Error('Gemini answered but not as expected.'); return res.json({ ok: true, msg: 'Gemini AI is working.' }); }
+  if (what === 'gemini') { const a = await gemini('Return ONLY this JSON: {"ok": true}', 'auto'); if (!a) throw new Error('Gemini answered but not as expected.'); const { currentModel } = require('./ai'); return res.json({ ok: true, msg: `Gemini AI is working (model: ${currentModel() || 'auto'}).` }); }
   if (what === 'apify') {
     if (process.env.AAVORAA_MOCK === '1') return res.json({ ok: true, msg: 'Apify connected.' });
     const r = await fetch('https://api.apify.com/v2/users/me?token=' + encodeURIComponent(config.get().apifyToken || ''));

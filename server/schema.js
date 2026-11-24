@@ -46,7 +46,7 @@ const SETTINGS = [
   ['INDUSTRIES', INDUSTRIES, 'Comma separated. One is picked at random each search', 'Targets', 'textarea'],
   ['CITIES', CITIES, 'Comma separated. Any city or country', 'Targets', 'textarea'],
   ['SERVICES', SERVICES, 'What the AI is allowed to offer', 'Targets', 'textarea'],
-  ['GEMINI_MODEL', 'gemini-2.5-flash', 'The AI model. Leave as is unless told otherwise', 'Advanced', 'text'],
+  ['GEMINI_MODEL', 'auto', 'auto = always use the newest Gemini Flash model your key can use (recommended). Or type an exact model name', 'Advanced', 'text'],
 ];
 
 const TONES = {
