@@ -295,7 +295,7 @@ async function pageQualified(el) {
           <textarea id="qt" rows="7" placeholder="Your reply…"></textarea>
           <div class="acts" style="margin-top:8px"><button class="btn sm primary" id="qs"></button><button class="btn sm hidden" id="qm">✓ I sent it on LinkedIn</button></div>
           <div class="sub" id="qh" style="margin-top:4px"></div></div>
-        ${r['Our Replies'] ? `<div class="field"><div class="k">What we sent them</div><div class="msg" style="white-space:pre-wrap">${esc(r['Our Replies'])}</div></div>` : ''}
+        <div class="field"><div class="k">Conversation</div><div id="conv"><span class="spin"></span></div></div>
         ${fields(r, ['Business Name', 'Next Step', 'Owner', 'Our Replies'], ['Email', 'Phone', 'LinkedIn'])}`, '<button class="btn primary" id="sv">Save</button>');
       const id = encodeURIComponent(r['Lead ID']);
       let ch = r.LinkedIn ? 'linkedin' : 'email';
@@ -304,6 +304,12 @@ async function pageQualified(el) {
         $('#qs', d).innerHTML = li ? 'in&nbsp; Send on LinkedIn' : 'Send email';
         $('#qh', d).innerHTML = li ? 'Copies the reply and opens their LinkedIn in your browser (your own LinkedIn account). Click <b>Message</b>, Ctrl+V, Send. Then click <b>I sent it on LinkedIn</b> so it is saved here.' : 'Sent from your Gmail, in the same thread as earlier emails to them.'; };
       $$('#ch button', d).forEach(b => b.onclick = () => setCh(b.dataset.c)); setCh(ch);
+      api('/leads/qualified/' + id + '/thread').then(t => {
+        if (t.email && !$('#qe', d).value) $('#qe', d).value = t.email;
+        if (t.emailHow) $('#qe', d).title = 'Found: ' + t.emailHow;
+        if (!t.email && r.LinkedIn) $('#qe', d).placeholder = 'No email yet – the AI reply asks them for it on LinkedIn';
+        $('#conv', d).innerHTML = t.messages.length ? t.messages.map(m => `<div class="msg" style="white-space:pre-wrap;${m.who === 'us' ? 'margin-left:24px;border-left:3px solid var(--gold, #c9a24a)' : 'margin-right:24px'}"><div class="sub" style="margin-bottom:4px">${m.who === 'us' ? 'We' : 'They'} · ${m.channel === 'linkedin' ? 'LinkedIn' : m.channel === 'email' ? 'Email' : ''}${m.when ? ' · ' + esc(m.when) : ''}${m.meta ? ' · ' + esc(m.meta) : ''}</div>${esc(m.text)}</div>`).join('') : '<div class="sub">No messages saved yet.</div>';
+      }).catch(e => { $('#conv', d).innerHTML = `<div class="sub">${esc(e.message)}</div>`; });
       $('#qd', d).onclick = e => busy(e.currentTarget, async () => { const x = await api('/leads/qualified/' + id + '/draft', { method: 'POST', body: { channel: ch, latest: $('#lt', d).value.trim() } }); $('#qt', d).value = x.text; if (!x.ai) toast('AI not available right now, a simple reply was filled in', true); $('#qt', d).focus(); });
       const save = async () => api('/leads/qualified/' + id + '/reply', { method: 'POST', body: { channel: ch, to: $('#qe', d).value.trim(), text: $('#qt', d).value.trim() } });
       $('#qs', d).onclick = e => busy(e.currentTarget, async () => {
@@ -313,7 +319,7 @@ async function pageQualified(el) {
         const x = await save(); toast('Sent: ' + x.where); closeLayer(); route();
       });
       $('#qm', d).onclick = e => busy(e.currentTarget, async () => { if (!$('#qt', d).value.trim()) throw new Error('The reply box is empty.'); await save(); toast('Saved as sent on LinkedIn'); closeLayer(); route(); });
-      $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/qualified/' + id, { method: 'PATCH', body: { 'Next Step': $('#nx', d).value, Owner: $('#ow', d).value, 'Lead Score': $('#sc', d).value } }); toast('Saved'); closeLayer(); route(); });
+      $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/qualified/' + id, { method: 'PATCH', body: { 'Next Step': $('#nx', d).value, Owner: $('#ow', d).value, 'Lead Score': $('#sc', d).value, ...($('#qe', d).value.trim() ? { Email: $('#qe', d).value.trim() } : {}) } }); toast('Saved'); closeLayer(); route(); });
     } });
 }
 
@@ -326,7 +332,7 @@ async function pageLinkedIn(el) {
   el.innerHTML = head('LinkedIn tasks', 'The agent prepares every message. You send it on LinkedIn and click what happened, about 10 minutes a day (max 15–20 connection requests).', `<div class="seg"><button data-v="tasks" class="${view === 'tasks' ? 'on' : ''}">Today's tasks (${tasks.length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All prospects (${rows.length})</button></div>`) + '<div id="t"></div>';
   $$('.seg button').forEach(b => b.onclick = () => { sessionStorage.setItem('li_view', b.dataset.v); route(); });
   if (view === 'all') return table($('#t'), { rows, statusKey: 'Status', empty: ['No LinkedIn prospects yet', 'The agent adds founders and owners every 12 hours.'],
-    cols: [{ k: 'Date Found', l: 'Found' }, { k: 'Name', l: 'Person', h: r => `<div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}</div>` }, { k: 'Company', l: 'Company' }, { k: 'Location', l: 'Location' }, { k: 'Best Service', l: 'Best service' }, { k: 'Fit Score', l: 'Fit', num: true }, { k: 'Status', l: 'Status', h: r => tag(r.Status) }, { k: 'Handled By', l: 'Handled by' }],
+    cols: [{ k: 'Date Found', l: 'Found' }, { k: 'Name', l: 'Person', h: r => `<div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}</div>` }, { k: 'Company', l: 'Company' }, { k: 'Email', l: 'Email', h: r => r.Email ? esc(r.Email) : '<span class="sub">–</span>' }, { k: 'Location', l: 'Location' }, { k: 'Best Service', l: 'Best service' }, { k: 'Fit Score', l: 'Fit', num: true }, { k: 'Status', l: 'Status', h: r => tag(r.Status) }, { k: 'Handled By', l: 'Handled by' }],
     onRow: r => drawer(r.Name, tag(r.Status), fields(r, ['Name'], ['Connection Note', 'First Message', 'Suggested Reply', 'LinkedIn URL'])) });
   if (!tasks.length) { $('#t').innerHTML = '<div class="tablewrap"><div class="empty"><b>All done for now</b>New prospects arrive every 12 hours.</div></div>'; return; }
   $('#t').innerHTML = `<div class="tasks">${tasks.slice(0, 40).map((r, i) => {
@@ -339,6 +345,7 @@ async function pageLinkedIn(el) {
     return `<article class="task" data-i="${i}"><div class="step">${st[0]}</div>
       <div class="top"><div><div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}${r.Company ? ' · ' + esc(r.Company) : ''} · ${esc(r.Location)}</div></div>${tag(r.Status)}</div>
       ${rep ? `<div class="sub">They said: “${esc(r['Their Reply'])}”</div>` : ''}
+      <div class="sub" style="margin:4px 0">✉ ${r.Email ? `<b>${esc(r.Email)}</b>${r['Email Found How'] ? ' · ' + esc(r['Email Found How']) : ''}` : 'No email yet'} <button class="btn sm ghost" data-email>${r.Email ? 'Change' : 'Add email'}</button></div>
       <textarea class="limsg" rows="4" aria-label="Message (you can edit it)">${esc(st[1] || '')}</textarea>
       <div class="acts" style="margin-top:8px"><button class="btn sm primary" data-li>in&nbsp; Send on LinkedIn</button><button class="btn sm" data-copy>Copy message</button></div>
       <div class="sub" style="margin-top:4px">Copies the message and opens their LinkedIn. ${r.Status === 'To Connect' ? 'Click <b>Connect → Add a note</b>, press Ctrl+V, Send.' : 'Click <b>Message</b>, press Ctrl+V, Send.'} Then click what happened below.</div>
@@ -348,7 +355,8 @@ async function pageLinkedIn(el) {
   $$('.task').forEach(card => {
     const r = tasks[+card.dataset.i];
     $('[data-copy]', card).onclick = () => copy($('.limsg', card).value);
-    $('[data-li]', card).onclick = () => { copy($('.limsg', card).value); if (r['LinkedIn URL']) window.open(r['LinkedIn URL'], '_blank', 'noopener'); else toast('No LinkedIn link saved for this person', true); };
+    $('[data-email]', card).onclick = e => { const v = prompt(`Email address of ${r.Name}:`, r.Email || ''); if (v === null) return; busy(e.currentTarget, async () => { await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { Email: v.trim() } }); toast('Email saved'); route(); }); };
+    $('[data-li]', card).onclick =() => { copy($('.limsg', card).value); if (r['LinkedIn URL']) window.open(r['LinkedIn URL'], '_blank', 'noopener'); else toast('No LinkedIn link saved for this person', true); };
     $$('[data-set]', card).forEach(b => b.onclick = () => busy(b, async () => { await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { Status: b.dataset.set } }); toast(b.dataset.set === 'Interested' ? 'Great! The team leader is being alerted.' : 'Updated'); route(); }));
     $('[data-reply]', card).onclick = () => { $('[data-rbox]', card).classList.toggle('hidden'); $('textarea', card).focus(); };
     $('[data-savereply]', card).onclick = e => busy(e.currentTarget, async () => { const t = $('textarea', card).value.trim(); if (!t) throw new Error('Paste their reply first.'); await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { 'Their Reply': t } }); toast('Saved. A suggested reply will appear in a minute.'); setTimeout(route, 1500); });
