@@ -30,7 +30,7 @@ function sentOn(rows, d) { return rows.filter(r => [r['Pitched On'], r['Follow-u
 
 // ---------------------------------------------------------------- state + log
 const state = Object.assign({ lastRun: {}, lastResult: {}, seen: [], reportDay: '', tries: {}, firstSeen: {} }, config.loadState());
-state.tries = state.tries || {}; state.firstSeen = state.firstSeen || {};
+state.tries = state.tries || {}; state.firstSeen = state.firstSeen || {}; state.rechecked = state.rechecked || {};
 const running = {};
 const logs = [];
 function log(job, msg, level = 'info') {
@@ -46,13 +46,23 @@ async function templates(stage) {
 }
 
 // ---------------------------------------------------------------- 01 find leads
+const apifyEmails = p => [...(p.emails || []), ...((p.contactDetails && p.contactDetails.emails) || []), p.email].filter(Boolean).map(e => String(e).toLowerCase().trim());
+// Best email for a business: what Apify found, then the site itself (home, contact, about pages, hidden addresses), then info@domain
+async function discoverEmail(s, website, domain, fromApify = []) {
+  const site = await web.findEmails(website);
+  const pool = [...new Set([...fromApify.filter(e => web.emailsFrom(e).length), ...site.emails])];
+  if (pool.length) return { email: web.bestEmail(pool, domain), how: fromApify.length ? 'found by Apify' : 'website', html: site.html, contactHtml: site.contactHtml };
+  if (yes(s.GUESS_EMAILS ?? 'yes')) { const g = await web.guessEmail(domain); if (g) return { email: g, how: 'guessed (info@ of their domain, which accepts email)', html: site.html, contactHtml: site.contactHtml }; }
+  return { email: '', how: '', html: site.html, contactHtml: site.contactHtml };
+}
+
 async function findLeads(s, opts = {}) {
   const industries = list(s.INDUSTRIES), cities = list(s.CITIES);
   if (!industries.length || !cities.length) throw new Error('Add industries and cities in Settings.');
   const industry = opts.industry || pick(industries), city = opts.city || pick(cities);
   const max = Number(opts.max || s.LEADS_PER_SEARCH || 10);
   log('find', `Searching Google Maps: "${industry}" in ${city}`);
-  const places = await web.mapsSearch(industry, city, max);
+  const places = await web.mapsSearch(industry, city, max, yes(s.APIFY_CONTACTS ?? 'yes'));
   const existing = await store.read('Raw Leads');
   const seen = new Set();
   for (const r of existing) { const d = web.domainOf(r.Website); if (d) seen.add(d); if (r['Business Name']) seen.add('n:' + String(r['Business Name']).toLowerCase().trim()); }
@@ -66,10 +76,10 @@ async function findLeads(s, opts = {}) {
     if (seen.has(d) || seen.has(nk)) continue;
     seen.add(d); seen.add(nk);
     const website = String(p.website).startsWith('http') ? p.website : 'https://' + p.website;
-    const html = await web.getHtml(website);
-    let emails = web.emailsFrom(html);
-    const contact = await web.getHtml(web.contactUrl(website, html));
-    emails = [...new Set([...emails, ...web.emailsFrom(contact)])];
+    // emails Apify found on the site (contact enrichment) + our own search of the site + info@ fallback
+    const found = await discoverEmail(s, website, d, apifyEmails(p));
+    const html = found.html, contact = found.contactHtml;
+    const emails = found.email ? [found.email] : [];
     const L = { name: p.title, category: p.categoryName || industry, city: p.city || city, country: p.countryCode || '', website, rating: p.totalScore ?? '', reviews: p.reviewsCount ?? '', checks: web.checkSite(website, html), siteText: web.strip(html).slice(0, 2500) };
     let a = null;
     // lead analysis is "nice to have": it only uses the AI when enough is left for emails and customer replies
@@ -80,14 +90,15 @@ async function findLeads(s, opts = {}) {
     const fit = Number(a.fit_score || 0);
     rows.push({
       'Lead ID': newId('L'), 'Date Found': today(), Source: 'Google Maps', 'Business Name': p.title, Industry: L.category, City: L.city, Country: L.country,
-      Website: website, Email: email, Phone: p.phone || p.phoneUnformatted || '', 'Contact Name': a.contact_name || '', LinkedIn: web.linkedinIn(html + contact),
+      Website: website, Email: email, Phone: p.phone || p.phoneUnformatted || '', 'Contact Name': a.contact_name || '', LinkedIn: web.linkedinIn(html + contact) || (p.linkedIns || [])[0] || '',
       'Google Rating': L.rating, Reviews: L.reviews, 'Website Issues': a.website_issues || '', 'Best Service': a.best_service || '', 'Pitch Angle': a.pitch_angle || '',
-      'Fit Score': fit || '', Status: !email ? 'No Email' : (fit && fit < Number(s.MIN_FIT_SCORE || 5) ? 'Low Fit' : 'New'),
-      Notes: a.language ? 'Site language: ' + a.language : '',
+      // every lead with an email is emailed; the fit score only decides the order (best first)
+      'Fit Score': fit || '', Status: email ? 'New' : 'No Email',
+      Notes: [a.language ? 'Site language: ' + a.language : '', found.how && found.how !== 'website' ? `Email ${found.how}` : ''].filter(Boolean).join(' | '),
     });
   }
   await store.append('Raw Leads', rows);
-  const msg = `Added ${rows.length} new leads (${rows.filter(r => r.Status === 'New').length} ready to email) from "${industry}" in ${city}`;
+  const msg = `Added ${rows.length} new leads (${rows.filter(r => r.Status === 'New').length} ready to email, ${rows.filter(r => r.Status === 'No Email').length} without any email) from "${industry}" in ${city}`;
   log('find', msg); return msg;
 }
 
@@ -146,7 +157,7 @@ async function sendEmails(s, opts = {}) {
   }
   // leads that "failed" only because the AI was out of requests or offline (older versions) are tried again
   const retry = r => r.Status === 'Send Failed' && !r['Pitched On'] && /Gemini|ChatGPT|fetch failed|AI /i.test(String(r.Notes || '').split(' | ').pop());
-  const waiting = r => r.Status === 'New' || retry(r);
+  const waiting = r => r.Status === 'New' || r.Status === 'Low Fit' || retry(r); // low-fit leads are emailed too, just after the best ones
   const contacted = new Set(rows.filter(r => r.Status && !waiting(r)).map(r => String(r.Email || '').toLowerCase().trim()));
   const fresh = [];
   for (const r of rows.filter(r => waiting(r) && validEmail(r.Email)).sort((a, b) => Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0))) {
@@ -300,10 +311,25 @@ async function alertTeam(s, subject, body) {
 }
 
 // ---------------------------------------------------------------- 04 LinkedIn prospects
+// "Simon Lockyer - and CEO @ The British School of Milan | LinkedIn" -> name, title, company
+function parseLinkedIn(title, snippet) {
+  const parts = String(title || '').replace(/\s*[|\-–]\s*LinkedIn.*$/i, '').split(/\s+[-–|]\s+/).map(x => x.trim());
+  const name = parts[0] || '', role = parts[1] || '';
+  let company = ((role.match(/(?:@|\bat)\s+(.+)$/i) || [])[1] || '').trim() || parts[2] || '';
+  if (!company) company = ((String(snippet || '').match(/Experience:\s*([^·|•\n]+)/i) || [])[1] || '').trim();
+  return { name, title: role.replace(/^and\s+/i, ''), company: company.replace(/\s*[|·•].*$/, '').replace(/\.\.\.$/, '').trim() };
+}
+// Messages written without AI, so every prospect always has something ready to send
+function linkedinPlain(s, p) {
+  const first = ai.firstName(p.name);
+  return {
+    connection_note: `Hi ${first}, I help businesses${p.location ? ' in ' + p.location : ''} grow with sharper websites, search visibility and marketing. Would be glad to connect.`.slice(0, 250),
+    first_message: `Thanks for connecting, ${first}. I'm ${s.SENDER_NAME} from ${s.COMPANY} (${s.WEBSITE}). We help ${p.company ? 'companies like ' + p.company : 'businesses like yours'} get more enquiries through a sharper website, better Google and AI search visibility, and simple marketing.\n\nWould a free 10-minute review of your online presence be useful?`,
+  };
+}
+
 async function linkedinProspects(s, opts = {}) {
   const industry = opts.industry || pick(list(s.INDUSTRIES)), city = opts.city || pick(list(s.CITIES));
-  // every prospect needs the AI to write its messages: skip the search (and the Apify credit) when the AI is saved for replies
-  if (!ai.canUse('low')) return 'Skipped: today\'s AI requests are kept for emails and customer replies';
   const query = `site:linkedin.com/in ("founder" OR "co-founder" OR "CEO" OR "owner" OR "managing director") "${industry}" "${city}"`;
   log('linkedin', `Searching LinkedIn via Google: ${industry} in ${city}`);
   const pages = await web.googleSearch(query);
@@ -315,22 +341,90 @@ async function linkedinProspects(s, opts = {}) {
     const url = String(r.url || '').split('?')[0]; const k = keyOf(url);
     if (!/linkedin\.com\/in\//i.test(url) || !k || existing.has(k) || people.length >= max) continue;
     existing.add(k);
-    const parts = String(r.title || '').replace(/\s*[|\-–]\s*LinkedIn.*$/i, '').split(/\s+[-–|]\s+/);
-    people.push({ name: (parts[0] || '').trim(), title: (parts[1] || '').trim(), company: (parts[2] || '').trim(), url, snippet: r.description || '', industry, location: city });
+    people.push({ ...parseLinkedIn(r.title, r.description), url, snippet: r.description || '', industry, location: city });
   }
-  const nt = await templates('LinkedIn connection note'), mt = await templates('LinkedIn first message');
   const rows = [];
   for (const p of people) {
-    let a;
-    try { a = (await gemini(P.linkedin(s, p, nt.length ? pick(nt) : null, mt.length ? pick(mt) : null), s.GEMINI_MODEL, { priority: 'low' })) || {}; } catch (e) {
-      if (aiUnavailable(e)) { log('linkedin', `Stopped early, ${e.message}`, 'warn'); break; } // the rest are found again on a later search
-      a = {};
-    }
-    rows.push({ 'Lead ID': newId('LI'), 'Date Found': today(), Name: p.name, Title: p.title, Company: p.company, Industry: industry, Location: city, 'LinkedIn URL': p.url, 'Fit Score': a.fit_score || '', 'Best Service': a.best_service || '', 'Connection Note': clean(a.connection_note).slice(0, 280), 'First Message': clean(a.first_message), Status: 'To Connect' });
+    const a = await linkedinMessages(s, p);
+    rows.push({ 'Lead ID': newId('LI'), 'Date Found': today(), Name: p.name, Title: p.title, Company: p.company, Industry: industry, Location: city, 'LinkedIn URL': p.url, 'Fit Score': a.fit_score || '', 'Best Service': a.best_service || '', 'Connection Note': clean(a.connection_note).slice(0, 280), 'First Message': clean(a.first_message), Status: 'To Connect', Notes: a.plain ? 'Messages written without AI' : '' });
   }
   await store.append('LinkedIn Leads', rows);
-  const msg = `Added ${rows.length} LinkedIn prospects (${industry}, ${city})`;
+  // also reach them by email: find their company's website and email address, and queue it for pitching
+  const emailed = rows.length ? await emailLinkedInCompanies(s, rows) : 0;
+  const msg = `Added ${rows.length} LinkedIn prospects (${industry}, ${city}), ${emailed} of their companies queued for email`;
   log('linkedin', msg); return msg;
+}
+// AI-written connection note + first message, or plain ones when the AI is out (never empty)
+async function linkedinMessages(s, p) {
+  if (ai.canUse('low')) {
+    try {
+      const nt = await templates('LinkedIn connection note'), mt = await templates('LinkedIn first message');
+      const a = await gemini(P.linkedin(s, p, nt.length ? pick(nt) : null, mt.length ? pick(mt) : null), s.GEMINI_MODEL, { priority: 'low' });
+      if (a && a.connection_note && a.first_message) return a;
+    } catch (e) { if (!aiUnavailable(e)) log('linkedin', 'AI error: ' + e.message, 'warn'); }
+  }
+  return { ...linkedinPlain(s, p), plain: true };
+}
+const NOT_COMPANY_SITE = /(^|\.)(linkedin|facebook|instagram|twitter|x|youtube|wikipedia|crunchbase|glassdoor|indeed|zoominfo|bloomberg|yelp|tripadvisor|justdial|indiamart|google|apollo|rocketreach|signalhire|pitchbook|dnb|owler|ambitionbox|naukri|tracxn|medium|github|reddit|quora|amazon)\.[a-z.]+$/;
+// For LinkedIn prospects: Google their company, take its own website, find an email, add it to Raw Leads so it is pitched like any other lead
+async function emailLinkedInCompanies(s, rows) {
+  const todo = rows.filter(r => r.Company && r.Company.length > 1).slice(0, 10);
+  if (!todo.length) return 0;
+  const raw = await store.read('Raw Leads', true);
+  const known = new Map(); for (const r of raw) { const d = web.domainOf(r.Website); if (d) known.set(d, r); }
+  const q = r => `"${r.Company}" ${r.Location || ''}`.trim();
+  let pages = [];
+  try { pages = await web.googleSearch(todo.map(q).join('\n')); } catch (e) { log('linkedin', 'Company search failed: ' + e.message, 'warn'); return 0; }
+  const byQuery = {}; for (const pg of pages) { const t = (pg.searchQuery && pg.searchQuery.term) || ''; byQuery[t] = (byQuery[t] || []).concat(pg.organicResults || []); }
+  const add = [], notes = [];
+  for (const r of todo) {
+    const site = (byQuery[q(r)] || []).map(x => x.url).find(u => { const d = web.domainOf(u); return d && !NOT_COMPANY_SITE.test(d); });
+    if (!site) { notes.push({ key: r['Lead ID'], set: { Notes: [r.Notes, 'Email search: company website not found'].filter(Boolean).join(' | ') } }); continue; }
+    const d = web.domainOf(site), website = 'https://' + new URL(site).hostname;
+    if (known.has(d)) { notes.push({ key: r['Lead ID'], set: { Notes: [r.Notes, `Email search: company already in Raw Leads (${known.get(d)['Lead ID']})`].filter(Boolean).join(' | ') } }); continue; }
+    const found = await discoverEmail(s, website, d);
+    const id = newId('L');
+    add.push({ 'Lead ID': id, 'Date Found': today(), Source: 'LinkedIn', 'Business Name': r.Company, Industry: r.Industry, City: r.Location, Website: website, Email: found.email,
+      'Contact Name': r.Name, LinkedIn: r['LinkedIn URL'], Status: found.email ? 'New' : 'No Email',
+      Notes: [`From LinkedIn: ${r.Name}, ${r.Title}`, found.how && found.how !== 'website' ? `Email ${found.how}` : ''].filter(Boolean).join(' | ') });
+    known.set(d, add[add.length - 1]);
+    notes.push({ key: r['Lead ID'], set: { Notes: [r.Notes, `Email search: ${found.email || 'no email found'} (Raw Leads ${id})`].filter(Boolean).join(' | ') } });
+  }
+  if (add.length) await store.append('Raw Leads', add);
+  if (notes.length) await store.update('LinkedIn Leads', 'Lead ID', notes);
+  return add.filter(r => r.Status === 'New').length;
+}
+
+// ---------------------------------------------------------------- 04b recheck (every 6 hours)
+// Leads that had no email get another search (new methods find more), LinkedIn prospects get emailed and their empty messages filled
+async function recheck(s) {
+  const out = [];
+  // 1) Raw leads without an email: up to 15 per run, each tried at most twice
+  const raw = (await store.read('Raw Leads', true)).filter(r => r.Status === 'No Email' && r.Website && (state.rechecked[r['Lead ID']] || 0) < 2).slice(0, 15);
+  const fixes = [];
+  for (const r of raw) {
+    state.rechecked[r['Lead ID']] = (state.rechecked[r['Lead ID']] || 0) + 1;
+    const found = await discoverEmail(s, r.Website, web.domainOf(r.Website));
+    if (found.email) fixes.push({ key: r['Lead ID'], set: { Email: found.email, Status: 'New', Notes: [r.Notes, `${today()}: email ${found.how === 'website' ? 'found on re-check' : found.how}`].filter(Boolean).join(' | ') } });
+  }
+  persist();
+  if (fixes.length) await store.update('Raw Leads', 'Lead ID', fixes);
+  if (raw.length) out.push(`re-checked ${raw.length} leads without email, found ${fixes.length}`);
+  // 2) LinkedIn prospects: fill empty messages, then look for their company's email
+  const li = await store.read('LinkedIn Leads', true);
+  const empty = li.filter(r => !String(r['First Message'] || '').trim()).slice(0, 25);
+  const fill = [];
+  for (const r of empty) {
+    const p = { ...parseLinkedIn(`${r.Name} - ${r.Title}`, ''), name: r.Name, company: r.Company || parseLinkedIn(`${r.Name} - ${r.Title}`, '').company, industry: r.Industry, location: r.Location };
+    const a = await linkedinMessages(s, p);
+    fill.push({ key: r['Lead ID'], set: { Company: p.company || r.Company || '', 'Connection Note': clean(a.connection_note).slice(0, 280), 'First Message': clean(a.first_message), 'Fit Score': r['Fit Score'] || a.fit_score || '', 'Best Service': r['Best Service'] || a.best_service || '' } });
+    r.Company = p.company || r.Company;
+  }
+  if (fill.length) { await store.update('LinkedIn Leads', 'Lead ID', fill); out.push(`wrote messages for ${fill.length} LinkedIn prospects`); }
+  const unsearched = li.filter(r => !/Email search:/.test(String(r.Notes || '')) && r.Company);
+  if (unsearched.length) out.push(`${await emailLinkedInCompanies(s, unsearched)} LinkedIn companies queued for email`);
+  const msg = out.join(', ') || 'Nothing to re-check';
+  log('recheck', msg); return msg;
 }
 
 // ---------------------------------------------------------------- 05 LinkedIn follow-up + alert
@@ -386,6 +480,7 @@ const JOBS = {
   replies: { name: 'Read & answer replies', fn: checkReplies, every: () => 5 * 60e3 },
   linkedin: { name: 'Find LinkedIn prospects', fn: linkedinProspects, every: s => Number(s.LINKEDIN_EVERY_HOURS || 12) * 3600e3 },
   linkedinFollow: { name: 'LinkedIn replies & team alerts', fn: linkedinFollow, every: () => 30 * 60e3 },
+  recheck: { name: 'Re-check leads without email + email LinkedIn companies', fn: recheck, every: () => 6 * 3600e3 },
   report: { name: 'Daily report (8:30 PM)', fn: dailyReport, every: null },
 };
 
@@ -429,4 +524,4 @@ function status() {
   });
 }
 
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, _internals: { findLeads, sendEmails, checkReplies, linkedinProspects, linkedinFollow, dailyReport } };
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, _internals: { findLeads, sendEmails, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

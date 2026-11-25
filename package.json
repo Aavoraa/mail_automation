@@ -1,7 +1,7 @@
 {
   "name": "aavoraa-lead-agent",
   "productName": "AAVORAA Lead Agent",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "AAVORAA Lead Agent - finds, pitches, follows up and qualifies leads",
   "main": "main.js",
   "author": "AAVORAA",
@@ -22,16 +22,29 @@
       "server/**",
       "ui/**",
       "assets/**",
-      "package.json"
+      "package.json",
+      "START HERE.md"
     ],
     "win": {
       "target": [
-        "dir"
+        "dir",
+        "nsis",
+        "zip"
       ],
       "signAndEditExecutable": false,
       "icon": "assets/icon.png"
     },
-    "asar": true
+    "asar": true,
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AAVORAA Lead Agent",
+      "artifactName": "AAVORAA_Lead_Agent_Setup_${version}.exe",
+      "runAfterFinish": true
+    }
   },
   "dependencies": {
     "express": "^4.22.3",
