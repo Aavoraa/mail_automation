@@ -207,9 +207,11 @@ app.patch('/api/leads/raw/:id', need('owner', 'leader'), wrap(async (req, res) =
 }));
 app.patch('/api/leads/qualified/:id', need('owner', 'leader'), wrap(async (req, res) => {
   const b = req.body || {}, set = {};
-  for (const k of ['Next Step', 'Owner', 'Lead Score']) if (b[k] !== undefined) set[k] = String(b[k]).slice(0, 500);
+  for (const k of ['Next Step', 'Owner', 'Lead Score', 'Email']) if (b[k] !== undefined) set[k] = String(b[k]).trim().slice(0, 500);
+  if (set.Email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(set.Email)) throw new Error('That email address does not look right.');
   await store.update('Qualified Leads', 'Lead ID', [{ key: req.params.id, set }]); res.json({ ok: true });
 }));
+app.get('/api/leads/qualified/:id/thread', need('owner', 'leader'), wrap(async (req, res) => res.json(await engine.qualifiedThread(req.params.id))));
 app.post('/api/leads/qualified/:id/draft', need('owner', 'leader'), wrap(async (req, res) => {
   const b = req.body || {};
   res.json(await engine.qualifiedDraft(req.params.id, b.channel === 'linkedin' ? 'linkedin' : 'email', b.latest));
@@ -218,12 +220,35 @@ app.post('/api/leads/qualified/:id/reply', need('owner', 'leader'), wrap(async (
   const b = req.body || {};
   res.json({ ok: true, ...(await engine.qualifiedReply(req.params.id, { channel: b.channel, to: b.to, text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
 }));
+// What is new, for the red badges and the pop sound: ids of every client reply (Gmail, LinkedIn) and qualified lead
+const liKey = r => r['Lead ID'] + ':' + String(r['Their Reply'] || '').length;
+app.get('/api/notify', need(), wrap(async (req, res) => {
+  const mailOk = req.user.role !== 'linkedin';
+  const [rep, li, qual] = await Promise.all([mailOk ? store.read('Replies') : [], store.read('LinkedIn Leads'), mailOk ? store.read('Qualified Leads') : []]);
+  res.json({
+    gmail: rep.map(r => ({ id: r['Reply ID'], who: r['Contact Name'] || r['Business Name'] || r.From, text: String(r['Their Message'] || '').slice(0, 120) })),
+    linkedin: li.filter(r => String(r['Their Reply'] || '').trim()).map(r => ({ id: liKey(r), who: r.Name, text: String(r['Their Reply']).slice(0, 120) })),
+    qualified: qual.map(r => ({ id: r['Lead ID'], who: r['Business Name'] || r['Contact Name'], text: r.Summary || r['Service Needed'] || '' })),
+  });
+}));
+
+app.post('/api/leads/linkedin/:id/reply', need(), wrap(async (req, res) => {
+  const b = req.body || {};
+  if (b.channel === 'email' && req.user.role === 'linkedin') throw new Error('Only the owner or team leader can send emails.');
+  res.json({ ok: true, ...(await engine.linkedinAnswer(req.params.id, { channel: b.channel, to: String(b.to || '').trim(), text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
+}));
 app.patch('/api/leads/linkedin/:id', need(), wrap(async (req, res) => {
   const b = req.body || {}, set = { 'Handled By': req.user.name };
   if (b.Status) { if (!LI_STATUSES.includes(b.Status)) throw new Error('Unknown status'); set.Status = b.Status; }
-  if (b['Their Reply'] !== undefined) { set['Their Reply'] = String(b['Their Reply']).slice(0, 3000); set['Suggested Reply'] = ''; if (!b.Status) set.Status = 'Replied'; }
+  if (b['Their Reply'] !== undefined) {
+    set['Their Reply'] = String(b['Their Reply']).slice(0, 3000); set['Suggested Reply'] = ''; if (!b.Status) set.Status = 'Replied';
+    const shared = (set['Their Reply'].match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/) || [])[0]; // they wrote their email in the reply
+    if (shared) set.Email = shared.toLowerCase();
+  }
+  if (b.Email !== undefined) { const e = String(b.Email).trim(); if (e && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) throw new Error('That email address does not look right.'); set.Email = e; }
   if (b.Notes !== undefined) set.Notes = String(b.Notes).slice(0, 1000);
   await store.update('LinkedIn Leads', 'Lead ID', [{ key: req.params.id, set }]);
+  if (set.Email) await engine.syncQualifiedEmail(req.params.id, set.Email).catch(() => {});
   if (set['Their Reply'] || set.Status === 'Interested') engine.run('linkedinFollow').catch(() => {});
   res.json({ ok: true });
 }));

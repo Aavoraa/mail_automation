@@ -51,7 +51,7 @@ const apifyEmails = p => [...(p.emails || []), ...((p.contactDetails && p.contac
 async function discoverEmail(s, website, domain, fromApify = []) {
   const site = await web.findEmails(website);
   const pool = [...new Set([...fromApify.filter(e => web.emailsFrom(e).length), ...site.emails])];
-  if (pool.length) return { email: web.bestEmail(pool, domain), how: fromApify.length ? 'found by Apify' : 'website', html: site.html, contactHtml: site.contactHtml };
+  if (pool.length) return { email: web.bestEmail(pool, domain), all: pool, how: fromApify.length ? 'found by Apify' : 'website', html: site.html, contactHtml: site.contactHtml };
   if (yes(s.GUESS_EMAILS ?? 'yes')) { const g = await web.guessEmail(domain); if (g) return { email: g, how: 'guessed (info@ of their domain, which accepts email)', html: site.html, contactHtml: site.contactHtml }; }
   return { email: '', how: '', html: site.html, contactHtml: site.contactHtml };
 }
@@ -411,7 +411,37 @@ async function linkedinMessages(s, p) {
   }
   return { ...linkedinPlain(s, p), plain: true };
 }
-const NOT_COMPANY_SITE = /(^|\.)(linkedin|facebook|instagram|twitter|x|youtube|wikipedia|crunchbase|glassdoor|indeed|zoominfo|bloomberg|yelp|tripadvisor|justdial|indiamart|google|apollo|rocketreach|signalhire|pitchbook|dnb|owler|ambitionbox|naukri|tracxn|medium|github|reddit|quora|amazon)\.[a-z.]+$/;
+// The address that belongs to this person (their name is in it), e.g. priya@ or p.shah@ for "Priya Shah"
+function personalEmail(name, emails) {
+  const parts = String(name || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').split(/[^a-z]+/).filter(p => p.length >= 3);
+  return (emails || []).find(e => { const l = String(e).split('@')[0].toLowerCase(); return parts.some(p => l.includes(p)); }) || '';
+}
+// Email of a LinkedIn prospect: saved one, one they wrote in their reply, or the one an earlier search wrote in Notes
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+function knownLinkedInEmail(r) {
+  if (validEmail(r.Email)) return { email: String(r.Email).trim(), how: r['Email Found How'] || 'saved' };
+  const said = (String(r['Their Reply'] || '').match(EMAIL_RE) || [])[0];
+  if (said) return { email: said.toLowerCase(), how: 'they shared it in their reply' };
+  const noted = (String(r.Notes || '').match(/Email search: ([^\s(|]+@[^\s(|]+)/) || [])[1];
+  if (noted) return { email: noted, how: 'company email (found by the agent)' };
+  return null;
+}
+// For an interested LinkedIn lead: make sure we have an email for them (search now if needed) and copy it to Qualified Leads
+async function linkedinEmailFor(s, r) {
+  let k = knownLinkedInEmail(r);
+  if (!k && r.Company && !/Email search:/.test(String(r.Notes || ''))) {
+    await emailLinkedInCompanies(s, [r]).catch(e => log('linkedin', 'Email search failed: ' + e.message, 'warn'));
+    const fresh = (await store.read('LinkedIn Leads', true)).find(x => x['Lead ID'] === r['Lead ID']);
+    if (fresh) k = knownLinkedInEmail(fresh);
+  }
+  if (k && !validEmail(r.Email)) await store.update('LinkedIn Leads', 'Lead ID', [{ key: r['Lead ID'], set: { Email: k.email, 'Email Found How': k.how } }]).catch(() => {});
+  return k;
+}
+async function syncQualifiedEmail(id, email) {
+  const q = (await store.read('Qualified Leads', true)).find(r => r['Lead ID'] === id);
+  if (q && String(q.Email || '').toLowerCase() !== String(email).toLowerCase()) await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { Email: email } }]);
+}
+const NOT_COMPANY_SITE =/(^|\.)(linkedin|facebook|instagram|twitter|x|youtube|wikipedia|crunchbase|glassdoor|indeed|zoominfo|bloomberg|yelp|tripadvisor|justdial|indiamart|google|apollo|rocketreach|signalhire|pitchbook|dnb|owler|ambitionbox|naukri|tracxn|medium|github|reddit|quora|amazon)\.[a-z.]+$/;
 // For LinkedIn prospects: Google their company, take its own website, find an email, add it to Raw Leads so it is pitched like any other lead
 async function emailLinkedInCompanies(s, rows) {
   const todo = rows.filter(r => r.Company && r.Company.length > 1).slice(0, 10);
@@ -427,14 +457,20 @@ async function emailLinkedInCompanies(s, rows) {
     const site = (byQuery[q(r)] || []).map(x => x.url).find(u => { const d = web.domainOf(u); return d && !NOT_COMPANY_SITE.test(d); });
     if (!site) { notes.push({ key: r['Lead ID'], set: { Notes: [r.Notes, 'Email search: company website not found'].filter(Boolean).join(' | ') } }); continue; }
     const d = web.domainOf(site), website = 'https://' + new URL(site).hostname;
-    if (known.has(d)) { notes.push({ key: r['Lead ID'], set: { Notes: [r.Notes, `Email search: company already in Raw Leads (${known.get(d)['Lead ID']})`].filter(Boolean).join(' | ') } }); continue; }
+    if (known.has(d)) {
+      const k = known.get(d), mail1 = personalEmail(r.Name, [k.Email].filter(Boolean)) || k.Email || '';
+      notes.push({ key: r['Lead ID'], set: { ...(mail1 && !r.Email ? { Email: mail1, 'Email Found How': 'company email (already in Raw Leads)' } : {}), Notes: [r.Notes, `Email search: company already in Raw Leads (${k['Lead ID']})`].filter(Boolean).join(' | ') } }); continue;
+    }
     const found = await discoverEmail(s, website, d);
+    const own = personalEmail(r.Name, found.all || []);
+    const email = own || found.email;
     const id = newId('L');
-    add.push({ 'Lead ID': id, 'Date Found': today(), Source: 'LinkedIn', 'Business Name': r.Company, Industry: r.Industry, City: r.Location, Website: website, Email: found.email,
-      'Contact Name': r.Name, LinkedIn: r['LinkedIn URL'], Status: found.email ? 'New' : 'No Email',
+    add.push({ 'Lead ID': id, 'Date Found': today(), Source: 'LinkedIn', 'Business Name': r.Company, Industry: r.Industry, City: r.Location, Website: website, Email: email,
+      'Contact Name': r.Name, LinkedIn: r['LinkedIn URL'], Status: email ? 'New' : 'No Email',
       Notes: [`From LinkedIn: ${r.Name}, ${r.Title}`, found.how && found.how !== 'website' ? `Email ${found.how}` : ''].filter(Boolean).join(' | ') });
     known.set(d, add[add.length - 1]);
-    notes.push({ key: r['Lead ID'], set: { Notes: [r.Notes, `Email search: ${found.email || 'no email found'} (Raw Leads ${id})`].filter(Boolean).join(' | ') } });
+    const how = own ? 'their own email, on the company website' : found.email ? 'company email (' + (found.how || 'website') + ')' : '';
+    notes.push({ key: r['Lead ID'], set: { ...(email && !r.Email ? { Email: email, 'Email Found How': how } : {}), Notes: [r.Notes, `Email search: ${email || 'no email found'} (Raw Leads ${id})`].filter(Boolean).join(' | ') } });
   }
   if (add.length) await store.append('Raw Leads', add);
   if (notes.length) await store.update('LinkedIn Leads', 'Lead ID', notes);
@@ -467,6 +503,9 @@ async function recheck(s) {
     r.Company = p.company || r.Company;
   }
   if (fill.length) { await store.update('LinkedIn Leads', 'Lead ID', fill); out.push(`wrote messages for ${fill.length} LinkedIn prospects`); }
+  // older prospects: copy an email found earlier (written in Notes) into the Email column
+  const back = li.filter(r => !validEmail(r.Email)).map(r => ({ r, k: knownLinkedInEmail(r) })).filter(x => x.k);
+  if (back.length) { await store.update('LinkedIn Leads', 'Lead ID', back.map(({ r, k }) => ({ key: r['Lead ID'], set: { Email: k.email, 'Email Found How': k.how } }))); out.push(`saved emails for ${back.length} LinkedIn prospects`); }
   const unsearched = li.filter(r => !/Email search:/.test(String(r.Notes || '')) && r.Company);
   if (unsearched.length) out.push(`${await emailLinkedInCompanies(s, unsearched)} LinkedIn companies queued for email`);
   const msg = out.join(', ') || 'Nothing to re-check';
@@ -483,6 +522,8 @@ async function linkedinFollow(s) {
   if (!work.length) return 'Nothing new';
   for (const r of work) {
     let a;
+    const em = await linkedinEmailFor(s, r); // so we can also reply to them by email
+    if (em) r.Email = em.email;
     try { a = (await gemini(P.linkedinReply(s, r), s.GEMINI_MODEL, { priority: 'send' })) || { category: 'other' }; } catch (e) {
       if (aiUnavailable(e)) { log('linkedin', `LinkedIn replies are waiting for the AI: ${e.message}`, 'warn'); break; } // handled on the next run
       a = { category: 'other' };
@@ -495,9 +536,9 @@ async function linkedinFollow(s) {
     else if (a.category === 'not_interested') set.Status = 'Not Interested';
     await store.update('LinkedIn Leads', 'Lead ID', [{ key: r['Lead ID'], set }]);
     if (forward) {
-      await upsertQualified({ 'Lead ID': r['Lead ID'], 'Date Qualified': today(), Source: 'LinkedIn', 'Business Name': r.Company, 'Contact Name': r.Name, LinkedIn: r['LinkedIn URL'], Country: r.Location, 'Service Needed': a.service_needed || r['Best Service'], 'Lead Score': a.lead_score || 'Warm', 'Their Message': String(r['Their Reply'] || '').slice(0, 1500), Summary: a.summary || '', 'Next Step': a.next_step || '', Owner: s.TEAM_LEADER_NAME || '', 'Team Alerted': s.TEAM_LEADER_EMAIL ? today() : '' });
+      await upsertQualified({ 'Lead ID': r['Lead ID'], 'Date Qualified': today(), Source: 'LinkedIn', 'Business Name': r.Company, 'Contact Name': r.Name, LinkedIn: r['LinkedIn URL'], Email: em ? em.email : '', Country: r.Location, 'Service Needed': a.service_needed || r['Best Service'], 'Lead Score': a.lead_score || 'Warm', 'Their Message': String(r['Their Reply'] || '').slice(0, 1500), Summary: a.summary || '', 'Next Step': a.next_step || '', Owner: s.TEAM_LEADER_NAME || '', 'Team Alerted': s.TEAM_LEADER_EMAIL ? today() : '' });
       if (s.TEAM_LEADER_EMAIL) await alertTeam(s, `Hot lead (LinkedIn): ${r.Name} - ${r.Company}`,
-        `A LinkedIn lead is interested. Please continue the conversation from your LinkedIn${s.TEAM_LEADER_LINKEDIN ? ' (' + s.TEAM_LEADER_LINKEDIN + ')' : ''}.\n\nName: ${r.Name}\nRole: ${r.Title} at ${r.Company}\nLocation: ${r.Location}\nLinkedIn profile: ${r['LinkedIn URL']}\nService needed: ${a.service_needed || r['Best Service']}\nLead score: ${a.lead_score || 'Warm'}\n\nOur message:\n${r['First Message']}\n\nTheir reply:\n${r['Their Reply'] || '(marked interested by the team)'}\n\nSummary: ${a.summary || '-'}\nSuggested next step: ${a.next_step || '-'}\n\nSuggested reply you can send:\n${sug || r['Suggested Reply'] || '-'}`);
+        `A LinkedIn lead is interested. Please continue the conversation from your LinkedIn${s.TEAM_LEADER_LINKEDIN ? ' (' + s.TEAM_LEADER_LINKEDIN + ')' : ''}.\n\nName: ${r.Name}\nRole: ${r.Title} at ${r.Company}\nLocation: ${r.Location}\nLinkedIn profile: ${r['LinkedIn URL']}\nEmail: ${em ? em.email + ' (' + em.how + ')' : 'not found yet - the suggested reply asks them for it'}\nService needed: ${a.service_needed || r['Best Service']}\nLead score: ${a.lead_score || 'Warm'}\n\nOur message:\n${r['First Message']}\n\nTheir reply:\n${r['Their Reply'] || '(marked interested by the team)'}\n\nSummary: ${a.summary || '-'}\nSuggested next step: ${a.next_step || '-'}\n\nSuggested reply you can send:\n${sug || r['Suggested Reply'] || '-'}`);
     }
     log('linkedin', `${r.Name}: ${a.category}${forward ? ', forwarded to team leader' : ''}`);
   }
@@ -689,9 +730,60 @@ async function qualifiedReply(id, { channel, text, to }, by) {
     if (li) await store.update('LinkedIn Leads', 'Lead ID', [{ key: li['Lead ID'], set: { 'Handled By': by, Notes: [li.Notes, `${day}: ${by} sent: ${body.slice(0, 200)}`].filter(Boolean).join(' | ').slice(0, 1500) } }]).catch(() => {});
   } else throw new Error('Choose email or LinkedIn');
   const entry = `[${stampNow()}, ${by}, ${where}] ${body}`;
-  await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { 'Our Replies': [q['Our Replies'], entry].filter(Boolean).join('\n\n').slice(-8000), 'Last Contact On': day, 'Last Contact By': by } }]);
+  await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { ...(channel === 'email' && to.toLowerCase() !== String(q.Email || '').toLowerCase() ? { Email: to } : {}), 'Our Replies': [q['Our Replies'], entry].filter(Boolean).join('\n\n').slice(-8000), 'Last Contact On': day, 'Last Contact By': by } }]);
   log('replies', `${by} replied to qualified lead ${q['Business Name'] || q['Contact Name']} by ${where}`);
   return { where };
+}
+
+// Answer a LinkedIn prospect who replied: on LinkedIn (a person sends it from their own LinkedIn; saved here) or by email (sent from the app)
+async function linkedinAnswer(id, { channel, text, to }, by) {
+  const r = (await store.read('LinkedIn Leads', true)).find(x => x['Lead ID'] === id);
+  if (!r) throw new Error('Lead not found');
+  const body = String(text || '').trim();
+  if (body.length < 2) throw new Error('Write the message first.');
+  const q = (await store.read('Qualified Leads', true)).find(x => x['Lead ID'] === id);
+  if (channel === 'email' && to && validEmail(to) && to !== r.Email) { await store.update('LinkedIn Leads', 'Lead ID', [{ key: id, set: { Email: to.trim(), 'Email Found How': 'added by ' + by } }]); r.Email = to.trim(); }
+  if (q) { const x = await qualifiedReply(id, { channel, text: body, to: to || r.Email }, by); await markLi(r, channel, '', by); return x; }
+  let where;
+  if (channel === 'email') {
+    const addr = String(to || r.Email || '').trim();
+    if (!validEmail(addr)) throw new Error('No email address for this person yet. Add one, or reply on LinkedIn.');
+    const s = await store.settings(), accs = mail.accounts(); if (!accs.length) throw new Error('Gmail is not connected (Connections page).');
+    await mail.send({ to: addr, from: accs[0].user, subject: `Following up on our LinkedIn chat - ${s.COMPANY}`, text: body + '\n\n' + signature(s), fromName: senderName(s) });
+    where = 'email to ' + addr;
+  } else if (channel === 'linkedin') where = 'LinkedIn';
+  else throw new Error('Choose email or LinkedIn');
+  await markLi(r, channel, body, by);
+  log('linkedin', `${by} answered ${r.Name} by ${where}`);
+  return { where };
+}
+async function markLi(r, channel, body, by) {
+  const set = { 'Handled By': by };
+  if (body) set.Notes = [r.Notes, `${today()}: ${by} replied by ${channel}: ${body.slice(0, 200)}`].filter(Boolean).join(' | ').slice(-1500);
+  if (!['Interested', 'Not Interested'].includes(r.Status)) set.Status = 'Message Sent';
+  await store.update('LinkedIn Leads', 'Lead ID', [{ key: r['Lead ID'], set }]);
+}
+
+// Whole conversation with a qualified lead, oldest first: what they wrote (email replies, LinkedIn) and what we sent
+async function qualifiedThread(id) {
+  const q = await qualifiedLead(id);
+  const mailOf = String(q.Email || '').toLowerCase().trim();
+  const out = [];
+  for (const r of await store.read('Replies', true)) {
+    if (!(r['Lead ID'] === id || (mailOf && String(r.From || '').toLowerCase().trim() === mailOf))) continue;
+    out.push({ when: r['Received On'], who: 'them', channel: 'email', text: r['Their Message'], meta: r.Subject || '' });
+    if (r['Our Reply']) out.push({ when: r['Received On'], who: 'us', channel: 'email', text: r['Our Reply'], meta: r['Reply Status'] || '' });
+  }
+  const li = (await store.read('LinkedIn Leads', true)).find(r => r['Lead ID'] === id || (q.LinkedIn && r['LinkedIn URL'] === q.LinkedIn));
+  if (li) {
+    if (li['First Message']) out.push({ when: li['Date Found'], who: 'us', channel: 'linkedin', text: li['First Message'], meta: 'first message' });
+    if (li['Their Reply']) out.push({ when: '', who: 'them', channel: 'linkedin', text: li['Their Reply'], meta: '' });
+  }
+  for (const m of String(q['Our Replies'] || '').split(/\n\n(?=\[)/).filter(Boolean)) {
+    const h = m.match(/^\[([^,\]]+), ([^,\]]+), ([^\]]+)\]\s*([\s\S]*)$/);
+    out.push(h ? { when: h[1], who: 'us', channel: /linkedin/i.test(h[3]) ? 'linkedin' : 'email', text: h[4], meta: 'sent by ' + h[2] } : { when: '', who: 'us', channel: '', text: m, meta: '' });
+  }
+  return { messages: out, email: q.Email || (li && li.Email) || '', emailHow: li && li['Email Found How'] || '' };
 }
 
 // Result of a call / WhatsApp message, clicked by a team member on the Call / WhatsApp page
@@ -712,4 +804,4 @@ async function callResult(id, status, note, by) {
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, qualifiedDraft, qualifiedReply, _internals: { findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, linkedinAnswer, _internals: { personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

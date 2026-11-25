@@ -31,7 +31,7 @@ const PAGES = {
   dashboard: { title: 'Dashboard', ic: '◈', roles: ['owner', 'leader', 'linkedin'], render: pageDashboard, sec: 'Work' },
   linkedin: { title: 'LinkedIn tasks', ic: 'in', roles: ['owner', 'leader', 'linkedin'], render: pageLinkedIn, sec: 'Work' },
   calls: { title: 'Call / WhatsApp', ic: '☎', roles: ['owner', 'leader', 'linkedin'], render: pageCalls, sec: 'Work' },
-  replies: { title: 'Replies', ic: '↩', roles: ['owner', 'leader'], render: pageReplies, sec: 'Work' },
+  replies: { title: 'Replies from client', ic: '↩', roles: ['owner', 'leader', 'linkedin'], render: pageReplies, sec: 'Work' },
   qualified: { title: 'Qualified leads', ic: '★', roles: ['owner', 'leader'], render: pageQualified, sec: 'Work' },
   leads: { title: 'All email leads', ic: '✉', roles: ['owner', 'leader'], render: pageLeads, sec: 'Work' },
   import: { title: 'Import leads', ic: '⇪', roles: ['owner', 'leader'], render: pageImport, sec: 'Grow' },
@@ -52,8 +52,87 @@ async function route() {
   if (!p || !p.roles.includes(S.me.role)) { location.hash = '#/' + (S.me.role === 'linkedin' ? 'linkedin' : 'dashboard'); return; }
   shell(page);
   try { await p.render($('#page')); } catch (e) { $('#page').innerHTML = `<div class="notice err">${esc(e.message)}</div>`; }
+  autoSeen(); drawBadges(); startNotify();
 }
 window.addEventListener('hashchange', route);
+
+/* ------------------------------------------------------------ notifications: red badges, pop sound, pop-up */
+// A red circle with the number of new items sits on the menu item (and tab) where they arrived; it clears when you open it.
+// Each new client reply or qualified lead plays a short "pop" and shows a Windows pop-up.
+const N = { data: null, seen: null, known: null, user: '', timer: null };
+const NSECS = ['gmail', 'linkedin', 'qualified'];
+const NLABEL = { gmail: 'New Gmail reply', linkedin: 'New LinkedIn reply', qualified: 'New qualified lead' };
+const NPAGE = { gmail: 'replies', linkedin: 'replies', qualified: 'qualified' };
+const seenKey = () => 'aav_seen_' + ((S.me && (S.me.username || S.me.name)) || '');
+const store_ = { get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
+const unseen = sec => (N.data && N.data[sec] || []).filter(x => !(N.seen && (N.seen[sec] || []).includes(x.id)));
+function markSeen(sec) { if (!N.data || !N.seen) return; N.seen[sec] = N.data[sec].map(x => x.id); store_.set(seenKey(), N.seen); drawBadges(); }
+// what you are looking at right now counts as seen (only while the window is really in front of you)
+function autoSeen() {
+  if (!N.data || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+  const page = (location.hash.replace(/^#\/?/, '').split('?')[0]) || 'dashboard';
+  if (page === 'qualified') markSeen('qualified');
+  if (page === 'replies') markSeen(S.me.role === 'linkedin' ? 'linkedin' : (sessionStorage.getItem('rp_src') || 'gmail'));
+}
+function badgeOn(el, n) {
+  if (!el) return; let b = $('.nbadge', el);
+  if (!n) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement('span'); b.className = 'nbadge'; el.appendChild(b); }
+  b.textContent = n > 99 ? '99+' : n; b.title = n + ' new';
+}
+function drawBadges() {
+  const g = unseen('gmail').length, l = unseen('linkedin').length, q = unseen('qualified').length;
+  badgeOn($('.nav a[href="#/replies"]'), g + l); badgeOn($('.nav a[href="#/qualified"]'), q);
+  badgeOn($('.head .seg button[data-s="gmail"]'), g); badgeOn($('.head .seg button[data-s="linkedin"]'), l);
+  badgeOn($('#menuBtn'), g + l + q);
+  const total = g + l + q;
+  document.title = (total ? `(${total}) ` : '') + 'AAVORAA Lead Agent';
+  if (window.aavDesktop) window.aavDesktop.badge(total);
+}
+let actx = null;
+function pop() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+    const t = actx.currentTime, o = actx.createOscillator(), g = actx.createGain();
+    o.type = 'sine'; o.frequency.setValueAtTime(900, t); o.frequency.exponentialRampToValueAtTime(300, t + 0.12);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.6, t + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+    o.connect(g).connect(actx.destination); o.start(t); o.stop(t + 0.22);
+  } catch (e) {}
+}
+function popup(items) {
+  const one = items.length === 1, x = items[0];
+  const title = one ? `${NLABEL[x.sec]}: ${x.who || ''}` : `${items.length} new: ` + NSECS.map(s => [s, items.filter(i => i.sec === s).length]).filter(a => a[1]).map(([s, n]) => `${n} ${s === 'qualified' ? 'qualified' : s === 'gmail' ? 'Gmail' : 'LinkedIn'}`).join(', ');
+  const body = one ? x.text || '' : items.slice(0, 3).map(i => `${i.who}: ${i.text}`).join('\n');
+  const page = NPAGE[x.sec];
+  if (window.aavDesktop) return window.aavDesktop.notify({ title, body, page, src: x.sec });
+  toast(title);
+  try { if ('Notification' in window && Notification.permission === 'granted') { const n = new Notification(title, { body, silent: true }); n.onclick = () => { window.focus(); if (x.sec !== 'qualified') sessionStorage.setItem('rp_src', x.sec); location.hash = '#/' + page; }; } } catch (e) {}
+}
+async function pollNotify() {
+  if (!S.me) return;
+  let d; try { d = await api('/notify'); } catch (e) { return; }
+  N.data = d;
+  if (N.user !== seenKey()) { N.user = seenKey(); N.seen = store_.get(seenKey()); N.known = null; if (!N.seen) { N.seen = {}; NSECS.forEach(s => N.seen[s] = d[s].map(x => x.id)); store_.set(seenKey(), N.seen); } }
+  const fresh = [];
+  if (N.known) for (const s of NSECS) for (const x of d[s]) if (!N.known[s].has(x.id) && !(N.seen[s] || []).includes(x.id)) fresh.push({ sec: s, ...x });
+  N.known = {}; NSECS.forEach(s => N.known[s] = new Set(d[s].map(x => x.id)));
+  if (fresh.length) {
+    pop(); popup(fresh);
+    // refresh the page you are on if the new item belongs there and you are not typing
+    const page = (location.hash.replace(/^#\/?/, '').split('?')[0]) || 'dashboard';
+    if (fresh.some(f => NPAGE[f.sec] === page) && !$$('#page textarea, #page input').some(t => t.value && t.value.trim() && t.matches(':focus'))) { route(); return; }
+  }
+  autoSeen(); drawBadges();
+}
+function startNotify() {
+  if (N.timer || !S.me) return;
+  try { if (!window.aavDesktop && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {}
+  pollNotify(); N.timer = setInterval(pollNotify, 20000);
+}
+window.addEventListener('focus', () => { autoSeen(); drawBadges(); });
+document.addEventListener('visibilitychange', () => { autoSeen(); drawBadges(); });
+if (window.aavDesktop && window.aavDesktop.onOpen) window.aavDesktop.onOpen(o => { if (o.src && o.src !== 'qualified') sessionStorage.setItem('rp_src', o.src); if (location.hash === '#/' + o.page) route(); else location.hash = '#/' + o.page; });
 
 function shell(active) {
   let nav = '', sec = '';
@@ -295,7 +374,7 @@ async function pageQualified(el) {
           <textarea id="qt" rows="7" placeholder="Your reply…"></textarea>
           <div class="acts" style="margin-top:8px"><button class="btn sm primary" id="qs"></button><button class="btn sm hidden" id="qm">✓ I sent it on LinkedIn</button></div>
           <div class="sub" id="qh" style="margin-top:4px"></div></div>
-        ${r['Our Replies'] ? `<div class="field"><div class="k">What we sent them</div><div class="msg" style="white-space:pre-wrap">${esc(r['Our Replies'])}</div></div>` : ''}
+        <div class="field"><div class="k">Conversation</div><div id="conv"><span class="spin"></span></div></div>
         ${fields(r, ['Business Name', 'Next Step', 'Owner', 'Our Replies'], ['Email', 'Phone', 'LinkedIn'])}`, '<button class="btn primary" id="sv">Save</button>');
       const id = encodeURIComponent(r['Lead ID']);
       let ch = r.LinkedIn ? 'linkedin' : 'email';
@@ -304,6 +383,12 @@ async function pageQualified(el) {
         $('#qs', d).innerHTML = li ? 'in&nbsp; Send on LinkedIn' : 'Send email';
         $('#qh', d).innerHTML = li ? 'Copies the reply and opens their LinkedIn in your browser (your own LinkedIn account). Click <b>Message</b>, Ctrl+V, Send. Then click <b>I sent it on LinkedIn</b> so it is saved here.' : 'Sent from your Gmail, in the same thread as earlier emails to them.'; };
       $$('#ch button', d).forEach(b => b.onclick = () => setCh(b.dataset.c)); setCh(ch);
+      api('/leads/qualified/' + id + '/thread').then(t => {
+        if (t.email && !$('#qe', d).value) $('#qe', d).value = t.email;
+        if (t.emailHow) $('#qe', d).title = 'Found: ' + t.emailHow;
+        if (!t.email && r.LinkedIn) $('#qe', d).placeholder = 'No email yet – the AI reply asks them for it on LinkedIn';
+        $('#conv', d).innerHTML = t.messages.length ? t.messages.map(m => `<div class="msg" style="white-space:pre-wrap;${m.who === 'us' ? 'margin-left:24px;border-left:3px solid var(--gold, #c9a24a)' : 'margin-right:24px'}"><div class="sub" style="margin-bottom:4px">${m.who === 'us' ? 'We' : 'They'} · ${m.channel === 'linkedin' ? 'LinkedIn' : m.channel === 'email' ? 'Email' : ''}${m.when ? ' · ' + esc(m.when) : ''}${m.meta ? ' · ' + esc(m.meta) : ''}</div>${esc(m.text)}</div>`).join('') : '<div class="sub">No messages saved yet.</div>';
+      }).catch(e => { $('#conv', d).innerHTML = `<div class="sub">${esc(e.message)}</div>`; });
       $('#qd', d).onclick = e => busy(e.currentTarget, async () => { const x = await api('/leads/qualified/' + id + '/draft', { method: 'POST', body: { channel: ch, latest: $('#lt', d).value.trim() } }); $('#qt', d).value = x.text; if (!x.ai) toast('AI not available right now, a simple reply was filled in', true); $('#qt', d).focus(); });
       const save = async () => api('/leads/qualified/' + id + '/reply', { method: 'POST', body: { channel: ch, to: $('#qe', d).value.trim(), text: $('#qt', d).value.trim() } });
       $('#qs', d).onclick = e => busy(e.currentTarget, async () => {
@@ -313,7 +398,7 @@ async function pageQualified(el) {
         const x = await save(); toast('Sent: ' + x.where); closeLayer(); route();
       });
       $('#qm', d).onclick = e => busy(e.currentTarget, async () => { if (!$('#qt', d).value.trim()) throw new Error('The reply box is empty.'); await save(); toast('Saved as sent on LinkedIn'); closeLayer(); route(); });
-      $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/qualified/' + id, { method: 'PATCH', body: { 'Next Step': $('#nx', d).value, Owner: $('#ow', d).value, 'Lead Score': $('#sc', d).value } }); toast('Saved'); closeLayer(); route(); });
+      $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/qualified/' + id, { method: 'PATCH', body: { 'Next Step': $('#nx', d).value, Owner: $('#ow', d).value, 'Lead Score': $('#sc', d).value, ...($('#qe', d).value.trim() ? { Email: $('#qe', d).value.trim() } : {}) } }); toast('Saved'); closeLayer(); route(); });
     } });
 }
 
@@ -326,7 +411,7 @@ async function pageLinkedIn(el) {
   el.innerHTML = head('LinkedIn tasks', 'The agent prepares every message. You send it on LinkedIn and click what happened, about 10 minutes a day (max 15–20 connection requests).', `<div class="seg"><button data-v="tasks" class="${view === 'tasks' ? 'on' : ''}">Today's tasks (${tasks.length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All prospects (${rows.length})</button></div>`) + '<div id="t"></div>';
   $$('.seg button').forEach(b => b.onclick = () => { sessionStorage.setItem('li_view', b.dataset.v); route(); });
   if (view === 'all') return table($('#t'), { rows, statusKey: 'Status', empty: ['No LinkedIn prospects yet', 'The agent adds founders and owners every 12 hours.'],
-    cols: [{ k: 'Date Found', l: 'Found' }, { k: 'Name', l: 'Person', h: r => `<div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}</div>` }, { k: 'Company', l: 'Company' }, { k: 'Location', l: 'Location' }, { k: 'Best Service', l: 'Best service' }, { k: 'Fit Score', l: 'Fit', num: true }, { k: 'Status', l: 'Status', h: r => tag(r.Status) }, { k: 'Handled By', l: 'Handled by' }],
+    cols: [{ k: 'Date Found', l: 'Found' }, { k: 'Name', l: 'Person', h: r => `<div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}</div>` }, { k: 'Company', l: 'Company' }, { k: 'Email', l: 'Email', h: r => r.Email ? esc(r.Email) : '<span class="sub">–</span>' }, { k: 'Location', l: 'Location' }, { k: 'Best Service', l: 'Best service' }, { k: 'Fit Score', l: 'Fit', num: true }, { k: 'Status', l: 'Status', h: r => tag(r.Status) }, { k: 'Handled By', l: 'Handled by' }],
     onRow: r => drawer(r.Name, tag(r.Status), fields(r, ['Name'], ['Connection Note', 'First Message', 'Suggested Reply', 'LinkedIn URL'])) });
   if (!tasks.length) { $('#t').innerHTML = '<div class="tablewrap"><div class="empty"><b>All done for now</b>New prospects arrive every 12 hours.</div></div>'; return; }
   $('#t').innerHTML = `<div class="tasks">${tasks.slice(0, 40).map((r, i) => {
@@ -339,6 +424,7 @@ async function pageLinkedIn(el) {
     return `<article class="task" data-i="${i}"><div class="step">${st[0]}</div>
       <div class="top"><div><div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}${r.Company ? ' · ' + esc(r.Company) : ''} · ${esc(r.Location)}</div></div>${tag(r.Status)}</div>
       ${rep ? `<div class="sub">They said: “${esc(r['Their Reply'])}”</div>` : ''}
+      <div class="sub" style="margin:4px 0">✉ ${r.Email ? `<b>${esc(r.Email)}</b>${r['Email Found How'] ? ' · ' + esc(r['Email Found How']) : ''}` : 'No email yet'} <button class="btn sm ghost" data-email>${r.Email ? 'Change' : 'Add email'}</button></div>
       <textarea class="limsg" rows="4" aria-label="Message (you can edit it)">${esc(st[1] || '')}</textarea>
       <div class="acts" style="margin-top:8px"><button class="btn sm primary" data-li>in&nbsp; Send on LinkedIn</button><button class="btn sm" data-copy>Copy message</button></div>
       <div class="sub" style="margin-top:4px">Copies the message and opens their LinkedIn. ${r.Status === 'To Connect' ? 'Click <b>Connect → Add a note</b>, press Ctrl+V, Send.' : 'Click <b>Message</b>, press Ctrl+V, Send.'} Then click what happened below.</div>
@@ -348,7 +434,8 @@ async function pageLinkedIn(el) {
   $$('.task').forEach(card => {
     const r = tasks[+card.dataset.i];
     $('[data-copy]', card).onclick = () => copy($('.limsg', card).value);
-    $('[data-li]', card).onclick = () => { copy($('.limsg', card).value); if (r['LinkedIn URL']) window.open(r['LinkedIn URL'], '_blank', 'noopener'); else toast('No LinkedIn link saved for this person', true); };
+    $('[data-email]', card).onclick = e => { const v = prompt(`Email address of ${r.Name}:`, r.Email || ''); if (v === null) return; busy(e.currentTarget, async () => { await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { Email: v.trim() } }); toast('Email saved'); route(); }); };
+    $('[data-li]', card).onclick =() => { copy($('.limsg', card).value); if (r['LinkedIn URL']) window.open(r['LinkedIn URL'], '_blank', 'noopener'); else toast('No LinkedIn link saved for this person', true); };
     $$('[data-set]', card).forEach(b => b.onclick = () => busy(b, async () => { await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { Status: b.dataset.set } }); toast(b.dataset.set === 'Interested' ? 'Great! The team leader is being alerted.' : 'Updated'); route(); }));
     $('[data-reply]', card).onclick = () => { $('[data-rbox]', card).classList.toggle('hidden'); $('textarea', card).focus(); };
     $('[data-savereply]', card).onclick = e => busy(e.currentTarget, async () => { const t = $('textarea', card).value.trim(); if (!t) throw new Error('Paste their reply first.'); await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { 'Their Reply': t } }); toast('Saved. A suggested reply will appear in a minute.'); setTimeout(route, 1500); });
@@ -356,20 +443,33 @@ async function pageLinkedIn(el) {
 }
 
 /* ------------------------------------------------------------ import */
-// Everyone who wrote back: who, when, what they said, what we answered, and a box to answer them yourself.
+// Replies from client: two separate lists, Gmail (email replies) and LinkedIn (replies pasted from LinkedIn).
+// Each shows who it is (with links to their email / LinkedIn profile), what they said, what we sent, and a box to answer them.
+const RP_LABEL = { interested: 'Interested ★', question: 'Question', referral: 'Referral', not_interested: 'Not interested', unsubscribe: 'Unsubscribed', out_of_office: 'Out of office', other: 'Other' };
 async function pageReplies(el) {
-  const rows = await api('/replies');
-  const open = r => /please answer|Not sent/i.test(r['Reply Status'] || '');
+  const canMail = S.me.role !== 'linkedin';
+  const [mailRows, liAll] = await Promise.all([canMail ? api('/replies') : [], api('/leads/linkedin')]);
+  const liRows = liAll.filter(r => String(r['Their Reply'] || '').trim());
+  const src = canMail ? (sessionStorage.getItem('rp_src') || 'gmail') : 'linkedin';
+  const mailOpen = r => /please answer|Not sent/i.test(r['Reply Status'] || '');
+  const liOpen = r => r.Status === 'Replied';
+  el.innerHTML = head('Replies from client', 'Everything clients wrote back to us, with their contact links, what they said and what we sent. Answer them from here.',
+    `<div class="seg">${canMail ? `<button data-s="gmail" class="${src === 'gmail' ? 'on' : ''}">✉ Gmail (${mailRows.length}${mailRows.some(mailOpen) ? ' · ' + mailRows.filter(mailOpen).length + ' waiting' : ''})</button>` : ''}<button data-s="linkedin" class="${src === 'linkedin' ? 'on' : ''}">in LinkedIn (${liRows.length}${liRows.some(liOpen) ? ' · ' + liRows.filter(liOpen).length + ' waiting' : ''})</button></div>`) + '<div id="sub"></div><div id="t"></div>';
+  $$('.head .seg button').forEach(b => b.onclick = () => { sessionStorage.setItem('rp_src', b.dataset.s); route(); });
+  return src === 'gmail' ? repliesGmail(mailRows, mailOpen) : repliesLinkedIn(liRows, liOpen);
+}
+
+function repliesGmail(rows, open) {
   const view = sessionStorage.getItem('rp_view') || (rows.some(open) ? 'open' : 'all');
   const list = view === 'open' ? rows.filter(open) : rows;
-  const label = { interested: 'Interested ★', question: 'Question', referral: 'Referral', not_interested: 'Not interested', unsubscribe: 'Unsubscribed', out_of_office: 'Out of office', other: 'Other' };
-  el.innerHTML = head('Replies', 'Everyone who answered our emails, what they said and what was sent back. Answer them yourself from here: it goes out from the same inbox, in the same email thread.',
-    `<div class="seg"><button data-v="open" class="${view === 'open' ? 'on' : ''}">Needs your answer (${rows.filter(open).length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All replies (${rows.length})</button></div>`) + '<div id="t"></div>';
-  $$('.seg button').forEach(b => b.onclick = () => { sessionStorage.setItem('rp_view', b.dataset.v); route(); });
-  if (!list.length) { $('#t').innerHTML = `<div class="tablewrap"><div class="empty"><b>${rows.length ? 'Nothing waiting for you' : 'No replies yet'}</b>${rows.length ? 'The agent has answered everyone. See "All replies".' : 'When a lead answers an email, it appears here within 5 minutes.'}</div></div>`; return; }
+  $('#sub').innerHTML = `<div class="seg" style="margin-bottom:12px"><button data-v="open" class="${view === 'open' ? 'on' : ''}">Needs your answer (${rows.filter(open).length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All Gmail replies (${rows.length})</button></div>`;
+  $$('#sub button').forEach(b => b.onclick = () => { sessionStorage.setItem('rp_view', b.dataset.v); route(); });
+  if (!list.length) { $('#t').innerHTML = `<div class="tablewrap"><div class="empty"><b>${rows.length ? 'Nothing waiting for you' : 'No email replies yet'}</b>${rows.length ? 'The agent has answered everyone. See "All Gmail replies".' : 'When a client answers an email, it appears here within 5 minutes.'}</div></div>`; return; }
   $('#t').innerHTML = `<div class="tasks">${list.map((r, i) => `<article class="task" data-i="${i}">
-      <div class="step">${esc(r['Received On'])} · ${esc(label[r.Category] || r.Category || '')}</div>
-      <div class="top"><div><div class="strong">${esc(r['Business Name'])}</div><div class="sub">${esc([r['Contact Name'], r.From].filter(Boolean).join(' · '))}${r.Inbox ? ' → ' + esc(r.Inbox) : ''}</div></div>${tag(r['Reply Status'])}</div>
+      <div class="step">✉ Gmail · ${esc(r['Received On'])} · ${esc(RP_LABEL[r.Category] || r.Category || '')}</div>
+      <div class="top"><div><div class="strong">${esc(r['Business Name'] || r.From)}</div>
+        <div class="sub">${r['Contact Name'] ? esc(r['Contact Name']) + ' · ' : ''}<a href="mailto:${esc(r.From)}">${esc(r.From)}</a>${r.Inbox ? ' → our inbox ' + esc(r.Inbox) : ''}</div></div>${tag(r['Reply Status'])}</div>
+      ${r.Summary ? `<div class="sub" style="margin-top:6px">Summary: ${esc(r.Summary)}</div>` : ''}
       <div class="sub" style="margin-top:8px">They wrote${r.Subject ? ' (' + esc(r.Subject) + ')' : ''}:</div>
       <div class="msg">${esc(r['Their Message'])}</div>
       ${r['Our Reply'] ? `<div class="sub">We answered:</div><div class="msg">${esc(r['Our Reply'])}</div>` : ''}
@@ -384,6 +484,38 @@ async function pageReplies(el) {
       if (!confirm(`Send this reply to ${r.From}?`)) return;
       await api('/replies/' + encodeURIComponent(r['Reply ID']) + '/answer', { method: 'POST', body: { text } });
       toast('Reply sent to ' + r.From); route();
+    });
+  });
+}
+
+function repliesLinkedIn(rows, open) {
+  const canMail = S.me.role !== 'linkedin';
+  const list = rows.slice().sort((a, b) => open(b) - open(a));
+  $('#sub').innerHTML = '<div class="sub" style="margin-bottom:12px">LinkedIn does not let apps read your messages, so paste each reply on the <a href="#/linkedin">LinkedIn tasks</a> page ("Paste their reply"). It then appears here with a suggested answer.</div>';
+  if (!list.length) { $('#t').innerHTML = '<div class="tablewrap"><div class="empty"><b>No LinkedIn replies yet</b>When someone answers you on LinkedIn, paste their message on the LinkedIn tasks page.</div></div>'; return; }
+  $('#t').innerHTML = `<div class="tasks">${list.map((r, i) => `<article class="task" data-i="${i}">
+      <div class="step">in LinkedIn${r['AI Category'] ? ' · ' + esc(RP_LABEL[r['AI Category']] || r['AI Category']) : ''}${open(r) ? ' · waiting for our answer' : ''}</div>
+      <div class="top"><div><div class="strong">${esc(r.Name)}</div>
+        <div class="sub">${esc([r.Title, r.Company, r.Location].filter(Boolean).join(' · '))}</div>
+        <div class="sub">${r['LinkedIn URL'] ? `<a href="${esc(r['LinkedIn URL'])}" target="_blank" rel="noopener">LinkedIn profile</a>` : ''}${r.Email ? ` · <a href="mailto:${esc(r.Email)}">${esc(r.Email)}</a>` : ' · no email yet'}</div></div>${tag(r.Status)}</div>
+      <div class="sub" style="margin-top:8px">They wrote:</div>
+      <div class="msg">${esc(r['Their Reply'])}</div>
+      <div class="sub">Your answer${r['Suggested Reply'] ? ' (suggested by the AI, edit as you like)' : ''}:</div>
+      <textarea rows="4">${esc(r['Suggested Reply'] || '')}</textarea>
+      <div class="acts" style="margin-top:8px"><button class="btn sm primary" data-li>in&nbsp; Send on LinkedIn</button><button class="btn sm" data-lidone>✓ I sent it on LinkedIn</button>${canMail ? `<button class="btn sm" data-mail>✉ Send by email</button>` : ''}</div>
+      <div class="sub" style="margin-top:4px">Send on LinkedIn copies the answer and opens their profile in your browser (your own LinkedIn): click Message, Ctrl+V, Send, then "I sent it".</div>
+    </article>`).join('')}</div>`;
+  $$('.task').forEach(card => {
+    const r = list[+card.dataset.i], id = encodeURIComponent(r['Lead ID']);
+    const text = () => { const t = $('textarea', card).value.trim(); if (!t) throw new Error('Write your answer first.'); return t; };
+    $('[data-li]', card).onclick = () => { const t = $('textarea', card).value.trim(); if (!t) return toast('Write your answer first.', true); copy(t); if (r['LinkedIn URL']) window.open(r['LinkedIn URL'], '_blank', 'noopener'); };
+    $('[data-lidone]', card).onclick = e => busy(e.currentTarget, async () => { await api('/leads/linkedin/' + id + '/reply', { method: 'POST', body: { channel: 'linkedin', text: text() } }); toast('Saved as sent on LinkedIn'); route(); });
+    if ($('[data-mail]', card)) $('[data-mail]', card).onclick = e => busy(e.currentTarget, async () => {
+      const t = text(); let to = r.Email;
+      if (!to) { to = (prompt(`No email saved for ${r.Name}. Their email address:`) || '').trim(); if (!to) return; }
+      if (!confirm(`Send this answer by email to ${to}?`)) return;
+      const x = await api('/leads/linkedin/' + id + '/reply', { method: 'POST', body: { channel: 'email', to, text: t } });
+      toast('Sent: ' + x.where); route();
     });
   });
 }
