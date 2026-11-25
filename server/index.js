@@ -36,6 +36,7 @@ const need = (...roles) => (req, res, next) => {
 };
 const wrap = fn => (req, res) => Promise.resolve(fn(req, res)).catch(e => res.status(400).json({ error: e.message }));
 const today = engine.today;
+const yes = v => ['yes', 'on', 'true', '1'].includes(String(v || '').toLowerCase());
 
 async function users() { return (await store.read('Users')).filter(u => u.Username); }
 const loginTries = new Map();
@@ -323,7 +324,11 @@ app.post('/api/import/commit', need('owner', 'leader'), wrap(async (req, res) =>
   }
   await store.append('Raw Leads', out);
   uploads.delete(token);
-  res.json({ added: out.length, duplicates: dup, empty, ready: out.filter(r => r.Status === 'New').length });
+  // imported leads are emailed first, starting right now (unless they were imported as anything other than New)
+  const s = await store.settings();
+  const now = out.length && yes(s.AGENT_ON) && String(s.IMPORT_SEND_NOW || 'yes').toLowerCase() !== 'no';
+  if (now) engine.run('importSend').catch(() => {});
+  res.json({ added: out.length, duplicates: dup, empty, ready: out.filter(r => r.Status === 'New').length, withWebsite: out.filter(r => r.Status === 'No Email' && r.Website).length, sendingNow: !!now, agentOff: !yes(s.AGENT_ON) });
 }));
 
 // ---------------------------------------------------------------- templates

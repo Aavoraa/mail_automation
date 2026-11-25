@@ -398,7 +398,9 @@ async function pageImport(el) {
         const mapping = {}; $$('[data-f]').forEach(s => { if (s.value) mapping[s.dataset.f] = s.value; });
         if (!mapping.Email && !mapping['Business Name']) throw new Error('Match at least the Email or Business Name column.');
         const r = await api('/import/commit', { method: 'POST', body: { token: p.token, mapping, defaults: { industry: $('#dI').value, country: $('#dC').value, status: $('#dS').value } } });
-        $('#step2').innerHTML = `<div class="notice ok"><b>Imported ${fmt(r.added)} leads.</b> ${fmt(r.ready)} will be emailed (within your daily limit). Skipped ${fmt(r.duplicates)} duplicates and ${fmt(r.empty)} empty rows.</div><a class="btn" href="#/leads">See all leads</a>`;
+        const when = r.sendingNow ? 'The agent is <b>emailing them now</b>, before all other leads (about one every 30–45 seconds, within today\'s daily limit; any left over go first tomorrow).'
+          : r.agentOff ? 'The agent is switched off: switch it on (Dashboard) and they are emailed first.' : 'They are emailed first, before all other leads.';
+        $('#step2').innerHTML = `<div class="notice ok"><b>Imported ${fmt(r.added)} leads, ${fmt(r.ready)} with an email.</b> ${when}${r.withWebsite ? ` For ${fmt(r.withWebsite)} rows with only a website, the agent looks for an email first.` : ''} Skipped ${fmt(r.duplicates)} duplicates and ${fmt(r.empty)} empty rows.</div><a class="btn" href="#/leads">See all leads</a> <a class="btn" href="#/activity">Watch it in Agent activity</a>`;
       });
     } catch (err) { $('#step2').innerHTML = `<div class="notice err">${esc(err.message)}</div>`; }
   }

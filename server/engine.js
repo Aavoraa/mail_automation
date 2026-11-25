@@ -153,7 +153,8 @@ async function domainTakesMail(email) {
 // as its daily limit allows "so far today", so the day's emails spread evenly over the sending hours.
 async function sendEmails(s, opts = {}) {
   const [h1, h2] = String(s.SEND_HOURS || '8-20').split('-').map(Number);
-  if (!opts.force && !isNaN(h1) && !isNaN(h2) && !(istHour() >= h1 && istHour() < h2)) return 'Outside sending hours, waiting';
+  // opts.imports = the run started right after an import: only imported leads, straight away (no hours window, no pacing), daily limit still applies
+  if (!opts.force && !opts.imports && !isNaN(h1) && !isNaN(h2) && !(istHour() >= h1 && istHour() < h2)) return 'Outside sending hours, waiting';
   const accs = mail.accounts();
   if (!accs.length) throw new Error('Gmail is not connected (Connections page).');
   const main = accs[0].user;
@@ -166,8 +167,8 @@ async function sendEmails(s, opts = {}) {
     const { started, limit } = inboxLimit(s, a);
     const done = rows.filter(r => sentFrom(r, main) === a.user && [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(day)).length;
     let allowed = started ? limit - done : 0;
-    if (!opts.force && even) allowed = Math.min(allowed, Math.ceil(limit * elapsed) + 1 - done);
-    if (!opts.force) allowed = Math.min(allowed, 1);
+    if (!opts.force && !opts.imports && even) allowed = Math.min(allowed, Math.ceil(limit * elapsed) + 1 - done);
+    if (!opts.force && !opts.imports) allowed = Math.min(allowed, 1);
     cap[a.user] = Math.max(0, allowed); limitAll += started ? limit : 0;
     info.push(`${a.user.split('@')[0]} ${done}/${started ? limit : 0}`);
   }
@@ -176,7 +177,7 @@ async function sendEmails(s, opts = {}) {
   if (total <= 0) return `Waiting (sent today: ${info.join(', ')})`;
   const f1 = Number(s.FOLLOWUP_1_DAYS || 3), f2 = Number(s.FOLLOWUP_2_DAYS || 7);
   const due = [];
-  for (const r of rows) {
+  for (const r of opts.imports ? [] : rows) {
     if (!validEmail(r.Email) || !r['Message ID'] || !r['Pitched On']) continue;
     const age = days(r['Pitched On'], day);
     if (r.Status === 'Pitched' && age >= f1) due.push({ lead: r, stage: 1 });
@@ -187,7 +188,9 @@ async function sendEmails(s, opts = {}) {
   const waiting = r => r.Status === 'New' || r.Status === 'Low Fit' || retry(r); // low-fit leads are emailed too, just after the best ones
   const contacted = new Set(rows.filter(r => r.Status && !waiting(r)).map(r => String(r.Email || '').toLowerCase().trim()));
   const fresh = [];
-  for (const r of rows.filter(r => waiting(r) && validEmail(r.Email)).sort((a, b) => Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0))) {
+  // your imported leads always go first, then the best-fitting ones
+  const imported = r => /^Import/i.test(String(r.Source || ''));
+  for (const r of rows.filter(r => waiting(r) && validEmail(r.Email) && (!opts.imports || imported(r))).sort((a, b) => (imported(b) - imported(a)) || Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0))) {
     const e = String(r.Email).toLowerCase().trim(); if (contacted.has(e)) continue; contacted.add(e); fresh.push({ lead: r, stage: 0 });
   }
   // follow-ups go out from the inbox that sent the first email (same thread); new pitches from the inbox with most room left
@@ -230,7 +233,7 @@ async function sendEmails(s, opts = {}) {
       log('send', `Could not email ${lead['Business Name']} from ${from}: ${err.message}`, 'error');
       await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Send Failed', Notes: [lead.Notes, `${day}: ${err.message}`.slice(0, 200)].filter(Boolean).join(' | ') } }]).catch(() => {});
     }
-    if (i < jobs.length - 1) await sleep(opts.fast ? 50 : 20000 + Math.random() * 25000);
+    if (i < jobs.length - 1) await sleep(opts.fast || process.env.AAVORAA_MOCK === '1' ? 50 : 20000 + Math.random() * 25000);
   }
   return `Sent ${sent} email(s) (today: ${info.join(', ')}; limit ${limitAll} across ${accs.length} inbox${accs.length > 1 ? 'es' : ''})`;
 }
@@ -525,10 +528,31 @@ const JOBS = {
   linkedinFollow: { name: 'LinkedIn replies & team alerts', fn: linkedinFollow, every: () => 30 * 60e3 },
   recheck: { name: 'Re-check leads without email + email LinkedIn companies', fn: recheck, every: () => 6 * 3600e3 },
   report: { name: 'Daily report (8:30 PM)', fn: dailyReport, every: null },
+  importSend: { name: 'Email imported leads now (starts after every import)', fn: sendImported, every: null },
 };
+
+// Right after an import: find emails for imported rows that only have a website, then email all imported leads straight away
+async function sendImported(s, opts = {}) {
+  const rows = (await store.read('Raw Leads', true)).filter(r => /^Import/i.test(String(r.Source || '')) && r.Status === 'No Email' && r.Website && !state.rechecked[r['Lead ID']]).slice(0, 100);
+  const fixes = [];
+  for (const r of rows) {
+    state.rechecked[r['Lead ID']] = 1;
+    const found = await discoverEmail(s, r.Website, web.domainOf(r.Website));
+    if (found.email) fixes.push({ key: r['Lead ID'], set: { Email: found.email, Status: 'New', Notes: [r.Notes, `Email ${found.how === 'website' ? 'found on their website' : found.how}`].filter(Boolean).join(' | ') } });
+  }
+  persist();
+  if (fixes.length) { await store.update('Raw Leads', 'Lead ID', fixes); log('send', `Found emails for ${fixes.length} of ${rows.length} imported leads that only had a website`); }
+  const msg = await sendEmails(s, { ...opts, imports: true });
+  return (rows.length ? `Found ${fixes.length} more emails. ` : '') + msg;
+}
+const EXCLUSIVE = ['send', 'importSend']; // never two sending runs at once (no lead can be emailed twice)
 
 async function run(id, opts = {}) {
   if (running[id]) return 'Already running';
+  if (EXCLUSIVE.includes(id)) {
+    if (id === 'send' && running.importSend) return 'Imported leads are being emailed right now';
+    if (id === 'importSend') { const t0 = Date.now(); while (running.send && Date.now() - t0 < 5 * 60e3) await sleep(2000); }
+  }
   running[id] = true;
   try {
     const s = await store.settings();
@@ -553,6 +577,8 @@ async function tick() {
   for (const [id, j] of Object.entries(JOBS)) {
     if (running[id]) continue;
     if (id === 'report') { if (istMinutes() >= 20 * 60 + 30 && state.reportDay !== today()) { state.reportDay = today(); persist(); run(id).catch(() => {}); } continue; }
+    if (!j.every) continue; // started by an action (e.g. an import), not by the clock
+    if (EXCLUSIVE.includes(id) && EXCLUSIVE.some(x => running[x])) continue;
     const last = state.lastRun[id] || 0;
     if (Date.now() - last >= j.every(s)) run(id).catch(() => {});
   }
@@ -568,7 +594,7 @@ function status() {
   return Object.entries(JOBS).map(([id, j]) => {
     const last = state.lastRun[id] || 0;
     const every = j.every ? j.every(s) : null;
-    return { id, name: j.name, running: !!running[id], lastRun: last ? new Date(last).toISOString() : null, nextRun: every ? new Date((last || Date.now()) + every).toISOString() : 'daily 20:30', result: state.lastResult[id] || null };
+    return { id, name: j.name, running: !!running[id], lastRun: last ? new Date(last).toISOString() : null, nextRun: every ? new Date((last || Date.now()) + every).toISOString() : id === 'report' ? 'daily 20:30' : 'after each import', result: state.lastResult[id] || null };
   });
 }
 
@@ -605,4 +631,4 @@ async function callResult(id, status, note, by) {
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, _internals: { findLeads, sendEmails, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, _internals: { findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

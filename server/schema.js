@@ -39,6 +39,7 @@ const SETTINGS = [
   ['DAILY_MAX_LIMIT', '50', 'Never send more than this per day (keep 50 or less on Gmail)', 'Sending limits', 'number'],
   ['FOLLOWUP_1_DAYS', '3', 'Days after the first email for follow-up 1', 'Sending limits', 'number'],
   ['FOLLOWUP_2_DAYS', '7', 'Days after the first email for follow-up 2', 'Sending limits', 'number'],
+  ['IMPORT_SEND_NOW', 'yes', 'yes = leads you import are emailed first and straight away (within the daily limit, any time of day). no = they wait for the normal sending schedule, still first in line', 'Sending limits', 'select', ['yes', 'no']],
   ['SEND_PACING', 'even', 'even = spread each day\'s emails evenly over the sending hours (safest for Gmail). fast = one email every 5 minutes per inbox until the daily limit', 'Sending limits', 'select', ['even', 'fast']],
   ['SEND_HOURS', '8-20', 'Only send new emails between these hours (India time), e.g. 8-20. Use 0-24 for all day', 'Sending limits', 'text'],
   ['MIN_FIT_SCORE', '5', 'Leads the AI scores below this are still emailed, but after the better-fitting ones', 'Lead finding', 'number'],
