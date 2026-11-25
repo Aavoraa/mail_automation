@@ -321,6 +321,11 @@ async function checkReplies(s) {
     const set = { 'Last Reply On': today(), 'Reply Category': a.category, Notes: [lead.Notes, `${today()}: ${a.summary || a.category} (${replied ? (draft ? 'reply saved as draft' : 'agent replied') : 'no reply sent'})`].filter(Boolean).join(' | ').slice(0, 1500) };
     if (map[a.category]) set.Status = map[a.category];
     await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set }]);
+    // keep the full conversation for the Replies page: who wrote, what they said, what we answered
+    const how = !needsReply ? 'No reply needed' : !replied ? 'Not sent - please answer' : draft ? 'Draft saved in Gmail' : a.safe ? 'Holding reply sent - please answer' : 'Agent replied';
+    await store.append('Replies', [{ 'Reply ID': newId('R'), 'Received On': new Date(m.date || Date.now()).toISOString().slice(0, 16).replace('T', ' '), 'Lead ID': lead['Lead ID'], 'Business Name': lead['Business Name'],
+      'Contact Name': m.fromName || lead['Contact Name'] || '', From: from, Inbox: m.inbox || '', Subject: m.subject || '', 'Their Message': text.slice(0, 4000), Category: a.category, Summary: a.summary || '',
+      'Our Reply': replied ? reply : '', 'Reply Status': how, 'Message ID': m.messageId || '', References: [...(m.references || []), m.messageId].filter(Boolean).join(' ').slice(0, 1500) }]).catch(e => log('replies', 'Could not save to the Replies tab: ' + e.message, 'warn'));
     log('replies', `${lead['Business Name']}: ${a.category}${replied ? (draft ? ', draft saved' : ', replied') : ''}`);
     if (a.category === 'interested') {
       const alert = yes(s.ALERT_TEAM_FOR_EMAIL_LEADS) && s.TEAM_LEADER_EMAIL;
@@ -567,6 +572,21 @@ function status() {
   });
 }
 
+// A person answers a lead's reply from the Replies page: sent from the inbox they wrote to, in the same thread
+async function answerReply(id, text, by) {
+  const r = (await store.read('Replies', true)).find(x => x['Reply ID'] === id);
+  if (!r) throw new Error('Reply not found');
+  const body = String(text || '').trim();
+  if (body.length < 2) throw new Error('Write your answer first.');
+  const s = await store.settings();
+  await mail.send({ to: r.From, from: r.Inbox || undefined, subject: 'Re: ' + String(r.Subject || '').replace(/^re:\s*/i, ''), text: body + '\n\n' + signature(s), fromName: senderName(s), inReplyTo: r['Message ID'] || undefined, references: r.References || r['Message ID'] || undefined });
+  const stamp = new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 16).replace('T', ' ');
+  await store.update('Replies', 'Reply ID', [{ key: id, set: { 'Our Reply': [r['Our Reply'], `[${by}, ${stamp}] ${body}`].filter(Boolean).join('\n\n').slice(0, 8000), 'Reply Status': 'Answered by ' + by, 'Answered By': by } }]);
+  const lead = (await store.read('Raw Leads', true)).find(x => x['Lead ID'] === r['Lead ID']);
+  if (lead) await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Notes: [lead.Notes, `${today()}: ${by} answered their reply`].filter(Boolean).join(' | ').slice(0, 1500) } }]);
+  log('replies', `${by} answered ${r['Business Name']} (${r.From})`);
+}
+
 // Result of a call / WhatsApp message, clicked by a team member on the Call / WhatsApp page
 async function callResult(id, status, note, by) {
   const lead = (await store.read('Raw Leads', true)).find(r => r['Lead ID'] === id);
@@ -585,4 +605,4 @@ async function callResult(id, status, note, by) {
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, _internals: { findLeads, sendEmails, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, _internals: { findLeads, sendEmails, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

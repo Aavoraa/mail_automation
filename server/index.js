@@ -219,6 +219,13 @@ app.patch('/api/leads/linkedin/:id', need(), wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ---------------------------------------------------------------- replies: everyone who wrote back, and our answers
+app.get('/api/replies', need('owner', 'leader'), wrap(async (req, res) => res.json(strip(await store.read('Replies')).reverse())));
+app.post('/api/replies/:id/answer', need('owner', 'leader'), wrap(async (req, res) => {
+  await engine.answerReply(req.params.id, (req.body || {}).text, req.user.name);
+  res.json({ ok: true });
+}));
+
 // ---------------------------------------------------------------- call / WhatsApp tasks (sent by a person, so no account can be banned)
 const CALL_STATUSES = ['Messaged', 'No Answer', 'Interested', 'Not Interested', 'Wrong Number'];
 const DIAL = { IN: '91', AU: '61', US: '1', CA: '1', GB: '44', UK: '44', AE: '971', SG: '65', MY: '60', SA: '966', QA: '974', OM: '968', BH: '973', KW: '965', IE: '353', NZ: '64', ES: '34', PT: '351', DE: '49', NL: '31', BE: '32', FR: '33', IT: '39', PL: '48', CZ: '420', BR: '55', MX: '52', ZA: '27', KE: '254', NG: '234', PH: '63', ID: '62', TH: '66', LK: '94', PK: '92', BD: '880', NP: '977', HK: '852', JP: '81' };

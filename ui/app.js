@@ -31,6 +31,7 @@ const PAGES = {
   dashboard: { title: 'Dashboard', ic: '◈', roles: ['owner', 'leader', 'linkedin'], render: pageDashboard, sec: 'Work' },
   linkedin: { title: 'LinkedIn tasks', ic: 'in', roles: ['owner', 'leader', 'linkedin'], render: pageLinkedIn, sec: 'Work' },
   calls: { title: 'Call / WhatsApp', ic: '☎', roles: ['owner', 'leader', 'linkedin'], render: pageCalls, sec: 'Work' },
+  replies: { title: 'Replies', ic: '↩', roles: ['owner', 'leader'], render: pageReplies, sec: 'Work' },
   qualified: { title: 'Qualified leads', ic: '★', roles: ['owner', 'leader'], render: pageQualified, sec: 'Work' },
   leads: { title: 'All email leads', ic: '✉', roles: ['owner', 'leader'], render: pageLeads, sec: 'Work' },
   import: { title: 'Import leads', ic: '⇪', roles: ['owner', 'leader'], render: pageImport, sec: 'Grow' },
@@ -312,6 +313,38 @@ async function pageLinkedIn(el) {
 }
 
 /* ------------------------------------------------------------ import */
+// Everyone who wrote back: who, when, what they said, what we answered, and a box to answer them yourself.
+async function pageReplies(el) {
+  const rows = await api('/replies');
+  const open = r => /please answer|Not sent/i.test(r['Reply Status'] || '');
+  const view = sessionStorage.getItem('rp_view') || (rows.some(open) ? 'open' : 'all');
+  const list = view === 'open' ? rows.filter(open) : rows;
+  const label = { interested: 'Interested ★', question: 'Question', referral: 'Referral', not_interested: 'Not interested', unsubscribe: 'Unsubscribed', out_of_office: 'Out of office', other: 'Other' };
+  el.innerHTML = head('Replies', 'Everyone who answered our emails, what they said and what was sent back. Answer them yourself from here: it goes out from the same inbox, in the same email thread.',
+    `<div class="seg"><button data-v="open" class="${view === 'open' ? 'on' : ''}">Needs your answer (${rows.filter(open).length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All replies (${rows.length})</button></div>`) + '<div id="t"></div>';
+  $$('.seg button').forEach(b => b.onclick = () => { sessionStorage.setItem('rp_view', b.dataset.v); route(); });
+  if (!list.length) { $('#t').innerHTML = `<div class="tablewrap"><div class="empty"><b>${rows.length ? 'Nothing waiting for you' : 'No replies yet'}</b>${rows.length ? 'The agent has answered everyone. See "All replies".' : 'When a lead answers an email, it appears here within 5 minutes.'}</div></div>`; return; }
+  $('#t').innerHTML = `<div class="tasks">${list.map((r, i) => `<article class="task" data-i="${i}">
+      <div class="step">${esc(r['Received On'])} · ${esc(label[r.Category] || r.Category || '')}</div>
+      <div class="top"><div><div class="strong">${esc(r['Business Name'])}</div><div class="sub">${esc([r['Contact Name'], r.From].filter(Boolean).join(' · '))}${r.Inbox ? ' → ' + esc(r.Inbox) : ''}</div></div>${tag(r['Reply Status'])}</div>
+      <div class="sub" style="margin-top:8px">They wrote${r.Subject ? ' (' + esc(r.Subject) + ')' : ''}:</div>
+      <div class="msg">${esc(r['Their Message'])}</div>
+      ${r['Our Reply'] ? `<div class="sub">We answered:</div><div class="msg">${esc(r['Our Reply'])}</div>` : ''}
+      <textarea placeholder="Write your answer to ${esc(r['Contact Name'] || r.From)}… (your signature is added automatically)" style="margin-top:8px"></textarea>
+      <div class="acts" style="margin-top:8px"><button class="btn sm primary" data-send>Send reply</button><button class="btn sm" data-copy>Copy their email</button></div>
+    </article>`).join('')}</div>`;
+  $$('.task').forEach(card => {
+    const r = list[+card.dataset.i];
+    $('[data-copy]', card).onclick = () => copy(r.From);
+    $('[data-send]', card).onclick = e => busy(e.currentTarget, async () => {
+      const text = $('textarea', card).value.trim(); if (!text) throw new Error('Write your answer first.');
+      if (!confirm(`Send this reply to ${r.From}?`)) return;
+      await api('/replies/' + encodeURIComponent(r['Reply ID']) + '/answer', { method: 'POST', body: { text } });
+      toast('Reply sent to ' + r.From); route();
+    });
+  });
+}
+
 // Leads that email cannot reach (or that did not answer the email): a person sends a WhatsApp message or calls.
 // Done by hand, so no WhatsApp or phone account can be banned.
 async function pageCalls(el) {

@@ -9,6 +9,7 @@ const TABS = {
   'Qualified Leads': ['Lead ID', 'Date Qualified', 'Source', 'Business Name', 'Contact Name', 'Email', 'LinkedIn', 'Phone', 'Website', 'Country', 'Service Needed', 'Budget', 'Timeline', 'Lead Score', 'Their Message', 'Summary', 'Next Step', 'Owner', 'Team Alerted'],
   'LinkedIn Leads': ['Lead ID', 'Date Found', 'Name', 'Title', 'Company', 'Industry', 'Location', 'LinkedIn URL', 'Fit Score', 'Best Service', 'Connection Note', 'First Message', 'Status', 'Their Reply', 'Suggested Reply', 'AI Category', 'Forwarded To Team', 'Handled By', 'Notes'],
   'Templates': ['Template ID', 'Name', 'Stage', 'Subject', 'Body', 'AI Personalise', 'Active', 'Created By', 'Updated On'],
+  'Replies': ['Reply ID', 'Received On', 'Lead ID', 'Business Name', 'Contact Name', 'From', 'Inbox', 'Subject', 'Their Message', 'Category', 'Summary', 'Our Reply', 'Reply Status', 'Answered By', 'Message ID', 'References'],
   'Users': ['Username', 'Name', 'Role', 'Password Hash', 'Active', 'Created On', 'Last Login'],
 };
 
