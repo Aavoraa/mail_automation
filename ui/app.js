@@ -52,8 +52,87 @@ async function route() {
   if (!p || !p.roles.includes(S.me.role)) { location.hash = '#/' + (S.me.role === 'linkedin' ? 'linkedin' : 'dashboard'); return; }
   shell(page);
   try { await p.render($('#page')); } catch (e) { $('#page').innerHTML = `<div class="notice err">${esc(e.message)}</div>`; }
+  autoSeen(); drawBadges(); startNotify();
 }
 window.addEventListener('hashchange', route);
+
+/* ------------------------------------------------------------ notifications: red badges, pop sound, pop-up */
+// A red circle with the number of new items sits on the menu item (and tab) where they arrived; it clears when you open it.
+// Each new client reply or qualified lead plays a short "pop" and shows a Windows pop-up.
+const N = { data: null, seen: null, known: null, user: '', timer: null };
+const NSECS = ['gmail', 'linkedin', 'qualified'];
+const NLABEL = { gmail: 'New Gmail reply', linkedin: 'New LinkedIn reply', qualified: 'New qualified lead' };
+const NPAGE = { gmail: 'replies', linkedin: 'replies', qualified: 'qualified' };
+const seenKey = () => 'aav_seen_' + ((S.me && (S.me.username || S.me.name)) || '');
+const store_ = { get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
+const unseen = sec => (N.data && N.data[sec] || []).filter(x => !(N.seen && (N.seen[sec] || []).includes(x.id)));
+function markSeen(sec) { if (!N.data || !N.seen) return; N.seen[sec] = N.data[sec].map(x => x.id); store_.set(seenKey(), N.seen); drawBadges(); }
+// what you are looking at right now counts as seen (only while the window is really in front of you)
+function autoSeen() {
+  if (!N.data || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+  const page = (location.hash.replace(/^#\/?/, '').split('?')[0]) || 'dashboard';
+  if (page === 'qualified') markSeen('qualified');
+  if (page === 'replies') markSeen(S.me.role === 'linkedin' ? 'linkedin' : (sessionStorage.getItem('rp_src') || 'gmail'));
+}
+function badgeOn(el, n) {
+  if (!el) return; let b = $('.nbadge', el);
+  if (!n) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement('span'); b.className = 'nbadge'; el.appendChild(b); }
+  b.textContent = n > 99 ? '99+' : n; b.title = n + ' new';
+}
+function drawBadges() {
+  const g = unseen('gmail').length, l = unseen('linkedin').length, q = unseen('qualified').length;
+  badgeOn($('.nav a[href="#/replies"]'), g + l); badgeOn($('.nav a[href="#/qualified"]'), q);
+  badgeOn($('.head .seg button[data-s="gmail"]'), g); badgeOn($('.head .seg button[data-s="linkedin"]'), l);
+  badgeOn($('#menuBtn'), g + l + q);
+  const total = g + l + q;
+  document.title = (total ? `(${total}) ` : '') + 'AAVORAA Lead Agent';
+  if (window.aavDesktop) window.aavDesktop.badge(total);
+}
+let actx = null;
+function pop() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+    const t = actx.currentTime, o = actx.createOscillator(), g = actx.createGain();
+    o.type = 'sine'; o.frequency.setValueAtTime(900, t); o.frequency.exponentialRampToValueAtTime(300, t + 0.12);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.6, t + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+    o.connect(g).connect(actx.destination); o.start(t); o.stop(t + 0.22);
+  } catch (e) {}
+}
+function popup(items) {
+  const one = items.length === 1, x = items[0];
+  const title = one ? `${NLABEL[x.sec]}: ${x.who || ''}` : `${items.length} new: ` + NSECS.map(s => [s, items.filter(i => i.sec === s).length]).filter(a => a[1]).map(([s, n]) => `${n} ${s === 'qualified' ? 'qualified' : s === 'gmail' ? 'Gmail' : 'LinkedIn'}`).join(', ');
+  const body = one ? x.text || '' : items.slice(0, 3).map(i => `${i.who}: ${i.text}`).join('\n');
+  const page = NPAGE[x.sec];
+  if (window.aavDesktop) return window.aavDesktop.notify({ title, body, page, src: x.sec });
+  toast(title);
+  try { if ('Notification' in window && Notification.permission === 'granted') { const n = new Notification(title, { body, silent: true }); n.onclick = () => { window.focus(); if (x.sec !== 'qualified') sessionStorage.setItem('rp_src', x.sec); location.hash = '#/' + page; }; } } catch (e) {}
+}
+async function pollNotify() {
+  if (!S.me) return;
+  let d; try { d = await api('/notify'); } catch (e) { return; }
+  N.data = d;
+  if (N.user !== seenKey()) { N.user = seenKey(); N.seen = store_.get(seenKey()); N.known = null; if (!N.seen) { N.seen = {}; NSECS.forEach(s => N.seen[s] = d[s].map(x => x.id)); store_.set(seenKey(), N.seen); } }
+  const fresh = [];
+  if (N.known) for (const s of NSECS) for (const x of d[s]) if (!N.known[s].has(x.id) && !(N.seen[s] || []).includes(x.id)) fresh.push({ sec: s, ...x });
+  N.known = {}; NSECS.forEach(s => N.known[s] = new Set(d[s].map(x => x.id)));
+  if (fresh.length) {
+    pop(); popup(fresh);
+    // refresh the page you are on if the new item belongs there and you are not typing
+    const page = (location.hash.replace(/^#\/?/, '').split('?')[0]) || 'dashboard';
+    if (fresh.some(f => NPAGE[f.sec] === page) && !$$('#page textarea, #page input').some(t => t.value && t.value.trim() && t.matches(':focus'))) { route(); return; }
+  }
+  autoSeen(); drawBadges();
+}
+function startNotify() {
+  if (N.timer || !S.me) return;
+  try { if (!window.aavDesktop && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {}
+  pollNotify(); N.timer = setInterval(pollNotify, 20000);
+}
+window.addEventListener('focus', () => { autoSeen(); drawBadges(); });
+document.addEventListener('visibilitychange', () => { autoSeen(); drawBadges(); });
+if (window.aavDesktop && window.aavDesktop.onOpen) window.aavDesktop.onOpen(o => { if (o.src && o.src !== 'qualified') sessionStorage.setItem('rp_src', o.src); if (location.hash === '#/' + o.page) route(); else location.hash = '#/' + o.page; });
 
 function shell(active) {
   let nav = '', sec = '';

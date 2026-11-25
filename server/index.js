@@ -220,6 +220,18 @@ app.post('/api/leads/qualified/:id/reply', need('owner', 'leader'), wrap(async (
   const b = req.body || {};
   res.json({ ok: true, ...(await engine.qualifiedReply(req.params.id, { channel: b.channel, to: b.to, text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
 }));
+// What is new, for the red badges and the pop sound: ids of every client reply (Gmail, LinkedIn) and qualified lead
+const liKey = r => r['Lead ID'] + ':' + String(r['Their Reply'] || '').length;
+app.get('/api/notify', need(), wrap(async (req, res) => {
+  const mailOk = req.user.role !== 'linkedin';
+  const [rep, li, qual] = await Promise.all([mailOk ? store.read('Replies') : [], store.read('LinkedIn Leads'), mailOk ? store.read('Qualified Leads') : []]);
+  res.json({
+    gmail: rep.map(r => ({ id: r['Reply ID'], who: r['Contact Name'] || r['Business Name'] || r.From, text: String(r['Their Message'] || '').slice(0, 120) })),
+    linkedin: li.filter(r => String(r['Their Reply'] || '').trim()).map(r => ({ id: liKey(r), who: r.Name, text: String(r['Their Reply']).slice(0, 120) })),
+    qualified: qual.map(r => ({ id: r['Lead ID'], who: r['Business Name'] || r['Contact Name'], text: r.Summary || r['Service Needed'] || '' })),
+  });
+}));
+
 app.post('/api/leads/linkedin/:id/reply', need(), wrap(async (req, res) => {
   const b = req.body || {};
   if (b.channel === 'email' && req.user.role === 'linkedin') throw new Error('Only the owner or team leader can send emails.');
