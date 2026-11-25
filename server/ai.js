@@ -311,11 +311,19 @@ Return ONLY a JSON object:
   linkedinReply(s, r) {
     return `${who(s)}\nLinkedIn conversation with ${r.Name} (${r.Title} at ${r.Company}):\nOur message: [[[${r['First Message']}]]]\nTheir reply: [[[${r['Their Reply'] || '(no text pasted, team marked them as interested)'}]]]\n\n${rules(s)} Keep it short (30-80 words), same language as them. If interested, suggest a short call${s.BOOKING_LINK ? ' and share this link: ' + s.BOOKING_LINK : ''}.\nReturn ONLY JSON:\n{"category": "interested" | "question" | "not_interested" | "other", "lead_score": "Hot" | "Warm" | "Cold",\n "service_needed": "", "summary": "one sentence", "next_step": "short next step", "suggested_reply": "LinkedIn reply text, or empty if not interested"}`;
   },
+  qualifiedReply(s, q, channel, latest, history) {
+    const booking = s.BOOKING_LINK ? `If a call is the next step, share this booking link: ${s.BOOKING_LINK}` : 'If a call is the next step, ask for two or three times that suit them, and their time zone.';
+    return `${who(s)}\nThis is a QUALIFIED lead: they already said they are interested. Write our next ${channel === 'linkedin' ? 'LinkedIn message (30-90 words, no subject, no signature)' : 'email (40-120 words, no signature)'}.\n\nLead: ${q['Business Name'] || ''} | contact: ${q['Contact Name'] || 'unknown'} | country: ${q.Country || ''}\nService they need: ${q['Service Needed'] || 'not clear yet'}\nBudget: ${q.Budget || 'unknown'} | Timeline: ${q.Timeline || 'unknown'}\nWhat they said before: [[[${q['Their Message'] || ''}]]]\nSummary: ${q.Summary || ''}\nOur team's next step: ${q['Next Step'] || ''}\n` +
+      (history ? `What we already sent them: [[[${String(history).slice(-1500)}]]]\n` : '') +
+      (latest ? `Their LATEST message (answer this): [[[${latest}]]]\n` : '') +
+      `\n${rules(s)} Same language they wrote in. Answer what they asked, move toward a short call. Never invent prices, timelines, guarantees or past clients. ${booking}\nReturn ONLY JSON: {"reply": "..."}`;
+  },
 };
 
 // ---------- mock AI for tests
 function mockAI(prompt) {
   if (prompt.includes('"fit_score": number')) return { fit_score: 7, best_service: 'SEO & AI Search Visibility', website_issues: 'No meta description ; footer shows 2021', pitch_angle: 'More enquiries from Google search', contact_name: '', language: 'English', is_real_business: true };
+  if (prompt.includes('QUALIFIED lead')) return { reply: 'Thanks for your interest. Would a 15-minute call on Tuesday or Wednesday work for you?' };
   if (prompt.includes('A lead replied')) return { category: /interest|yes|call/i.test(prompt.split('Their reply')[1] || '') ? 'interested' : 'question', lead_score: 'Hot', service_needed: 'SEO', summary: 'Wants a call next week', next_step: 'Book a call', reply: 'Thank you, happy to set up a short call. Would Tuesday or Wednesday suit you?' };
   if (prompt.includes('connection_note')) return { fit_score: 8, best_service: 'Performance Marketing', connection_note: 'Hi, I liked your work, would be glad to connect.', first_message: 'Thanks for connecting. One idea that helps businesses like yours is...' };
   if (prompt.includes('suggested_reply')) return { category: 'interested', lead_score: 'Warm', service_needed: 'SEO', summary: 'Open to a call', next_step: 'Message on LinkedIn', suggested_reply: 'Great, would a 15-minute call this week work?' };

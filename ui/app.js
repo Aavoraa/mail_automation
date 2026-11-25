@@ -283,11 +283,37 @@ async function pageQualified(el) {
   const rows = await api('/leads/qualified');
   el.innerHTML = head('Qualified leads', 'People who said yes. The team leader also gets an email for each one.') + '<div id="t"></div>';
   table($('#t'), { rows, statusKey: 'Lead Score', empty: ['No qualified leads yet', 'When someone replies "yes, interested", they appear here.'],
-    cols: [{ k: 'Date Qualified', l: 'Date' }, { k: 'Business Name', l: 'Business', h: r => `<div class="strong">${esc(r['Business Name'] || r['Contact Name'])}</div><div class="sub">${esc(r['Contact Name'])}</div>` }, { k: 'Source', l: 'Source', h: r => tag(r.Source === 'LinkedIn' ? 'LinkedIn' : 'Email') }, { k: 'Service Needed', l: 'Service needed' }, { k: 'Lead Score', l: 'Score', h: r => tag(r['Lead Score']) }, { k: 'Country', l: 'Country' }, { k: 'Next Step', l: 'Next step' }, { k: 'Owner', l: 'Owner' }],
+    cols: [{ k: 'Date Qualified', l: 'Date' }, { k: 'Business Name', l: 'Business', h: r => `<div class="strong">${esc(r['Business Name'] || r['Contact Name'])}</div><div class="sub">${esc(r['Contact Name'])}</div>` }, { k: 'Source', l: 'Source', h: r => tag(r.Source === 'LinkedIn' ? 'LinkedIn' : 'Email') }, { k: 'Service Needed', l: 'Service needed' }, { k: 'Lead Score', l: 'Score', h: r => tag(r['Lead Score']) }, { k: 'Country', l: 'Country' }, { k: 'Next Step', l: 'Next step' }, { k: 'Owner', l: 'Owner' }, { k: 'Last Contact On', l: 'Last contact', h: r => r['Last Contact On'] ? `${esc(r['Last Contact On'])}<div class="sub">${esc(r['Last Contact By'])}</div>` : '<span class="sub">not yet</span>' }],
     onRow: r => {
       const d = drawer(r['Business Name'] || r['Contact Name'], tag(r['Lead Score']) + ' ' + tag(r.Source), `<div class="row2"><label class="f"><span>Next step</span><input type="text" id="nx" value="${esc(r['Next Step'])}"></label><label class="f"><span>Owner</span><input type="text" id="ow" value="${esc(r.Owner)}"></label></div>
-        <label class="f"><span>Score</span><select id="sc">${['Hot', 'Warm', 'Cold'].map(s => `<option ${s === r['Lead Score'] ? 'selected' : ''}>${s}</option>`).join('')}</select></label>${fields(r, ['Business Name', 'Next Step', 'Owner'], ['Email', 'Phone', 'LinkedIn'])}`, '<button class="btn primary" id="sv">Save</button>');
-      $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/qualified/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { 'Next Step': $('#nx', d).value, Owner: $('#ow', d).value, 'Lead Score': $('#sc', d).value } }); toast('Saved'); closeLayer(); route(); });
+        <label class="f"><span>Score</span><select id="sc">${['Hot', 'Warm', 'Cold'].map(s => `<option ${s === r['Lead Score'] ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
+        <div class="field"><div class="k">Reply to them</div>
+          <div class="seg" style="margin:6px 0" id="ch">${r.LinkedIn ? `<button data-c="linkedin" class="${r.LinkedIn ? 'on' : ''}">in LinkedIn</button>` : ''}<button data-c="email" class="${r.LinkedIn ? '' : 'on'}">✉ Email</button></div>
+          <textarea id="lt" rows="3" placeholder="Optional: paste their latest message, so the AI answers it"></textarea>
+          <div class="acts" style="margin:6px 0"><button class="btn sm" id="qd">✎ Write it for me (AI)</button></div>
+          <input type="email" id="qe" value="${esc(r.Email)}" placeholder="Their email address" style="margin-bottom:6px">
+          <textarea id="qt" rows="7" placeholder="Your reply…"></textarea>
+          <div class="acts" style="margin-top:8px"><button class="btn sm primary" id="qs"></button><button class="btn sm hidden" id="qm">✓ I sent it on LinkedIn</button></div>
+          <div class="sub" id="qh" style="margin-top:4px"></div></div>
+        ${r['Our Replies'] ? `<div class="field"><div class="k">What we sent them</div><div class="msg" style="white-space:pre-wrap">${esc(r['Our Replies'])}</div></div>` : ''}
+        ${fields(r, ['Business Name', 'Next Step', 'Owner', 'Our Replies'], ['Email', 'Phone', 'LinkedIn'])}`, '<button class="btn primary" id="sv">Save</button>');
+      const id = encodeURIComponent(r['Lead ID']);
+      let ch = r.LinkedIn ? 'linkedin' : 'email';
+      const setCh = c => { ch = c; $$('#ch button', d).forEach(b => b.classList.toggle('on', b.dataset.c === c)); const li = c === 'linkedin';
+        $('#qe', d).classList.toggle('hidden', li); $('#qm', d).classList.toggle('hidden', !li);
+        $('#qs', d).innerHTML = li ? 'in&nbsp; Send on LinkedIn' : 'Send email';
+        $('#qh', d).innerHTML = li ? 'Copies the reply and opens their LinkedIn in your browser (your own LinkedIn account). Click <b>Message</b>, Ctrl+V, Send. Then click <b>I sent it on LinkedIn</b> so it is saved here.' : 'Sent from your Gmail, in the same thread as earlier emails to them.'; };
+      $$('#ch button', d).forEach(b => b.onclick = () => setCh(b.dataset.c)); setCh(ch);
+      $('#qd', d).onclick = e => busy(e.currentTarget, async () => { const x = await api('/leads/qualified/' + id + '/draft', { method: 'POST', body: { channel: ch, latest: $('#lt', d).value.trim() } }); $('#qt', d).value = x.text; if (!x.ai) toast('AI not available right now, a simple reply was filled in', true); $('#qt', d).focus(); });
+      const save = async () => api('/leads/qualified/' + id + '/reply', { method: 'POST', body: { channel: ch, to: $('#qe', d).value.trim(), text: $('#qt', d).value.trim() } });
+      $('#qs', d).onclick = e => busy(e.currentTarget, async () => {
+        const text = $('#qt', d).value.trim(); if (!text) throw new Error('Write the reply first (or click "Write it for me").');
+        if (ch === 'linkedin') { copy(text); window.open(r.LinkedIn, '_blank', 'noopener'); return; }
+        if (!confirm(`Send this email to ${$('#qe', d).value.trim()} now?`)) return;
+        const x = await save(); toast('Sent: ' + x.where); closeLayer(); route();
+      });
+      $('#qm', d).onclick = e => busy(e.currentTarget, async () => { if (!$('#qt', d).value.trim()) throw new Error('The reply box is empty.'); await save(); toast('Saved as sent on LinkedIn'); closeLayer(); route(); });
+      $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/qualified/' + id, { method: 'PATCH', body: { 'Next Step': $('#nx', d).value, Owner: $('#ow', d).value, 'Lead Score': $('#sc', d).value } }); toast('Saved'); closeLayer(); route(); });
     } });
 }
 

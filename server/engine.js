@@ -651,6 +651,49 @@ async function emailLead(id, { to, subject, text }, by) {
   return { to, from };
 }
 
+// ---- Qualified leads: our next message to them, by email (sent from the app) or on LinkedIn (sent by a person from their own LinkedIn)
+const stampNow = () => new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 16).replace('T', ' ');
+async function qualifiedLead(id) {
+  const q = (await store.read('Qualified Leads', true)).find(r => r['Lead ID'] === id);
+  if (!q) throw new Error('Lead not found');
+  return q;
+}
+async function qualifiedDraft(id, channel, latest) {
+  const q = await qualifiedLead(id), s = await store.settings();
+  try {
+    const a = await gemini(P.qualifiedReply(s, q, channel, String(latest || '').slice(0, 3000), q['Our Replies']), s.GEMINI_MODEL, { priority: 'reply' });
+    if (a && a.reply) return { text: clean(a.reply), ai: true };
+  } catch (e) { if (!aiUnavailable(e)) log('replies', 'AI could not write the reply: ' + e.message, 'warn'); }
+  const name = ai.firstName(q['Contact Name']) || 'there';
+  return { text: `Hi ${name},\n\nThank you for your interest${q['Service Needed'] ? ' in ' + q['Service Needed'] : ''}. The easiest next step is a short 15-minute call so we can understand what you need and share a clear plan. ${s.BOOKING_LINK ? 'You can pick a time here: ' + s.BOOKING_LINK : 'Which day and time suit you this week?'}`, ai: false };
+}
+async function qualifiedReply(id, { channel, text, to }, by) {
+  const q = await qualifiedLead(id), body = String(text || '').trim();
+  if (body.length < 2) throw new Error('Write the message first.');
+  const s = await store.settings(), day = today();
+  let where;
+  if (channel === 'email') {
+    to = String(to || q.Email || '').trim();
+    if (!validEmail(to)) throw new Error('This lead has no valid email address. Add one, or use LinkedIn.');
+    const accs = mail.accounts(); if (!accs.length) throw new Error('Gmail is not connected (Connections page).');
+    const raw = (await store.read('Raw Leads', true)).find(r => r['Lead ID'] === id || String(r.Email || '').toLowerCase().trim() === to.toLowerCase());
+    const main = accs[0].user, prev = raw ? sentFrom(raw, main) : main;
+    const from = accs.some(a => a.user === prev) ? prev : main;
+    const thread = raw && raw['Message ID'] && String(raw.Email || '').toLowerCase().trim() === to.toLowerCase();
+    const subject = thread ? 'Re: ' + String(raw['Email Subject'] || '').replace(/^re:\s*/i, '') : `${s.COMPANY} - next steps${q['Service Needed'] ? ' for ' + q['Service Needed'] : ''}`;
+    await mail.send({ to, from, subject, text: body + '\n\n' + signature(s), fromName: senderName(s), ...(thread ? { inReplyTo: raw['Message ID'], references: raw['Message ID'] } : {}) });
+    where = `email to ${to}`;
+  } else if (channel === 'linkedin') {
+    where = 'LinkedIn';
+    const li = (await store.read('LinkedIn Leads', true)).find(r => r['Lead ID'] === id || (q.LinkedIn && r['LinkedIn URL'] === q.LinkedIn));
+    if (li) await store.update('LinkedIn Leads', 'Lead ID', [{ key: li['Lead ID'], set: { 'Handled By': by, Notes: [li.Notes, `${day}: ${by} sent: ${body.slice(0, 200)}`].filter(Boolean).join(' | ').slice(0, 1500) } }]).catch(() => {});
+  } else throw new Error('Choose email or LinkedIn');
+  const entry = `[${stampNow()}, ${by}, ${where}] ${body}`;
+  await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { 'Our Replies': [q['Our Replies'], entry].filter(Boolean).join('\n\n').slice(-8000), 'Last Contact On': day, 'Last Contact By': by } }]);
+  log('replies', `${by} replied to qualified lead ${q['Business Name'] || q['Contact Name']} by ${where}`);
+  return { where };
+}
+
 // Result of a call / WhatsApp message, clicked by a team member on the Call / WhatsApp page
 async function callResult(id, status, note, by) {
   const lead = (await store.read('Raw Leads', true)).find(r => r['Lead ID'] === id);
@@ -669,4 +712,4 @@ async function callResult(id, status, note, by) {
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, _internals: { findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, qualifiedDraft, qualifiedReply, _internals: { findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

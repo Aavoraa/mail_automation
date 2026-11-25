@@ -210,6 +210,14 @@ app.patch('/api/leads/qualified/:id', need('owner', 'leader'), wrap(async (req, 
   for (const k of ['Next Step', 'Owner', 'Lead Score']) if (b[k] !== undefined) set[k] = String(b[k]).slice(0, 500);
   await store.update('Qualified Leads', 'Lead ID', [{ key: req.params.id, set }]); res.json({ ok: true });
 }));
+app.post('/api/leads/qualified/:id/draft', need('owner', 'leader'), wrap(async (req, res) => {
+  const b = req.body || {};
+  res.json(await engine.qualifiedDraft(req.params.id, b.channel === 'linkedin' ? 'linkedin' : 'email', b.latest));
+}));
+app.post('/api/leads/qualified/:id/reply', need('owner', 'leader'), wrap(async (req, res) => {
+  const b = req.body || {};
+  res.json({ ok: true, ...(await engine.qualifiedReply(req.params.id, { channel: b.channel, to: b.to, text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
+}));
 app.patch('/api/leads/linkedin/:id', need(), wrap(async (req, res) => {
   const b = req.body || {}, set = { 'Handled By': req.user.name };
   if (b.Status) { if (!LI_STATUSES.includes(b.Status)) throw new Error('Unknown status'); set.Status = b.Status; }
