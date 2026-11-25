@@ -228,10 +228,17 @@ app.get('/api/notify', need(), wrap(async (req, res) => {
   res.json({
     gmail: rep.map(r => ({ id: r['Reply ID'], who: r['Contact Name'] || r['Business Name'] || r.From, text: String(r['Their Message'] || '').slice(0, 120) })),
     linkedin: li.filter(r => String(r['Their Reply'] || '').trim()).map(r => ({ id: liKey(r), who: r.Name, text: String(r['Their Reply']).slice(0, 120) })),
+    accepted: li.filter(r => r.Status === 'Connected').map(r => ({ id: r['Lead ID'], who: r.Name, text: 'Accepted your connection request. Send them the first message.' })),
     qualified: qual.map(r => ({ id: r['Lead ID'], who: r['Business Name'] || r['Contact Name'], text: r.Summary || r['Service Needed'] || '' })),
   });
 }));
 
+// LinkedIn auto-connect (runs in the Windows app on the main PC)
+app.get('/api/linkedin/bot', need(), wrap(async (req, res) => res.json(global.liBot ? await global.liBot.status() : { available: false })));
+app.post('/api/linkedin/bot/run', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); res.json({ ok: true, msg: await global.liBot.runNow() }); }));
+app.post('/api/linkedin/bot/signin', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); global.liBot.signIn(); res.json({ ok: true }); }));
+app.post('/api/linkedin/bot/signout', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); await global.liBot.signOut(); res.json({ ok: true }); }));
+app.post('/api/linkedin/bot/switch', need('owner'), wrap(async (req, res) => { await store.saveSettings({ LINKEDIN_AUTO_CONNECT: req.body && req.body.on ? 'yes' : 'no' }); res.json({ ok: true }); }));
 app.post('/api/leads/linkedin/:id/reply', need(), wrap(async (req, res) => {
   const b = req.body || {};
   if (b.channel === 'email' && req.user.role === 'linkedin') throw new Error('Only the owner or team leader can send emails.');

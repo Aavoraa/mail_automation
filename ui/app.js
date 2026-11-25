@@ -60,18 +60,19 @@ window.addEventListener('hashchange', route);
 // A red circle with the number of new items sits on the menu item (and tab) where they arrived; it clears when you open it.
 // Each new client reply or qualified lead plays a short "pop" and shows a Windows pop-up.
 const N = { data: null, seen: null, known: null, user: '', timer: null };
-const NSECS = ['gmail', 'linkedin', 'qualified'];
-const NLABEL = { gmail: 'New Gmail reply', linkedin: 'New LinkedIn reply', qualified: 'New qualified lead' };
-const NPAGE = { gmail: 'replies', linkedin: 'replies', qualified: 'qualified' };
+const NSECS = ['gmail', 'linkedin', 'qualified', 'accepted'];
+const NLABEL = { gmail: 'New Gmail reply', linkedin: 'New LinkedIn reply', qualified: 'New qualified lead', accepted: 'Accepted on LinkedIn' };
+const NPAGE = { gmail: 'replies', linkedin: 'replies', qualified: 'qualified', accepted: 'linkedin' };
 const seenKey = () => 'aav_seen_' + ((S.me && (S.me.username || S.me.name)) || '');
 const store_ = { get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
 const unseen = sec => (N.data && N.data[sec] || []).filter(x => !(N.seen && (N.seen[sec] || []).includes(x.id)));
-function markSeen(sec) { if (!N.data || !N.seen) return; N.seen[sec] = N.data[sec].map(x => x.id); store_.set(seenKey(), N.seen); drawBadges(); }
+function markSeen(sec) { if (!N.data || !N.seen || !N.data[sec]) return; N.seen[sec] = N.data[sec].map(x => x.id); store_.set(seenKey(), N.seen); drawBadges(); }
 // what you are looking at right now counts as seen (only while the window is really in front of you)
 function autoSeen() {
   if (!N.data || document.visibilityState !== 'visible' || !document.hasFocus()) return;
   const page = (location.hash.replace(/^#\/?/, '').split('?')[0]) || 'dashboard';
   if (page === 'qualified') markSeen('qualified');
+  if (page === 'linkedin') markSeen('accepted');
   if (page === 'replies') markSeen(S.me.role === 'linkedin' ? 'linkedin' : (sessionStorage.getItem('rp_src') || 'gmail'));
 }
 function badgeOn(el, n) {
@@ -81,11 +82,11 @@ function badgeOn(el, n) {
   b.textContent = n > 99 ? '99+' : n; b.title = n + ' new';
 }
 function drawBadges() {
-  const g = unseen('gmail').length, l = unseen('linkedin').length, q = unseen('qualified').length;
-  badgeOn($('.nav a[href="#/replies"]'), g + l); badgeOn($('.nav a[href="#/qualified"]'), q);
+  const g = unseen('gmail').length, l = unseen('linkedin').length, q = unseen('qualified').length, a = unseen('accepted').length;
+  badgeOn($('.nav a[href="#/replies"]'), g + l); badgeOn($('.nav a[href="#/qualified"]'), q); badgeOn($('.nav a[href="#/linkedin"]'), a);
   badgeOn($('.head .seg button[data-s="gmail"]'), g); badgeOn($('.head .seg button[data-s="linkedin"]'), l);
-  badgeOn($('#menuBtn'), g + l + q);
-  const total = g + l + q;
+  badgeOn($('#menuBtn'), g + l + q + a);
+  const total = g + l + q + a;
   document.title = (total ? `(${total}) ` : '') + 'AAVORAA Lead Agent';
   if (window.aavDesktop) window.aavDesktop.badge(total);
 }
@@ -102,21 +103,23 @@ function pop() {
 }
 function popup(items) {
   const one = items.length === 1, x = items[0];
-  const title = one ? `${NLABEL[x.sec]}: ${x.who || ''}` : `${items.length} new: ` + NSECS.map(s => [s, items.filter(i => i.sec === s).length]).filter(a => a[1]).map(([s, n]) => `${n} ${s === 'qualified' ? 'qualified' : s === 'gmail' ? 'Gmail' : 'LinkedIn'}`).join(', ');
+  const title = one ? `${NLABEL[x.sec]}: ${x.who || ''}` : `${items.length} new: ` + NSECS.map(s => [s, items.filter(i => i.sec === s).length]).filter(a => a[1]).map(([s, n]) => `${n} ${s === 'qualified' ? 'qualified' : s === 'gmail' ? 'Gmail' : s === 'accepted' ? 'accepted on LinkedIn' : 'LinkedIn'}`).join(', ');
   const body = one ? x.text || '' : items.slice(0, 3).map(i => `${i.who}: ${i.text}`).join('\n');
   const page = NPAGE[x.sec];
   if (window.aavDesktop) return window.aavDesktop.notify({ title, body, page, src: x.sec });
   toast(title);
-  try { if ('Notification' in window && Notification.permission === 'granted') { const n = new Notification(title, { body, silent: true }); n.onclick = () => { window.focus(); if (x.sec !== 'qualified') sessionStorage.setItem('rp_src', x.sec); location.hash = '#/' + page; }; } } catch (e) {}
+  try { if ('Notification' in window && Notification.permission === 'granted') { const n = new Notification(title, { body, silent: true }); n.onclick = () => { window.focus(); if (NPAGE[x.sec] === 'replies') sessionStorage.setItem('rp_src', x.sec); location.hash = '#/' + page; }; } } catch (e) {}
 }
 async function pollNotify() {
   if (!S.me) return;
   let d; try { d = await api('/notify'); } catch (e) { return; }
   N.data = d;
-  if (N.user !== seenKey()) { N.user = seenKey(); N.seen = store_.get(seenKey()); N.known = null; if (!N.seen) { N.seen = {}; NSECS.forEach(s => N.seen[s] = d[s].map(x => x.id)); store_.set(seenKey(), N.seen); } }
+  if (N.user !== seenKey()) { N.user = seenKey(); N.seen = store_.get(seenKey()); N.known = null; if (!N.seen) N.seen = {}; }
+  // a section seen for the first time (new user or new kind of alert) starts with everything already there counted as seen
+  if (NSECS.some(s => !N.seen[s] && d[s])) { NSECS.forEach(s => { if (!N.seen[s] && d[s]) N.seen[s] = d[s].map(x => x.id); }); store_.set(seenKey(), N.seen); }
   const fresh = [];
-  if (N.known) for (const s of NSECS) for (const x of d[s]) if (!N.known[s].has(x.id) && !(N.seen[s] || []).includes(x.id)) fresh.push({ sec: s, ...x });
-  N.known = {}; NSECS.forEach(s => N.known[s] = new Set(d[s].map(x => x.id)));
+  if (N.known) for (const s of NSECS) for (const x of d[s] || []) if (!N.known[s].has(x.id) && !(N.seen[s] || []).includes(x.id)) fresh.push({ sec: s, ...x });
+  N.known = {}; NSECS.forEach(s => N.known[s] = new Set((d[s] || []).map(x => x.id)));
   if (fresh.length) {
     pop(); popup(fresh);
     // refresh the page you are on if the new item belongs there and you are not typing
@@ -132,7 +135,7 @@ function startNotify() {
 }
 window.addEventListener('focus', () => { autoSeen(); drawBadges(); });
 document.addEventListener('visibilitychange', () => { autoSeen(); drawBadges(); });
-if (window.aavDesktop && window.aavDesktop.onOpen) window.aavDesktop.onOpen(o => { if (o.src && o.src !== 'qualified') sessionStorage.setItem('rp_src', o.src); if (location.hash === '#/' + o.page) route(); else location.hash = '#/' + o.page; });
+if (window.aavDesktop && window.aavDesktop.onOpen) window.aavDesktop.onOpen(o => { if (o.page === 'replies' && o.src) sessionStorage.setItem('rp_src', o.src); if (location.hash === '#/' + o.page) route(); else location.hash = '#/' + o.page; });
 
 function shell(active) {
   let nav = '', sec = '';
@@ -404,11 +407,13 @@ async function pageQualified(el) {
 
 /* ------------------------------------------------------------ LinkedIn */
 async function pageLinkedIn(el) {
-  const rows = await api('/leads/linkedin');
+  const [rows, bot] = await Promise.all([api('/leads/linkedin'), api('/linkedin/bot').catch(() => ({ available: false }))]);
   const view = sessionStorage.getItem('li_view') || 'tasks';
+  const auto = bot.available && bot.on && bot.signedIn, owner = S.me.role === 'owner';
   const tasks = rows.filter(r => ['To Connect', 'Request Sent', 'Connected', 'Message Sent'].includes(r.Status) || (r['Their Reply'] && r['Suggested Reply'] && !['Interested', 'Not Interested'].includes(r.Status)))
     .sort((a, b) => { const p = r => r['Suggested Reply'] && r.Status === 'Replied' ? 0 : r.Status === 'Connected' ? 1 : r.Status === 'To Connect' ? 2 : 3; return p(a) - p(b) || Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0); });
-  el.innerHTML = head('LinkedIn tasks', 'The agent prepares every message. You send it on LinkedIn and click what happened, about 10 minutes a day (max 15–20 connection requests).', `<div class="seg"><button data-v="tasks" class="${view === 'tasks' ? 'on' : ''}">Today's tasks (${tasks.length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All prospects (${rows.length})</button></div>`) + '<div id="t"></div>';
+  el.innerHTML = head('LinkedIn tasks', auto ? 'Connection requests go out automatically. When someone accepts you get a pop-up: send them the first message here.' : 'The agent prepares every message. You send it on LinkedIn and click what happened, about 10 minutes a day (max 15–20 connection requests).', `<div class="seg"><button data-v="tasks" class="${view === 'tasks' ? 'on' : ''}">Today's tasks (${tasks.length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All prospects (${rows.length})</button></div>`) + liBotPanel(bot, owner) + '<div id="t"></div>';
+  liBotWire(bot);
   $$('.seg button').forEach(b => b.onclick = () => { sessionStorage.setItem('li_view', b.dataset.v); route(); });
   if (view === 'all') return table($('#t'), { rows, statusKey: 'Status', empty: ['No LinkedIn prospects yet', 'The agent adds founders and owners every 12 hours.'],
     cols: [{ k: 'Date Found', l: 'Found' }, { k: 'Name', l: 'Person', h: r => `<div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}</div>` }, { k: 'Company', l: 'Company' }, { k: 'Email', l: 'Email', h: r => r.Email ? esc(r.Email) : '<span class="sub">–</span>' }, { k: 'Location', l: 'Location' }, { k: 'Best Service', l: 'Best service' }, { k: 'Fit Score', l: 'Fit', num: true }, { k: 'Status', l: 'Status', h: r => tag(r.Status) }, { k: 'Handled By', l: 'Handled by' }],
@@ -417,9 +422,9 @@ async function pageLinkedIn(el) {
   $('#t').innerHTML = `<div class="tasks">${tasks.slice(0, 40).map((r, i) => {
     const rep = r['Their Reply'] && r['Suggested Reply'] && r.Status === 'Replied';
     const st = rep ? ['Reply to their message', r['Suggested Reply'], [['Message Sent', 'I replied'], ['Interested', 'They\'re interested ★'], ['Not Interested', 'Not interested']]]
-      : r.Status === 'To Connect' ? ['1 · Send connection request', r['Connection Note'], [['Request Sent', 'Request sent']]]
+      : r.Status === 'To Connect' ? [/auto-connect skipped/i.test(r.Notes || '') ? '1 · Send connection request – the agent could not send this one' : auto ? '1 · Connection request – the agent sends it automatically (or send it yourself)' : '1 · Send connection request', r['Connection Note'], [['Request Sent', 'Request sent']]]
       : r.Status === 'Request Sent' ? ['2 · Waiting for them to accept', r['Connection Note'], [['Connected', 'They accepted'], ['Not Interested', 'Ignored / declined']]]
-      : r.Status === 'Connected' ? ['3 · Send the first message', r['First Message'], [['Message Sent', 'Message sent']]]
+      : r.Status === 'Connected' ? ['3 · They accepted ✓ Send the first message', r['First Message'], [['Message Sent', 'Message sent']]]
       : ['4 · Waiting for their reply', r['First Message'], [['Interested', 'They\'re interested ★'], ['Not Interested', 'Not interested']]];
     return `<article class="task" data-i="${i}"><div class="step">${st[0]}</div>
       <div class="top"><div><div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}${r.Company ? ' · ' + esc(r.Company) : ''} · ${esc(r.Location)}</div></div>${tag(r.Status)}</div>
@@ -440,6 +445,31 @@ async function pageLinkedIn(el) {
     $('[data-reply]', card).onclick = () => { $('[data-rbox]', card).classList.toggle('hidden'); $('textarea', card).focus(); };
     $('[data-savereply]', card).onclick = e => busy(e.currentTarget, async () => { const t = $('textarea', card).value.trim(); if (!t) throw new Error('Paste their reply first.'); await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { 'Their Reply': t } }); toast('Saved. A suggested reply will appear in a minute.'); setTimeout(route, 1500); });
   });
+}
+
+// LinkedIn auto-connect panel: on/off, LinkedIn sign-in, today's numbers
+function liBotPanel(b, owner) {
+  if (!b.available) return owner ? '<div class="notice" style="margin-bottom:14px">LinkedIn auto-connect runs in the Windows app on the main PC. Open the app there to sign in to LinkedIn and switch it on.</div>' : '';
+  const t = iso => iso ? new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+  const state = !b.on ? 'Off. You send the requests yourself.' : !b.signedIn ? '<b style="color:#e5383b">Waiting for LinkedIn sign-in.</b>' : b.pausedUntil ? `Paused until ${t(b.pausedUntil)}.` : b.busy ? 'Working on LinkedIn now…' : b.today >= b.perDay ? 'Done for today.' : b.nextSendAt ? `Next request around ${t(b.nextSendAt)} (sends ${b.hours} India time, Mon–Sat).` : `Sends ${b.hours} India time, Mon–Sat.`;
+  return `<div class="panel" style="margin-bottom:14px"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <div style="flex:1;min-width:260px"><h2>Auto-connect</h2><div class="desc" style="margin:0">${state}</div>
+      <div class="sub" style="margin-top:6px">Sent today <b>${b.today}/${b.perDay}</b> · this week ${b.week}/${b.weekMax} · ${b.waiting} waiting to accept · ${b.queue} in the queue · LinkedIn ${b.signedIn ? '<b>signed in</b>' : 'not signed in'}</div>
+      ${b.lastResult ? `<div class="sub" style="margin-top:2px">Last: ${esc(b.lastResult)}</div>` : ''}</div>
+    ${owner ? `<div class="acts" style="margin:0">${b.signedIn ? '<button class="btn sm" data-bot="run">Send one now</button><button class="btn sm ghost" data-bot="signout">Sign out of LinkedIn</button>' : '<button class="btn sm primary" data-bot="signin">in&nbsp; Sign in to LinkedIn</button>'}
+      <label class="switch"><input type="checkbox" id="botsw" ${b.on ? 'checked' : ''}><i></i><span>${b.on ? 'ON' : 'OFF'}</span></label></div>` : ''}</div>
+    ${owner && !b.on ? '<div class="sub" style="margin-top:8px">Uses your own LinkedIn. LinkedIn does not allow automation tools, so the app goes slowly (15 a day by default, never more than 25 a day / 80 a week, only in working hours) and stops if LinkedIn shows a limit. A small risk of a LinkedIn restriction remains.</div>' : ''}</div>`;
+}
+function liBotWire(b) {
+  const go = (el, path, msg) => busy(el, async () => { const r = await api('/linkedin/bot/' + path, { method: 'POST', body: {} }); toast(r.msg || msg); route(); });
+  $$('[data-bot]').forEach(el => el.onclick = () => el.dataset.bot === 'signin' ? go(el, 'signin', 'A LinkedIn window opened on the main PC. Sign in there; it closes by itself.')
+    : el.dataset.bot === 'signout' ? (confirm('Sign out of LinkedIn in the app? Auto-connect stops until you sign in again.') && go(el, 'signout', 'Signed out of LinkedIn'))
+    : go(el, 'run', 'Done'));
+  if ($('#botsw')) $('#botsw').onchange = async e => {
+    if (e.target.checked && !confirm('Send LinkedIn connection requests automatically from your LinkedIn account?\n\nLinkedIn does not allow automation tools. The app sends only a few a day, slowly, in working hours, but LinkedIn could still restrict the account.')) { e.target.checked = false; return; }
+    try { await api('/linkedin/bot/switch', { method: 'POST', body: { on: e.target.checked } }); toast(e.target.checked ? (b.signedIn ? 'Auto-connect is ON' : 'Auto-connect is ON. Now click "Sign in to LinkedIn".') : 'Auto-connect is OFF'); route(); } catch (err) { toast(err.message, true); }
+  };
+  if (b.busy) setTimeout(() => { if (location.hash === '#/linkedin') route(); }, 8000);
 }
 
 /* ------------------------------------------------------------ import */

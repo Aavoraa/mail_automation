@@ -70,11 +70,11 @@ ipcMain.on('aav-badge', (e, n) => {
   } catch (err) {}
   lastBadge = n;
 });
-const PAGES = ['replies', 'qualified'];
+const PAGES = ['replies', 'qualified', 'linkedin'];
 ipcMain.on('aav-notify', (e, o) => {
   try {
     const n = new Notification({ title: o.title || 'AAVORAA Lead Agent', body: o.body || '', silent: true, icon: path.join(__dirname, 'assets', 'icon.png') });
-    n.on('click', () => { if (!win) return; win.show(); win.focus(); if (PAGES.includes(o.page)) win.webContents.send('aav-open', { page: o.page, src: ['gmail', 'linkedin', 'qualified'].includes(o.src) ? o.src : '' }); });
+    n.on('click', () => { if (!win) return; win.show(); win.focus(); if (PAGES.includes(o.page)) win.webContents.send('aav-open', { page: o.page, src: ['gmail', 'linkedin', 'qualified', 'accepted'].includes(o.src) ? o.src : '' }); });
     n.show();
   } catch (err) {}
 });
@@ -97,4 +97,5 @@ app.whenReady().then(async () => {
   app.setAppUserModelId('com.aavoraa.leadagent');
   createTray();
   createWindow(!process.argv.includes('--hidden'));
+  require('./linkedin-bot').start({ parent: () => win });
 });
