@@ -80,7 +80,7 @@ async function canEditConnections(req) {
 app.get('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
   const c = config.get(); const mask = v => v ? '•••• saved' : '';
-  res.json({ sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), network: lanUrls() });
+  res.json({ sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
 }));
 app.post('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
@@ -108,6 +108,24 @@ app.post('/api/connections', wrap(async (req, res) => {
   if (b.apifyToken && !String(b.apifyToken).startsWith('••')) patch.apifyToken = String(b.apifyToken).trim();
   config.set(patch);
   res.json({ ok: true, serviceAccountEmail: config.get().serviceAccount ? config.get().serviceAccount.client_email : '' });
+}));
+// Extra sending inboxes (Gmail or Google Workspace, each with its own App Password). Each warms up from the day it is added.
+app.post('/api/connections/inboxes', wrap(async (req, res) => {
+  if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
+  const user = String((req.body || {}).user || '').trim().toLowerCase(), pass = String((req.body || {}).pass || '').replace(/\s+/g, '');
+  if (!/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/.test(user)) throw new Error('Type the full email address of the inbox.');
+  if (pass.length < 16) throw new Error('Paste the 16-letter App Password of that inbox (Google Account → Security → App passwords).');
+  const c = config.get();
+  if (user === String(c.gmailUser || '').toLowerCase() || (c.extraInboxes || []).some(x => x.user === user)) throw new Error('This inbox is already connected.');
+  await mail.test({ user, pass });
+  config.set({ extraInboxes: [...(c.extraInboxes || []), { user, pass, added: today() }] });
+  res.json({ ok: true, msg: `${user} connected. It starts with ${(await store.settings().catch(() => ({}))).DAILY_START_LIMIT || 20} emails a day and grows each week.` });
+}));
+app.delete('/api/connections/inboxes/:user', wrap(async (req, res) => {
+  if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
+  const u = String(req.params.user).toLowerCase();
+  config.set({ extraInboxes: (config.get().extraInboxes || []).filter(x => x.user !== u) });
+  res.json({ ok: true });
 }));
 app.post('/api/connections/test', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Not allowed.' });
@@ -178,7 +196,7 @@ const strip = rows => rows.map(({ _row, ...r }) => r);
 app.get('/api/leads/raw', need('owner', 'leader'), wrap(async (req, res) => res.json(strip(await store.read('Raw Leads')).reverse())));
 app.get('/api/leads/qualified', need('owner', 'leader'), wrap(async (req, res) => res.json(strip(await store.read('Qualified Leads')).reverse())));
 app.get('/api/leads/linkedin', need(), wrap(async (req, res) => res.json(strip(await store.read('LinkedIn Leads')).reverse())));
-const RAW_STATUSES = ['New', 'Pitched', 'Follow-up 1', 'Follow-up 2', 'Replied', 'Interested', 'Not Interested', 'Do Not Contact', 'Bounced', 'No Email', 'Low Fit', 'Send Failed'];
+const RAW_STATUSES = ['New', 'Pitched', 'Follow-up 1', 'Follow-up 2', 'Replied', 'Interested', 'Not Interested', 'Do Not Contact', 'Bounced', 'No Email', 'Low Fit', 'Send Failed', 'Bad Email'];
 const LI_STATUSES = ['To Connect', 'Request Sent', 'Connected', 'Message Sent', 'Replied', 'Interested', 'Not Interested'];
 app.patch('/api/leads/raw/:id', need('owner', 'leader'), wrap(async (req, res) => {
   const b = req.body || {}, set = {};
@@ -198,6 +216,47 @@ app.patch('/api/leads/linkedin/:id', need(), wrap(async (req, res) => {
   if (b.Notes !== undefined) set.Notes = String(b.Notes).slice(0, 1000);
   await store.update('LinkedIn Leads', 'Lead ID', [{ key: req.params.id, set }]);
   if (set['Their Reply'] || set.Status === 'Interested') engine.run('linkedinFollow').catch(() => {});
+  res.json({ ok: true });
+}));
+
+// ---------------------------------------------------------------- call / WhatsApp tasks (sent by a person, so no account can be banned)
+const CALL_STATUSES = ['Messaged', 'No Answer', 'Interested', 'Not Interested', 'Wrong Number'];
+const DIAL = { IN: '91', AU: '61', US: '1', CA: '1', GB: '44', UK: '44', AE: '971', SG: '65', MY: '60', SA: '966', QA: '974', OM: '968', BH: '973', KW: '965', IE: '353', NZ: '64', ES: '34', PT: '351', DE: '49', NL: '31', BE: '32', FR: '33', IT: '39', PL: '48', CZ: '420', BR: '55', MX: '52', ZA: '27', KE: '254', NG: '234', PH: '63', ID: '62', TH: '66', LK: '94', PK: '92', BD: '880', NP: '977', HK: '852', JP: '81' };
+const CITY_COUNTRY = { dubai: 'AE', 'abu dhabi': 'AE', sharjah: 'AE', riyadh: 'SA', doha: 'QA', muscat: 'OM', london: 'GB', manchester: 'GB', birmingham: 'GB', dublin: 'IE', 'new york': 'US', 'los angeles': 'US', houston: 'US', chicago: 'US', miami: 'US', dallas: 'US', toronto: 'CA', vancouver: 'CA', sydney: 'AU', melbourne: 'AU', auckland: 'NZ', singapore: 'SG', 'kuala lumpur': 'MY', madrid: 'ES', barcelona: 'ES', lisbon: 'PT', berlin: 'DE', munich: 'DE', amsterdam: 'NL', brussels: 'BE', paris: 'FR', milan: 'IT', warsaw: 'PL', prague: 'CZ', 'sao paulo': 'BR', 'mexico city': 'MX', johannesburg: 'ZA', nairobi: 'KE', mumbai: 'IN', bengaluru: 'IN', chennai: 'IN', coimbatore: 'IN', hyderabad: 'IN', delhi: 'IN', pune: 'IN', kochi: 'IN' };
+// "+61 2 9000 0000" -> "61290000000"; "02 9000 0000" + Australia -> "61290000000"
+function waNumber(phone, country, city) {
+  const raw = String(phone || '').trim(); let d = raw.replace(/[^\d]/g, '');
+  if (!d) return '';
+  if (raw.startsWith('+')) return d;
+  if (raw.startsWith('00')) return d.slice(2);
+  const cc = DIAL[String(country || '').toUpperCase()] || DIAL[CITY_COUNTRY[String(city || '').toLowerCase().trim()]] || '';
+  if (!cc) return d;
+  if (d.startsWith(cc) && d.length > 10) return d;
+  return cc + d.replace(/^0+/, '');
+}
+function callMessage(s, r) {
+  const first = r['Contact Name'] ? ' ' + String(r['Contact Name']).split(/\s+/)[0] : '';
+  const biz = String(r['Business Name'] || '').split(/\s+[|:–-]\s+/)[0];
+  return r['Pitched On']
+    ? `Hi${first}, this is ${s.SENDER_NAME} from ${s.COMPANY} (${s.WEBSITE}). I sent you an email a few days ago about helping ${biz} get more enquiries online. Would a free 10-minute review of your website and Google listing be useful? Happy to share it here.`
+    : `Hi${first}, this is ${s.SENDER_NAME} from ${s.COMPANY} (${s.WEBSITE}). We help businesses like ${biz} get more enquiries through a sharper website, better Google visibility and simple marketing. Would a free 10-minute review of your online presence be useful?`;
+}
+app.get('/api/leads/calls', need(), wrap(async (req, res) => {
+  const s = await store.settings(), rows = await store.read('Raw Leads');
+  const now = engine.today();
+  const age = d => { const t = Date.parse(d); return isNaN(t) ? 0 : (Date.parse(now) - t) / 86400000; };
+  const open = r => r.Phone && !['Interested', 'Not Interested', 'Wrong Number', 'Messaged'].includes(r['Call Status']) && !['Do Not Contact', 'Not Interested', 'Interested', 'Replied'].includes(r.Status);
+  const noEmail = r => ['No Email', 'Bad Email', 'Bounced', 'Send Failed'].includes(r.Status);
+  const quiet = r => r['Pitched On'] && !r['Last Reply On'] && age(r['Pitched On']) >= 2;
+  const tasks = rows.filter(r => open(r) && (noEmail(r) || quiet(r)))
+    .sort((a, b) => (noEmail(b) - noEmail(a)) || ((a['Call Status'] === 'No Answer') - (b['Call Status'] === 'No Answer')) || Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0))
+    .slice(0, 60).map(r => ({ ...strip([r])[0], why: noEmail(r) ? 'Cannot be reached by email' : `Emailed ${Math.floor(age(r['Pitched On']))} days ago, no reply`, wa: waNumber(r.Phone, r.Country, r.City), message: callMessage(s, r) }));
+  res.json({ tasks, done: rows.filter(r => r['Call Status']).length });
+}));
+app.patch('/api/leads/call/:id', need(), wrap(async (req, res) => {
+  const b = req.body || {};
+  if (!CALL_STATUSES.includes(b.status)) throw new Error('Unknown result');
+  await engine.callResult(req.params.id, b.status, String(b.note || '').slice(0, 500), req.user.name);
   res.json({ ok: true });
 }));
 

@@ -139,19 +139,46 @@ async function writeEmail(s, lead, stage) {
   return null;
 }
 
+// Warm-up limit of one inbox: the main Gmail counts from START_DATE, an extra inbox from the day it was added
+function inboxLimit(s, a) { return dailyLimit({ ...s, START_DATE: a.main ? s.START_DATE : (a.added || today()) }); }
+const sentFrom = (r, main) => String(r['Sent From'] || main || '').toLowerCase();
+const mxCache = new Map();
+async function domainTakesMail(email) {
+  const d = String(email).split('@')[1] || '';
+  if (!mxCache.has(d)) mxCache.set(d, process.env.AAVORAA_MOCK === '1' ? !/\.invalid$/.test(d) : await web.hasMx(d));
+  return mxCache.get(d);
+}
+
+// Runs every 5 minutes. Each inbox sends at most one email per run and, with SEND_PACING = even, only as many
+// as its daily limit allows "so far today", so the day's emails spread evenly over the sending hours.
 async function sendEmails(s, opts = {}) {
   const [h1, h2] = String(s.SEND_HOURS || '8-20').split('-').map(Number);
   if (!opts.force && !isNaN(h1) && !isNaN(h2) && !(istHour() >= h1 && istHour() < h2)) return 'Outside sending hours, waiting';
-  const { started, limit } = dailyLimit(s);
-  if (!started) return `Sending starts on ${s.START_DATE}`;
+  const accs = mail.accounts();
+  if (!accs.length) throw new Error('Gmail is not connected (Connections page).');
+  const main = accs[0].user;
   const rows = await store.read('Raw Leads', true);
-  const slots = Math.min(opts.max || Math.ceil(limit / 6), limit - sentOn(rows, today()));
-  if (slots <= 0) return `Today's limit reached (${limit})`;
+  const day = today(), even = String(s.SEND_PACING || 'even').toLowerCase() !== 'fast';
+  const elapsed = isNaN(h1) || isNaN(h2) ? 1 : Math.min(1, Math.max(0, (istMinutes() - h1 * 60) / ((h2 - h1) * 60)));
+  const cap = {}, info = [];
+  let total = 0, limitAll = 0;
+  for (const a of accs) {
+    const { started, limit } = inboxLimit(s, a);
+    const done = rows.filter(r => sentFrom(r, main) === a.user && [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(day)).length;
+    let allowed = started ? limit - done : 0;
+    if (!opts.force && even) allowed = Math.min(allowed, Math.ceil(limit * elapsed) + 1 - done);
+    if (!opts.force) allowed = Math.min(allowed, 1);
+    cap[a.user] = Math.max(0, allowed); limitAll += started ? limit : 0;
+    info.push(`${a.user.split('@')[0]} ${done}/${started ? limit : 0}`);
+  }
+  if (opts.max) { let left = opts.max; for (const u of Object.keys(cap)) { cap[u] = Math.min(cap[u], left); left -= cap[u]; } }
+  for (const u of Object.keys(cap)) total += cap[u];
+  if (total <= 0) return `Waiting (sent today: ${info.join(', ')})`;
   const f1 = Number(s.FOLLOWUP_1_DAYS || 3), f2 = Number(s.FOLLOWUP_2_DAYS || 7);
   const due = [];
   for (const r of rows) {
     if (!validEmail(r.Email) || !r['Message ID'] || !r['Pitched On']) continue;
-    const age = days(r['Pitched On'], today());
+    const age = days(r['Pitched On'], day);
     if (r.Status === 'Pitched' && age >= f1) due.push({ lead: r, stage: 1 });
     else if (r.Status === 'Follow-up 1' && age >= f2) due.push({ lead: r, stage: 2 });
   }
@@ -163,40 +190,49 @@ async function sendEmails(s, opts = {}) {
   for (const r of rows.filter(r => waiting(r) && validEmail(r.Email)).sort((a, b) => Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0))) {
     const e = String(r.Email).toLowerCase().trim(); if (contacted.has(e)) continue; contacted.add(e); fresh.push({ lead: r, stage: 0 });
   }
-  const jobs = [...due, ...fresh].slice(0, slots);
+  // follow-ups go out from the inbox that sent the first email (same thread); new pitches from the inbox with most room left
+  const jobs = [];
+  for (const j of due) { const u = accs.some(a => a.user === sentFrom(j.lead, main)) ? sentFrom(j.lead, main) : main; if (cap[u] > 0) { cap[u]--; jobs.push({ ...j, from: u }); } }
+  for (const j of fresh) { const u = Object.keys(cap).sort((a, b) => cap[b] - cap[a])[0]; if (!u || cap[u] <= 0) break; cap[u]--; jobs.push({ ...j, from: u }); }
   let sent = 0;
-  if (jobs.length) log('send', `Emailing ${jobs.length} lead(s) now (${due.length} follow-ups due, ${fresh.length} new waiting, ${slots} allowed this hour)`);
-  for (const [i, { lead, stage }] of jobs.entries()) {
+  if (jobs.length) log('send', `Emailing ${jobs.length} lead(s) now (${due.length} follow-ups due, ${fresh.length} new waiting; sent today: ${info.join(', ')})`);
+  for (const [i, { lead, stage, from }] of jobs.entries()) {
     if (!yes((await store.settings()).AGENT_ON)) { log('send', 'Agent switched off, stopping'); break; }
+    const to = String(lead.Email).trim();
+    // check the address can receive email before using a send (bounces hurt the inbox's reputation)
+    if (stage === 0 && !(await domainTakesMail(to))) {
+      log('send', `Skipped ${lead['Business Name']}: ${to.split('@')[1]} cannot receive email`, 'warn');
+      await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Bad Email', Notes: [lead.Notes, `${day}: ${to.split('@')[1]} has no mail server`].filter(Boolean).join(' | ') } }]).catch(() => {});
+      continue;
+    }
     log('send', `${i + 1}/${jobs.length}: writing ${['first email', 'follow-up 1', 'follow-up 2'][stage]} for ${lead['Business Name']}`);
     let e;
     try { e = await writeEmail(s, lead, stage); } catch (err) {
-      if (aiUnavailable(err)) { log('send', `Waiting for the AI before emailing more leads: ${err.message}`, 'warn'); break; } // lead stays as it is and is tried next hour
+      if (aiUnavailable(err)) { log('send', `Waiting for the AI before emailing more leads: ${err.message}`, 'warn'); break; } // lead stays as it is and is tried next run
       log('send', `Could not write an email for ${lead['Business Name']}: ${err.message}, will retry later`, 'warn'); continue;
     }
     if (!e) { log('send', `AI could not write an email for ${lead['Business Name']}, will retry later`, 'warn'); continue; }
     if (e.noAI) log('send', `AI not available, using the "${e.tpl.Name || 'template'}" email for ${lead['Business Name']}`, 'warn');
     try {
       const text = e.body + '\n\n' + signature(s);
-      const to = String(lead.Email).trim();
       if (stage === 0) {
-        const r = await mail.send({ to, subject: e.subject || ('quick idea for ' + lead['Business Name']), text, fromName: senderName(s) });
-        await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Pitched', 'Pitched On': today(), 'Email Subject': e.subject, 'Message ID': r.messageId, 'Thread ID': r.messageId, 'Template Used': e.tpl ? e.tpl.Name : 'AI' } }]);
+        const r = await mail.send({ to, from, subject: e.subject || ('quick idea for ' + lead['Business Name']), text, fromName: senderName(s) });
+        await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Pitched', 'Pitched On': day, 'Email Subject': e.subject, 'Message ID': r.messageId, 'Thread ID': r.messageId, 'Template Used': e.tpl ? e.tpl.Name : 'AI', 'Sent From': r.from || from } }]);
       } else {
         const subj = 'Re: ' + String(lead['Email Subject'] || '').replace(/^re:\s*/i, '');
-        await mail.send({ to, subject: subj, text, fromName: senderName(s), inReplyTo: lead['Message ID'], references: lead['Message ID'] });
+        await mail.send({ to, from, subject: subj, text, fromName: senderName(s), inReplyTo: lead['Message ID'], references: lead['Message ID'] });
         const col = stage === 1 ? 'Follow-up 1 On' : 'Follow-up 2 On';
-        await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: stage === 1 ? 'Follow-up 1' : 'Follow-up 2', [col]: today() } }]);
+        await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: stage === 1 ? 'Follow-up 1' : 'Follow-up 2', [col]: day } }]);
       }
       sent++;
-      log('send', `${['Pitched', 'Follow-up 1 to', 'Follow-up 2 to'][stage]} ${lead['Business Name']} (${to})`);
+      log('send', `${['Pitched', 'Follow-up 1 to', 'Follow-up 2 to'][stage]} ${lead['Business Name']} (${to}) from ${from}`);
     } catch (err) {
-      log('send', `Could not email ${lead['Business Name']}: ${err.message}`, 'error');
-      await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Send Failed', Notes: [lead.Notes, `${today()}: ${err.message}`.slice(0, 200)].filter(Boolean).join(' | ') } }]).catch(() => {});
+      log('send', `Could not email ${lead['Business Name']} from ${from}: ${err.message}`, 'error');
+      await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Send Failed', Notes: [lead.Notes, `${day}: ${err.message}`.slice(0, 200)].filter(Boolean).join(' | ') } }]).catch(() => {});
     }
-    if (i < jobs.length - 1) await sleep(opts.fast ? 50 : 45000 + Math.random() * 60000);
+    if (i < jobs.length - 1) await sleep(opts.fast ? 50 : 20000 + Math.random() * 25000);
   }
-  return `Sent ${sent} emails (limit today ${limit})`;
+  return `Sent ${sent} email(s) (today: ${info.join(', ')}; limit ${limitAll} across ${accs.length} inbox${accs.length > 1 ? 'es' : ''})`;
 }
 
 // ---------------------------------------------------------------- 03 replies
@@ -220,7 +256,9 @@ function safeReply(s, lead, m, text) {
 async function checkReplies(s) {
   const since = new Date(Date.now() - 3 * 86400000);
   const seen = new Set(state.seen);
-  const msgs = await mail.fetchNew(since, seen);
+  // every sending inbox is checked; an inbox that cannot be read is reported but does not stop the others
+  const msgs = [];
+  for (const a of mail.accounts()) { try { msgs.push(...await mail.fetchNew(since, seen, a.user)); } catch (e) { log('replies', `Could not read ${a.user}: ${e.message}`, 'error'); } }
   if (!msgs.length) return 'No new emails';
   const rows = await store.read('Raw Leads', true);
   const byEmail = {}, byMsg = {}, byDomain = {};
@@ -230,12 +268,12 @@ async function checkReplies(s) {
     if (r.Email) { byEmail[String(r.Email).toLowerCase().trim()] = r; const d = domainOf(r.Email); if (d && !free.test(d) && r['Pitched On']) byDomain[d] = r; }
     if (r['Message ID']) byMsg[r['Message ID']] = r;
   }
-  const me = String(config.get().gmailUser || '').toLowerCase();
+  const mine = new Set(mail.accounts().map(a => a.user));
   const done = m => { state.seen.push(m.messageId); persist(); };
   let handled = 0, waiting = 0;
   for (const m of msgs) {
     const from = String(m.from || '').toLowerCase();
-    if (!from || from === me) { done(m); continue; }
+    if (!from || mine.has(from)) { done(m); continue; }
     if (/mailer-daemon|postmaster/.test(from)) {
       const low = String(m.text).toLowerCase();
       const lead = rows.find(r => r.Email && low.includes(String(r.Email).toLowerCase().trim()));
@@ -270,7 +308,7 @@ async function checkReplies(s) {
     const draft = String(s.REPLY_MODE || 'send').toLowerCase() === 'draft';
     let replied = false;
     if (needsReply) {
-      const msg = { to: from, subject: 'Re: ' + String(m.subject || '').replace(/^re:\s*/i, ''), text: reply + '\n\n' + signature(s), fromName: senderName(s), inReplyTo: m.messageId, references: [...(m.references || []), m.messageId].join(' ') };
+      const msg = { to: from, from: m.inbox, subject: 'Re: ' + String(m.subject || '').replace(/^re:\s*/i, ''), text: reply + '\n\n' + signature(s), fromName: senderName(s), inReplyTo: m.messageId, references: [...(m.references || []), m.messageId].join(' ') };
       try { if (draft) await mail.saveDraft(msg); else await mail.send(msg); replied = true; } catch (e) {
         const tries = state.tries[m.messageId] = (state.tries[m.messageId] || 0) + 1; persist();
         if (tries < 4) { log('replies', `Could not send the reply to ${from}: ${e.message}, will try again`, 'error'); waiting++; continue; } // retried on the next check
@@ -476,7 +514,7 @@ async function dailyReport(s) {
 // ---------------------------------------------------------------- scheduler
 const JOBS = {
   find: { name: 'Find leads (Google Maps)', fn: findLeads, every: s => Number(s.FIND_EVERY_HOURS || 8) * 3600e3 },
-  send: { name: 'Send pitches & follow-ups', fn: sendEmails, every: () => 60 * 60e3 },
+  send: { name: 'Send pitches & follow-ups (every 5 min, paced)', fn: sendEmails, every: () => 5 * 60e3 },
   replies: { name: 'Read & answer replies', fn: checkReplies, every: () => 5 * 60e3 },
   linkedin: { name: 'Find LinkedIn prospects', fn: linkedinProspects, every: s => Number(s.LINKEDIN_EVERY_HOURS || 12) * 3600e3 },
   linkedinFollow: { name: 'LinkedIn replies & team alerts', fn: linkedinFollow, every: () => 30 * 60e3 },
@@ -514,7 +552,12 @@ async function tick() {
     if (Date.now() - last >= j.every(s)) run(id).catch(() => {});
   }
 }
-function start() { if (!timer) { timer = setInterval(tick, 60000); setTimeout(tick, 5000); log('agent', 'Agent engine started'); } }
+function start() {
+  if (timer) return;
+  // add any new columns / settings this version needs to the Google Sheet
+  if (config.isConfigured()) store.ensureTabs().then(() => log('agent', 'Google Sheet tabs checked')).catch(e => log('agent', 'Could not update the Sheet tabs: ' + e.message, 'warn'));
+  timer = setInterval(tick, 60000); setTimeout(tick, 5000); log('agent', 'Agent engine started');
+}
 function status() {
   const s = lastSettings || {};
   return Object.entries(JOBS).map(([id, j]) => {
@@ -524,4 +567,22 @@ function status() {
   });
 }
 
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, _internals: { findLeads, sendEmails, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+// Result of a call / WhatsApp message, clicked by a team member on the Call / WhatsApp page
+async function callResult(id, status, note, by) {
+  const lead = (await store.read('Raw Leads', true)).find(r => r['Lead ID'] === id);
+  if (!lead) throw new Error('Lead not found');
+  const what = status === 'Messaged' ? 'WhatsApp message sent' : 'call: ' + status;
+  const set = { 'Call Status': status, 'Called By': by, Notes: [lead.Notes, `${today()}: ${what}${note ? ' - ' + note : ''} (${by})`].filter(Boolean).join(' | ').slice(0, 1500) };
+  if (status === 'Not Interested') set.Status = 'Not Interested'; // stops follow-up emails too
+  if (status === 'Interested') set.Status = 'Interested';
+  await store.update('Raw Leads', 'Lead ID', [{ key: id, set }]);
+  log('calls', `${lead['Business Name']}: ${status} (${by})`);
+  if (status === 'Interested') {
+    const s = await store.settings();
+    const q = { 'Lead ID': id, 'Date Qualified': today(), Source: 'Phone / WhatsApp', 'Business Name': lead['Business Name'], 'Contact Name': lead['Contact Name'], Email: lead.Email, LinkedIn: lead.LinkedIn, Phone: lead.Phone, Website: lead.Website, Country: lead.Country, 'Service Needed': lead['Best Service'] || '', 'Lead Score': 'Hot', 'Their Message': note, Summary: 'Interested on the phone / WhatsApp', 'Next Step': 'Follow up and book a call', Owner: s.TEAM_LEADER_NAME || '', 'Team Alerted': s.TEAM_LEADER_EMAIL ? today() : '' };
+    await upsertQualified(q);
+    if (s.TEAM_LEADER_EMAIL) await alertTeam(s, `Hot lead (phone/WhatsApp): ${lead['Business Name']}`,
+      `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
+  }
+}
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, _internals: { findLeads, sendEmails, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

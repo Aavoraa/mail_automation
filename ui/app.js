@@ -30,6 +30,7 @@ const ROLE_NAME = { owner: 'Owner', leader: 'Team Leader', linkedin: 'LinkedIn E
 const PAGES = {
   dashboard: { title: 'Dashboard', ic: '◈', roles: ['owner', 'leader', 'linkedin'], render: pageDashboard, sec: 'Work' },
   linkedin: { title: 'LinkedIn tasks', ic: 'in', roles: ['owner', 'leader', 'linkedin'], render: pageLinkedIn, sec: 'Work' },
+  calls: { title: 'Call / WhatsApp', ic: '☎', roles: ['owner', 'leader', 'linkedin'], render: pageCalls, sec: 'Work' },
   qualified: { title: 'Qualified leads', ic: '★', roles: ['owner', 'leader'], render: pageQualified, sec: 'Work' },
   leads: { title: 'All email leads', ic: '✉', roles: ['owner', 'leader'], render: pageLeads, sec: 'Work' },
   import: { title: 'Import leads', ic: '⇪', roles: ['owner', 'leader'], render: pageImport, sec: 'Grow' },
@@ -311,6 +312,31 @@ async function pageLinkedIn(el) {
 }
 
 /* ------------------------------------------------------------ import */
+// Leads that email cannot reach (or that did not answer the email): a person sends a WhatsApp message or calls.
+// Done by hand, so no WhatsApp or phone account can be banned.
+async function pageCalls(el) {
+  const d = await api('/leads/calls');
+  el.innerHTML = head('Call / WhatsApp', 'Leads the email cannot reach, and leads who did not answer the email. Open WhatsApp (the message is filled in), press send, then click what happened. About 10–15 a day is plenty.', `<span class="sub">${d.done} handled so far</span>`) + '<div id="t"></div>';
+  if (!d.tasks.length) { $('#t').innerHTML = '<div class="tablewrap"><div class="empty"><b>Nothing to call right now</b>Leads appear here when they have a phone number but no working email, or when they have not answered an email for 2 days.</div></div>'; return; }
+  $('#t').innerHTML = `<div class="tasks">${d.tasks.map((r, i) => `<article class="task" data-i="${i}">
+      <div class="step">${esc(r.why)}${r['Call Status'] === 'No Answer' ? ' · try again' : ''}</div>
+      <div class="top"><div><div class="strong">${esc(r['Business Name'])}</div><div class="sub">${esc([r['Contact Name'], r.City, r.Phone].filter(Boolean).join(' · '))}</div></div>${tag(r.Status)}</div>
+      <div class="msg">${esc(r.message)}</div>
+      <div class="acts">${r.wa ? `<a class="btn sm primary" href="https://wa.me/${esc(r.wa)}?text=${encodeURIComponent(r.message)}" target="_blank" rel="noopener">Open WhatsApp</a>` : ''}<button class="btn sm" data-copy>Copy message</button><button class="btn sm" data-num>Copy number</button>${r.Website ? `<a class="btn sm ghost" href="${esc(r.Website)}" target="_blank" rel="noopener">Website</a>` : ''}</div>
+      <div class="acts">${[['Messaged', 'WhatsApp sent'], ['No Answer', 'Called, no answer'], ['Interested', 'Interested ★'], ['Not Interested', 'Not interested'], ['Wrong Number', 'Wrong number']].map(([v, l]) => `<button class="btn sm" data-set="${v}">${l}</button>`).join('')}</div>
+    </article>`).join('')}</div>`;
+  $$('.task').forEach(card => {
+    const r = d.tasks[+card.dataset.i];
+    $('[data-copy]', card).onclick = () => copy(r.message);
+    $('[data-num]', card).onclick = () => copy(r.Phone);
+    $$('[data-set]', card).forEach(b => b.onclick = () => busy(b, async () => {
+      const note = b.dataset.set === 'Interested' ? (prompt('What did they say? (optional, goes to the team leader)') || '') : '';
+      await api('/leads/call/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { status: b.dataset.set, note } });
+      toast(b.dataset.set === 'Interested' ? 'Great! Added to Qualified leads, the team leader is alerted.' : 'Saved'); route();
+    }));
+  });
+}
+
 async function pageImport(el) {
   el.innerHTML = head('Import leads', 'Upload your own list (Excel or CSV). The agent emails every row that has an email address, using your templates and tone.') +
     `<div class="panel"><div class="drop" id="drop"><b style="font-size:15px;color:var(--text)">Choose an Excel or CSV file</b><br><span class="sub">or drop it here · .xlsx, .xls, .csv · up to 5,000 rows</span></div><input type="file" id="f" class="hidden" accept=".xlsx,.xls,.csv"></div><div id="step2" style="margin-top:14px"></div>`;
@@ -450,6 +476,17 @@ async function pageConnections(el) {
   const save = async () => { const b = {}; for (const id of ['sheetUrl', 'gmailUser', 'gmailAppPassword', 'openaiKey', 'apifyToken']) b[id] = $('#' + id).value.trim(); await api('/connections', { method: 'POST', body: b }); };
   $('#sv').onclick = e => busy(e.currentTarget, async () => { await save(); toast('Saved'); });
   $$('[data-t]').forEach(b => b.onclick = () => busy(b, async () => { try { await save(); const r = await api('/connections/test', { method: 'POST', body: { what: b.dataset.t } }); $('#msg').innerHTML = `<div class="notice ok">${esc(r.msg)}</div>`; } catch (err) { $('#msg').innerHTML = `<div class="notice err">${esc(err.message)}</div>`; } }));
+  // extra sending inboxes: more inboxes = more emails a day without pushing any one account too hard
+  const ib = document.createElement('div'); ib.className = 'panel'; ib.style.marginTop = '18px';
+  ib.innerHTML = `<h3 style="margin-top:0">Extra sending inboxes</h3>
+    <div class="how">Each inbox sends its own daily amount (starts at 20 a day and grows every week), so 3 inboxes send about 3× as many pitches without any single account looking like spam. Best: Google Workspace inboxes on a <b>separate domain</b> just for outreach. For each inbox: turn on 2-Step Verification, create an <b>App Password</b>, and turn on IMAP in Gmail settings.</div>
+    ${(c.inboxes || []).length ? `<div class="tablewrap" style="margin:10px 0"><table><thead><tr><th>Inbox</th><th>Added</th><th></th></tr></thead><tbody>${c.inboxes.map(x => `<tr><td>${esc(x.user)}</td><td>${esc(x.added)}</td><td style="text-align:right"><button class="btn sm ghost" data-rm="${esc(x.user)}">Remove</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="sub">Only the main Gmail above is sending right now.</p>'}
+    <div class="row2"><label class="f"><span>Inbox email</span><input type="email" id="ibU" placeholder="sales@your-outreach-domain.com" autocomplete="off"></label>
+    <label class="f"><span>App password (16 letters)</span><input type="password" id="ibP" placeholder="abcd efgh ijkl mnop" autocomplete="off"></label></div>
+    <button class="btn primary" id="ibAdd">Test &amp; add inbox</button><div id="ibMsg" style="margin-top:12px"></div>`;
+  el.appendChild(ib);
+  $('#ibAdd').onclick = e => busy(e.currentTarget, async () => { try { const r = await api('/connections/inboxes', { method: 'POST', body: { user: $('#ibU').value, pass: $('#ibP').value } }); toast(r.msg); route(); } catch (err) { $('#ibMsg').innerHTML = `<div class="notice err">${esc(err.message)}</div>`; } });
+  $$('[data-rm]', ib).forEach(b => b.onclick = () => busy(b, async () => { if (!confirm('Stop sending from ' + b.dataset.rm + '? Replies to its emails will no longer be read.')) return; await api('/connections/inboxes/' + encodeURIComponent(b.dataset.rm), { method: 'DELETE' }); toast('Removed'); route(); }));
   $('#rk').onclick = e => { e.preventDefault(); $('#saFile').click(); };
   $('#saFile').onchange = async e => { const f = e.target.files[0]; if (!f) return; try { await api('/connections', { method: 'POST', body: { serviceAccountJson: await f.text() } }); toast('Key replaced'); route(); } catch (err) { toast(err.message, true); } };
 }

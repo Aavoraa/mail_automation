@@ -5,7 +5,7 @@ const CITIES = 'Dubai, Abu Dhabi, Sharjah, Riyadh, Doha, Muscat, London, Manches
 
 const TABS = {
   'Settings': ['Key', 'Value', 'What it means'],
-  'Raw Leads': ['Lead ID', 'Date Found', 'Source', 'Business Name', 'Industry', 'City', 'Country', 'Website', 'Email', 'Phone', 'Contact Name', 'LinkedIn', 'Google Rating', 'Reviews', 'Website Issues', 'Best Service', 'Pitch Angle', 'Fit Score', 'Status', 'Pitched On', 'Email Subject', 'Message ID', 'Thread ID', 'Template Used', 'Follow-up 1 On', 'Follow-up 2 On', 'Last Reply On', 'Reply Category', 'Notes'],
+  'Raw Leads': ['Lead ID', 'Date Found', 'Source', 'Business Name', 'Industry', 'City', 'Country', 'Website', 'Email', 'Phone', 'Contact Name', 'LinkedIn', 'Google Rating', 'Reviews', 'Website Issues', 'Best Service', 'Pitch Angle', 'Fit Score', 'Status', 'Pitched On', 'Email Subject', 'Message ID', 'Thread ID', 'Template Used', 'Follow-up 1 On', 'Follow-up 2 On', 'Last Reply On', 'Reply Category', 'Notes', 'Sent From', 'Call Status', 'Called By'],
   'Qualified Leads': ['Lead ID', 'Date Qualified', 'Source', 'Business Name', 'Contact Name', 'Email', 'LinkedIn', 'Phone', 'Website', 'Country', 'Service Needed', 'Budget', 'Timeline', 'Lead Score', 'Their Message', 'Summary', 'Next Step', 'Owner', 'Team Alerted'],
   'LinkedIn Leads': ['Lead ID', 'Date Found', 'Name', 'Title', 'Company', 'Industry', 'Location', 'LinkedIn URL', 'Fit Score', 'Best Service', 'Connection Note', 'First Message', 'Status', 'Their Reply', 'Suggested Reply', 'AI Category', 'Forwarded To Team', 'Handled By', 'Notes'],
   'Templates': ['Template ID', 'Name', 'Stage', 'Subject', 'Body', 'AI Personalise', 'Active', 'Created By', 'Updated On'],
@@ -38,6 +38,7 @@ const SETTINGS = [
   ['DAILY_MAX_LIMIT', '50', 'Never send more than this per day (keep 50 or less on Gmail)', 'Sending limits', 'number'],
   ['FOLLOWUP_1_DAYS', '3', 'Days after the first email for follow-up 1', 'Sending limits', 'number'],
   ['FOLLOWUP_2_DAYS', '7', 'Days after the first email for follow-up 2', 'Sending limits', 'number'],
+  ['SEND_PACING', 'even', 'even = spread each day\'s emails evenly over the sending hours (safest for Gmail). fast = one email every 5 minutes per inbox until the daily limit', 'Sending limits', 'select', ['even', 'fast']],
   ['SEND_HOURS', '8-20', 'Only send new emails between these hours (India time), e.g. 8-20. Use 0-24 for all day', 'Sending limits', 'text'],
   ['MIN_FIT_SCORE', '5', 'Leads the AI scores below this are still emailed, but after the better-fitting ones', 'Lead finding', 'number'],
   ['APIFY_CONTACTS', 'yes', 'yes = Apify also reads each business website for emails (finds far more emails, small extra Apify cost per place)', 'Lead finding', 'select', ['yes', 'no']],

@@ -137,4 +137,4 @@ function mockApify(actor, input = {}) {
   return [{ organicResults: [{ url: 'https://www.linkedin.com/in/jane-demo-' + Math.floor(Math.random() * 1e6), title: 'Jane Demo - Founder - Demo Interiors | LinkedIn', description: 'Founder at Demo Interiors, Dubai' }] }];
 }
 
-module.exports = { mapsSearch, googleSearch, getHtml, emailsFrom, findEmails, guessEmail, decodeCf, strip, domainOf, checkSite, contactUrl, linkedinIn, bestEmail };
+module.exports = { mapsSearch, googleSearch, getHtml, emailsFrom, findEmails, guessEmail, hasMx, decodeCf, strip, domainOf, checkSite, contactUrl, linkedinIn, bestEmail };
