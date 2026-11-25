@@ -260,8 +260,23 @@ async function pageLeads(el) {
     cols: [{ k: 'Date Found', l: 'Found' }, { k: 'Business Name', l: 'Business', h: r => `<div class="strong">${esc(r['Business Name'])}</div><div class="sub">${esc(r.Industry)}</div>` }, { k: 'Country', l: 'Location', h: r => `${esc(r.City)}<div class="sub">${esc(r.Country)}</div>` }, { k: 'Email', l: 'Email', h: r => r.Email ? esc(r.Email) : '<span class="sub">not found</span>' }, { k: 'Best Service', l: 'Best service' }, { k: 'Fit Score', l: 'Fit', num: true, h: r => r['Fit Score'] ? `${esc(r['Fit Score'])}<span class="sub">/10</span>` : '<span class="sub">–</span>' }, { k: 'Status', l: 'Status', h: r => tag(r.Status) }, { k: 'Pitched On', l: 'Emailed' }],
     onRow: r => {
       const d = drawer(r['Business Name'], tag(r.Status) + ' <span class="sub">' + esc(r['Lead ID']) + '</span>', `<label class="f"><span>Change status</span><select id="ns">${statuses.map(s => `<option ${s === r.Status ? 'selected' : ''}>${s}</option>`).join('')}</select><small>Tip: "Do Not Contact" stops all emails to this lead forever. "New" puts it back in the queue.</small></label>
-        <label class="f"><span>Email</span><input type="email" id="ne" value="${esc(r.Email)}"></label>${fields(r, ['Business Name', 'Message ID', 'Thread ID'], ['Email', 'Phone', 'Website'])}`, '<button class="btn primary" id="sv">Save</button>');
-      $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/raw/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { Status: $('#ns', d).value, Email: $('#ne', d).value.trim() } }); toast('Saved'); closeLayer(); route(); });
+        <label class="f"><span>Email</span><input type="email" id="ne" value="${esc(r.Email)}"></label>
+        <div class="field"><div class="k">Send an email now</div>
+          <div class="acts" style="margin:6px 0"><button class="btn sm" id="wd">✎ Write it for me (AI)</button><span class="sub">${r['Message ID'] ? 'Goes in the same email thread as before' : 'Sent as their first email'}</span></div>
+          <input type="text" id="es" placeholder="Subject${r['Message ID'] ? ' (leave empty to reply in the same thread)' : ''}" style="margin-bottom:6px">
+          <textarea id="eb" rows="8" placeholder="Write your email… your signature is added automatically"></textarea>
+          <div class="acts" style="margin-top:8px"><button class="btn sm primary" id="se" ${r.Status === 'Do Not Contact' ? 'disabled title="This lead asked not to be contacted"' : ''}>Send email</button></div></div>
+        ${fields(r, ['Business Name', 'Message ID', 'Thread ID'], ['Email', 'Phone', 'Website'])}`, '<button class="btn primary" id="sv">Save</button>');
+      const id = encodeURIComponent(r['Lead ID']);
+      $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/raw/' + id, { method: 'PATCH', body: { Status: $('#ns', d).value, Email: $('#ne', d).value.trim() } }); toast('Saved'); closeLayer(); route(); });
+      $('#wd', d).onclick = e => busy(e.currentTarget, async () => { const x = await api('/leads/raw/' + id + '/draft'); $('#es', d).value = x.threaded ? '' : x.subject; $('#eb', d).value = x.body; $('#eb', d).focus(); });
+      $('#se', d).onclick = e => busy(e.currentTarget, async () => {
+        const to = $('#ne', d).value.trim(), text = $('#eb', d).value.trim();
+        if (!to) throw new Error('Add their email address first.'); if (!text) throw new Error('Write the email first (or click "Write it for me").');
+        if (!confirm(`Send this email to ${to} now?`)) return;
+        const x = await api('/leads/raw/' + id + '/email', { method: 'POST', body: { to, subject: $('#es', d).value.trim(), text } });
+        toast(`Email sent to ${x.to} from ${x.from}`); closeLayer(); route();
+      });
     } });
 }
 async function pageQualified(el) {
@@ -298,14 +313,16 @@ async function pageLinkedIn(el) {
     return `<article class="task" data-i="${i}"><div class="step">${st[0]}</div>
       <div class="top"><div><div class="strong">${esc(r.Name)}</div><div class="sub">${esc(r.Title)}${r.Company ? ' · ' + esc(r.Company) : ''} · ${esc(r.Location)}</div></div>${tag(r.Status)}</div>
       ${rep ? `<div class="sub">They said: “${esc(r['Their Reply'])}”</div>` : ''}
-      <div class="msg">${esc(st[1] || '')}</div>
-      <div class="acts"><button class="btn sm primary" data-copy>Copy message</button><a class="btn sm" href="${esc(r['LinkedIn URL'])}" target="_blank" rel="noopener">Open profile</a></div>
+      <textarea class="limsg" rows="4" aria-label="Message (you can edit it)">${esc(st[1] || '')}</textarea>
+      <div class="acts" style="margin-top:8px"><button class="btn sm primary" data-li>in&nbsp; Send on LinkedIn</button><button class="btn sm" data-copy>Copy message</button></div>
+      <div class="sub" style="margin-top:4px">Copies the message and opens their LinkedIn. ${r.Status === 'To Connect' ? 'Click <b>Connect → Add a note</b>, press Ctrl+V, Send.' : 'Click <b>Message</b>, press Ctrl+V, Send.'} Then click what happened below.</div>
       <div class="acts">${st[2].map(([v, l]) => `<button class="btn sm" data-set="${v}">${l}</button>`).join('')}<button class="btn sm ghost" data-reply>Paste their reply</button></div>
       <div class="hidden" data-rbox><textarea placeholder="Paste exactly what they wrote on LinkedIn…"></textarea><div class="acts" style="margin-top:8px"><button class="btn sm primary" data-savereply>Save – the agent will suggest a reply</button></div></div></article>`;
   }).join('')}</div>`;
   $$('.task').forEach(card => {
     const r = tasks[+card.dataset.i];
-    $('[data-copy]', card).onclick = () => copy($('.msg', card).textContent);
+    $('[data-copy]', card).onclick = () => copy($('.limsg', card).value);
+    $('[data-li]', card).onclick = () => { copy($('.limsg', card).value); if (r['LinkedIn URL']) window.open(r['LinkedIn URL'], '_blank', 'noopener'); else toast('No LinkedIn link saved for this person', true); };
     $$('[data-set]', card).forEach(b => b.onclick = () => busy(b, async () => { await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { Status: b.dataset.set } }); toast(b.dataset.set === 'Interested' ? 'Great! The team leader is being alerted.' : 'Updated'); route(); }));
     $('[data-reply]', card).onclick = () => { $('[data-rbox]', card).classList.toggle('hidden'); $('textarea', card).focus(); };
     $('[data-savereply]', card).onclick = e => busy(e.currentTarget, async () => { const t = $('textarea', card).value.trim(); if (!t) throw new Error('Paste their reply first.'); await api('/leads/linkedin/' + encodeURIComponent(r['Lead ID']), { method: 'PATCH', body: { 'Their Reply': t } }); toast('Saved. A suggested reply will appear in a minute.'); setTimeout(route, 1500); });

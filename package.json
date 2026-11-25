@@ -1,7 +1,7 @@
 {
   "name": "aavoraa-lead-agent",
   "productName": "AAVORAA Lead Agent",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "AAVORAA Lead Agent - finds, pitches, follows up and qualifies leads",
   "main": "main.js",
   "author": "AAVORAA",

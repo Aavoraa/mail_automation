@@ -613,6 +613,44 @@ async function answerReply(id, text, by) {
   log('replies', `${by} answered ${r['Business Name']} (${r.From})`);
 }
 
+// The next email this lead would get (first email or follow-up), written by the AI or the template, for a person to check and send
+const nextStage = l => l['Message ID'] && l['Pitched On'] ? (l.Status === 'Follow-up 1' || l.Status === 'Follow-up 2' ? 2 : 1) : 0;
+async function draftFor(id) {
+  const lead = (await store.read('Raw Leads', true)).find(r => r['Lead ID'] === id);
+  if (!lead) throw new Error('Lead not found');
+  const s = await store.settings(), stage = nextStage(lead);
+  let e;
+  try { e = await writeEmail(s, lead, stage); } catch (err) { e = null; }
+  if (!e) e = fromTemplate({ ...PLAIN[stage], Name: 'Plain' }, leadVars(lead, s), stage);
+  const threaded = stage > 0;
+  return { subject: threaded ? 'Re: ' + String(lead['Email Subject'] || '').replace(/^re:\s*/i, '') : e.subject, body: e.body, threaded, to: lead.Email || '' };
+}
+
+// A person sends an email to a lead straight from the app (same inbox and thread as earlier emails to them)
+async function emailLead(id, { to, subject, text }, by) {
+  const lead = (await store.read('Raw Leads', true)).find(r => r['Lead ID'] === id);
+  if (!lead) throw new Error('Lead not found');
+  if (lead.Status === 'Do Not Contact') throw new Error('This lead asked not to be contacted.');
+  to = String(to || lead.Email || '').trim();
+  if (!validEmail(to)) throw new Error('Enter a valid email address.');
+  const body = String(text || '').trim();
+  if (body.length < 5) throw new Error('Write the email first.');
+  const s = await store.settings(), accs = mail.accounts();
+  if (!accs.length) throw new Error('Gmail is not connected (Connections page).');
+  const main = accs[0].user, prev = sentFrom(lead, main);
+  const from = accs.some(a => a.user === prev) ? prev : main;
+  const day = today();
+  const threaded = !!lead['Message ID'] && to.toLowerCase() === String(lead.Email || '').toLowerCase().trim();
+  const subj = String(subject || '').trim() || (threaded ? 'Re: ' + String(lead['Email Subject'] || '').replace(/^re:\s*/i, '') : 'quick idea for ' + lead['Business Name']);
+  const r = await mail.send({ to, from, subject: subj, text: body + '\n\n' + signature(s), fromName: senderName(s), ...(threaded ? { inReplyTo: lead['Message ID'], references: lead['Message ID'] } : {}) });
+  const set = { Email: to, Notes: [lead.Notes, `${day}: ${by} emailed them from the app`].filter(Boolean).join(' | ').slice(0, 1500) };
+  if (!lead['Pitched On']) Object.assign(set, { Status: 'Pitched', 'Pitched On': day, 'Email Subject': subj, 'Message ID': r.messageId, 'Thread ID': r.messageId, 'Template Used': 'Written by ' + by, 'Sent From': r.from || from });
+  else if (['New', 'Low Fit', 'No Email', 'Bad Email', 'Send Failed', 'Bounced'].includes(lead.Status)) set.Status = 'Pitched';
+  await store.update('Raw Leads', 'Lead ID', [{ key: id, set }]);
+  log('send', `${by} emailed ${lead['Business Name']} (${to}) from ${from}`);
+  return { to, from };
+}
+
 // Result of a call / WhatsApp message, clicked by a team member on the Call / WhatsApp page
 async function callResult(id, status, note, by) {
   const lead = (await store.read('Raw Leads', true)).find(r => r['Lead ID'] === id);
@@ -631,4 +669,4 @@ async function callResult(id, status, note, by) {
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, _internals: { findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, _internals: { findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

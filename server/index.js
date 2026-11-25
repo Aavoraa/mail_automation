@@ -222,6 +222,13 @@ app.patch('/api/leads/linkedin/:id', need(), wrap(async (req, res) => {
 
 // ---------------------------------------------------------------- replies: everyone who wrote back, and our answers
 app.get('/api/replies', need('owner', 'leader'), wrap(async (req, res) => res.json(strip(await store.read('Replies')).reverse())));
+// Write / send an email to one lead straight from the app
+app.get('/api/leads/raw/:id/draft', need('owner', 'leader'), wrap(async (req, res) => res.json(await engine.draftFor(req.params.id))));
+app.post('/api/leads/raw/:id/email', need('owner', 'leader'), wrap(async (req, res) => {
+  const b = req.body || {};
+  res.json({ ok: true, ...(await engine.emailLead(req.params.id, { to: b.to, subject: String(b.subject || '').slice(0, 300), text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
+}));
+
 app.post('/api/replies/:id/answer', need('owner', 'leader'), wrap(async (req, res) => {
   await engine.answerReply(req.params.id, (req.body || {}).text, req.user.name);
   res.json({ ok: true });
