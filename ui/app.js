@@ -31,7 +31,7 @@ const PAGES = {
   dashboard: { title: 'Dashboard', ic: '◈', roles: ['owner', 'leader', 'linkedin'], render: pageDashboard, sec: 'Work' },
   linkedin: { title: 'LinkedIn tasks', ic: 'in', roles: ['owner', 'leader', 'linkedin'], render: pageLinkedIn, sec: 'Work' },
   calls: { title: 'Call / WhatsApp', ic: '☎', roles: ['owner', 'leader', 'linkedin'], render: pageCalls, sec: 'Work' },
-  replies: { title: 'Replies', ic: '↩', roles: ['owner', 'leader'], render: pageReplies, sec: 'Work' },
+  replies: { title: 'Replies from client', ic: '↩', roles: ['owner', 'leader', 'linkedin'], render: pageReplies, sec: 'Work' },
   qualified: { title: 'Qualified leads', ic: '★', roles: ['owner', 'leader'], render: pageQualified, sec: 'Work' },
   leads: { title: 'All email leads', ic: '✉', roles: ['owner', 'leader'], render: pageLeads, sec: 'Work' },
   import: { title: 'Import leads', ic: '⇪', roles: ['owner', 'leader'], render: pageImport, sec: 'Grow' },
@@ -364,20 +364,33 @@ async function pageLinkedIn(el) {
 }
 
 /* ------------------------------------------------------------ import */
-// Everyone who wrote back: who, when, what they said, what we answered, and a box to answer them yourself.
+// Replies from client: two separate lists, Gmail (email replies) and LinkedIn (replies pasted from LinkedIn).
+// Each shows who it is (with links to their email / LinkedIn profile), what they said, what we sent, and a box to answer them.
+const RP_LABEL = { interested: 'Interested ★', question: 'Question', referral: 'Referral', not_interested: 'Not interested', unsubscribe: 'Unsubscribed', out_of_office: 'Out of office', other: 'Other' };
 async function pageReplies(el) {
-  const rows = await api('/replies');
-  const open = r => /please answer|Not sent/i.test(r['Reply Status'] || '');
+  const canMail = S.me.role !== 'linkedin';
+  const [mailRows, liAll] = await Promise.all([canMail ? api('/replies') : [], api('/leads/linkedin')]);
+  const liRows = liAll.filter(r => String(r['Their Reply'] || '').trim());
+  const src = canMail ? (sessionStorage.getItem('rp_src') || 'gmail') : 'linkedin';
+  const mailOpen = r => /please answer|Not sent/i.test(r['Reply Status'] || '');
+  const liOpen = r => r.Status === 'Replied';
+  el.innerHTML = head('Replies from client', 'Everything clients wrote back to us, with their contact links, what they said and what we sent. Answer them from here.',
+    `<div class="seg">${canMail ? `<button data-s="gmail" class="${src === 'gmail' ? 'on' : ''}">✉ Gmail (${mailRows.length}${mailRows.some(mailOpen) ? ' · ' + mailRows.filter(mailOpen).length + ' waiting' : ''})</button>` : ''}<button data-s="linkedin" class="${src === 'linkedin' ? 'on' : ''}">in LinkedIn (${liRows.length}${liRows.some(liOpen) ? ' · ' + liRows.filter(liOpen).length + ' waiting' : ''})</button></div>`) + '<div id="sub"></div><div id="t"></div>';
+  $$('.head .seg button').forEach(b => b.onclick = () => { sessionStorage.setItem('rp_src', b.dataset.s); route(); });
+  return src === 'gmail' ? repliesGmail(mailRows, mailOpen) : repliesLinkedIn(liRows, liOpen);
+}
+
+function repliesGmail(rows, open) {
   const view = sessionStorage.getItem('rp_view') || (rows.some(open) ? 'open' : 'all');
   const list = view === 'open' ? rows.filter(open) : rows;
-  const label = { interested: 'Interested ★', question: 'Question', referral: 'Referral', not_interested: 'Not interested', unsubscribe: 'Unsubscribed', out_of_office: 'Out of office', other: 'Other' };
-  el.innerHTML = head('Replies', 'Everyone who answered our emails, what they said and what was sent back. Answer them yourself from here: it goes out from the same inbox, in the same email thread.',
-    `<div class="seg"><button data-v="open" class="${view === 'open' ? 'on' : ''}">Needs your answer (${rows.filter(open).length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All replies (${rows.length})</button></div>`) + '<div id="t"></div>';
-  $$('.seg button').forEach(b => b.onclick = () => { sessionStorage.setItem('rp_view', b.dataset.v); route(); });
-  if (!list.length) { $('#t').innerHTML = `<div class="tablewrap"><div class="empty"><b>${rows.length ? 'Nothing waiting for you' : 'No replies yet'}</b>${rows.length ? 'The agent has answered everyone. See "All replies".' : 'When a lead answers an email, it appears here within 5 minutes.'}</div></div>`; return; }
+  $('#sub').innerHTML = `<div class="seg" style="margin-bottom:12px"><button data-v="open" class="${view === 'open' ? 'on' : ''}">Needs your answer (${rows.filter(open).length})</button><button data-v="all" class="${view === 'all' ? 'on' : ''}">All Gmail replies (${rows.length})</button></div>`;
+  $$('#sub button').forEach(b => b.onclick = () => { sessionStorage.setItem('rp_view', b.dataset.v); route(); });
+  if (!list.length) { $('#t').innerHTML = `<div class="tablewrap"><div class="empty"><b>${rows.length ? 'Nothing waiting for you' : 'No email replies yet'}</b>${rows.length ? 'The agent has answered everyone. See "All Gmail replies".' : 'When a client answers an email, it appears here within 5 minutes.'}</div></div>`; return; }
   $('#t').innerHTML = `<div class="tasks">${list.map((r, i) => `<article class="task" data-i="${i}">
-      <div class="step">${esc(r['Received On'])} · ${esc(label[r.Category] || r.Category || '')}</div>
-      <div class="top"><div><div class="strong">${esc(r['Business Name'])}</div><div class="sub">${esc([r['Contact Name'], r.From].filter(Boolean).join(' · '))}${r.Inbox ? ' → ' + esc(r.Inbox) : ''}</div></div>${tag(r['Reply Status'])}</div>
+      <div class="step">✉ Gmail · ${esc(r['Received On'])} · ${esc(RP_LABEL[r.Category] || r.Category || '')}</div>
+      <div class="top"><div><div class="strong">${esc(r['Business Name'] || r.From)}</div>
+        <div class="sub">${r['Contact Name'] ? esc(r['Contact Name']) + ' · ' : ''}<a href="mailto:${esc(r.From)}">${esc(r.From)}</a>${r.Inbox ? ' → our inbox ' + esc(r.Inbox) : ''}</div></div>${tag(r['Reply Status'])}</div>
+      ${r.Summary ? `<div class="sub" style="margin-top:6px">Summary: ${esc(r.Summary)}</div>` : ''}
       <div class="sub" style="margin-top:8px">They wrote${r.Subject ? ' (' + esc(r.Subject) + ')' : ''}:</div>
       <div class="msg">${esc(r['Their Message'])}</div>
       ${r['Our Reply'] ? `<div class="sub">We answered:</div><div class="msg">${esc(r['Our Reply'])}</div>` : ''}
@@ -392,6 +405,38 @@ async function pageReplies(el) {
       if (!confirm(`Send this reply to ${r.From}?`)) return;
       await api('/replies/' + encodeURIComponent(r['Reply ID']) + '/answer', { method: 'POST', body: { text } });
       toast('Reply sent to ' + r.From); route();
+    });
+  });
+}
+
+function repliesLinkedIn(rows, open) {
+  const canMail = S.me.role !== 'linkedin';
+  const list = rows.slice().sort((a, b) => open(b) - open(a));
+  $('#sub').innerHTML = '<div class="sub" style="margin-bottom:12px">LinkedIn does not let apps read your messages, so paste each reply on the <a href="#/linkedin">LinkedIn tasks</a> page ("Paste their reply"). It then appears here with a suggested answer.</div>';
+  if (!list.length) { $('#t').innerHTML = '<div class="tablewrap"><div class="empty"><b>No LinkedIn replies yet</b>When someone answers you on LinkedIn, paste their message on the LinkedIn tasks page.</div></div>'; return; }
+  $('#t').innerHTML = `<div class="tasks">${list.map((r, i) => `<article class="task" data-i="${i}">
+      <div class="step">in LinkedIn${r['AI Category'] ? ' · ' + esc(RP_LABEL[r['AI Category']] || r['AI Category']) : ''}${open(r) ? ' · waiting for our answer' : ''}</div>
+      <div class="top"><div><div class="strong">${esc(r.Name)}</div>
+        <div class="sub">${esc([r.Title, r.Company, r.Location].filter(Boolean).join(' · '))}</div>
+        <div class="sub">${r['LinkedIn URL'] ? `<a href="${esc(r['LinkedIn URL'])}" target="_blank" rel="noopener">LinkedIn profile</a>` : ''}${r.Email ? ` · <a href="mailto:${esc(r.Email)}">${esc(r.Email)}</a>` : ' · no email yet'}</div></div>${tag(r.Status)}</div>
+      <div class="sub" style="margin-top:8px">They wrote:</div>
+      <div class="msg">${esc(r['Their Reply'])}</div>
+      <div class="sub">Your answer${r['Suggested Reply'] ? ' (suggested by the AI, edit as you like)' : ''}:</div>
+      <textarea rows="4">${esc(r['Suggested Reply'] || '')}</textarea>
+      <div class="acts" style="margin-top:8px"><button class="btn sm primary" data-li>in&nbsp; Send on LinkedIn</button><button class="btn sm" data-lidone>✓ I sent it on LinkedIn</button>${canMail ? `<button class="btn sm" data-mail>✉ Send by email</button>` : ''}</div>
+      <div class="sub" style="margin-top:4px">Send on LinkedIn copies the answer and opens their profile in your browser (your own LinkedIn): click Message, Ctrl+V, Send, then "I sent it".</div>
+    </article>`).join('')}</div>`;
+  $$('.task').forEach(card => {
+    const r = list[+card.dataset.i], id = encodeURIComponent(r['Lead ID']);
+    const text = () => { const t = $('textarea', card).value.trim(); if (!t) throw new Error('Write your answer first.'); return t; };
+    $('[data-li]', card).onclick = () => { const t = $('textarea', card).value.trim(); if (!t) return toast('Write your answer first.', true); copy(t); if (r['LinkedIn URL']) window.open(r['LinkedIn URL'], '_blank', 'noopener'); };
+    $('[data-lidone]', card).onclick = e => busy(e.currentTarget, async () => { await api('/leads/linkedin/' + id + '/reply', { method: 'POST', body: { channel: 'linkedin', text: text() } }); toast('Saved as sent on LinkedIn'); route(); });
+    if ($('[data-mail]', card)) $('[data-mail]', card).onclick = e => busy(e.currentTarget, async () => {
+      const t = text(); let to = r.Email;
+      if (!to) { to = (prompt(`No email saved for ${r.Name}. Their email address:`) || '').trim(); if (!to) return; }
+      if (!confirm(`Send this answer by email to ${to}?`)) return;
+      const x = await api('/leads/linkedin/' + id + '/reply', { method: 'POST', body: { channel: 'email', to, text: t } });
+      toast('Sent: ' + x.where); route();
     });
   });
 }

@@ -220,6 +220,11 @@ app.post('/api/leads/qualified/:id/reply', need('owner', 'leader'), wrap(async (
   const b = req.body || {};
   res.json({ ok: true, ...(await engine.qualifiedReply(req.params.id, { channel: b.channel, to: b.to, text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
 }));
+app.post('/api/leads/linkedin/:id/reply', need(), wrap(async (req, res) => {
+  const b = req.body || {};
+  if (b.channel === 'email' && req.user.role === 'linkedin') throw new Error('Only the owner or team leader can send emails.');
+  res.json({ ok: true, ...(await engine.linkedinAnswer(req.params.id, { channel: b.channel, to: String(b.to || '').trim(), text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
+}));
 app.patch('/api/leads/linkedin/:id', need(), wrap(async (req, res) => {
   const b = req.body || {}, set = { 'Handled By': req.user.name };
   if (b.Status) { if (!LI_STATUSES.includes(b.Status)) throw new Error('Unknown status'); set.Status = b.Status; }

@@ -735,6 +735,35 @@ async function qualifiedReply(id, { channel, text, to }, by) {
   return { where };
 }
 
+// Answer a LinkedIn prospect who replied: on LinkedIn (a person sends it from their own LinkedIn; saved here) or by email (sent from the app)
+async function linkedinAnswer(id, { channel, text, to }, by) {
+  const r = (await store.read('LinkedIn Leads', true)).find(x => x['Lead ID'] === id);
+  if (!r) throw new Error('Lead not found');
+  const body = String(text || '').trim();
+  if (body.length < 2) throw new Error('Write the message first.');
+  const q = (await store.read('Qualified Leads', true)).find(x => x['Lead ID'] === id);
+  if (channel === 'email' && to && validEmail(to) && to !== r.Email) { await store.update('LinkedIn Leads', 'Lead ID', [{ key: id, set: { Email: to.trim(), 'Email Found How': 'added by ' + by } }]); r.Email = to.trim(); }
+  if (q) { const x = await qualifiedReply(id, { channel, text: body, to: to || r.Email }, by); await markLi(r, channel, '', by); return x; }
+  let where;
+  if (channel === 'email') {
+    const addr = String(to || r.Email || '').trim();
+    if (!validEmail(addr)) throw new Error('No email address for this person yet. Add one, or reply on LinkedIn.');
+    const s = await store.settings(), accs = mail.accounts(); if (!accs.length) throw new Error('Gmail is not connected (Connections page).');
+    await mail.send({ to: addr, from: accs[0].user, subject: `Following up on our LinkedIn chat - ${s.COMPANY}`, text: body + '\n\n' + signature(s), fromName: senderName(s) });
+    where = 'email to ' + addr;
+  } else if (channel === 'linkedin') where = 'LinkedIn';
+  else throw new Error('Choose email or LinkedIn');
+  await markLi(r, channel, body, by);
+  log('linkedin', `${by} answered ${r.Name} by ${where}`);
+  return { where };
+}
+async function markLi(r, channel, body, by) {
+  const set = { 'Handled By': by };
+  if (body) set.Notes = [r.Notes, `${today()}: ${by} replied by ${channel}: ${body.slice(0, 200)}`].filter(Boolean).join(' | ').slice(-1500);
+  if (!['Interested', 'Not Interested'].includes(r.Status)) set.Status = 'Message Sent';
+  await store.update('LinkedIn Leads', 'Lead ID', [{ key: r['Lead ID'], set }]);
+}
+
 // Whole conversation with a qualified lead, oldest first: what they wrote (email replies, LinkedIn) and what we sent
 async function qualifiedThread(id) {
   const q = await qualifiedLead(id);
@@ -775,4 +804,4 @@ async function callResult(id, status, note, by) {
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, _internals: { personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, linkedinAnswer, _internals: { personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
