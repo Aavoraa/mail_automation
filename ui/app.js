@@ -32,13 +32,16 @@ const PAGES = {
   linkedin: { title: 'LinkedIn tasks', ic: 'in', roles: ['owner', 'leader', 'linkedin'], render: pageLinkedIn, sec: 'Work' },
   calls: { title: 'Call / WhatsApp', ic: '☎', roles: ['owner', 'leader', 'linkedin'], render: pageCalls, sec: 'Work' },
   replies: { title: 'Replies from client', ic: '↩', roles: ['owner', 'leader', 'linkedin'], render: pageReplies, sec: 'Work' },
-  qualified: { title: 'Qualified leads', ic: '★', roles: ['owner', 'leader'], render: pageQualified, sec: 'Work' },
+  interested: { title: 'Interested leads', ic: '★', roles: ['owner', 'leader'], render: el => pageQualified(el, 'interested'), sec: 'Work' },
+  qualified: { title: 'Qualified leads', ic: '✓', roles: ['owner', 'leader'], render: el => pageQualified(el, 'qualified'), sec: 'Work' },
   leads: { title: 'All email leads', ic: '✉', roles: ['owner', 'leader'], render: pageLeads, sec: 'Work' },
   import: { title: 'Import leads', ic: '⇪', roles: ['owner', 'leader'], render: pageImport, sec: 'Grow' },
   templates: { title: 'Templates & tone', ic: '✎', roles: ['owner', 'leader'], render: pageTemplates, sec: 'Grow' },
   settings: { title: 'Settings', ic: '⚙', roles: ['owner', 'leader'], render: pageSettings, sec: 'Manage' },
   activity: { title: 'Agent activity', ic: '◷', roles: ['owner', 'leader'], render: pageActivity, sec: 'Manage' },
   team: { title: 'Team & logins', ic: '◎', roles: ['owner'], render: pageTeam, sec: 'Manage' },
+  usage: { title: 'Tokens & usage', ic: '◔', roles: ['owner', 'leader'], render: pageUsage, sec: 'Manage' },
+  bills: { title: 'Bills & payments', ic: '₹', roles: ['owner'], render: pageBills, sec: 'Manage' },
   connections: { title: 'Connections', ic: '⇄', roles: ['owner'], render: pageConnections, sec: 'Manage' },
   account: { title: 'My account', ic: '○', roles: ['owner', 'leader', 'linkedin'], render: pageAccount, hidden: true },
 };
@@ -52,17 +55,28 @@ async function route() {
   if (!p || !p.roles.includes(S.me.role)) { location.hash = '#/' + (S.me.role === 'linkedin' ? 'linkedin' : 'dashboard'); return; }
   shell(page);
   try { await p.render($('#page')); } catch (e) { $('#page').innerHTML = `<div class="notice err">${esc(e.message)}</div>`; }
-  autoSeen(); drawBadges(); startNotify();
+  countUp(); autoSeen(); drawBadges(); startNotify();
 }
 window.addEventListener('hashchange', route);
+// KPI numbers count up when a page opens (motion), e.g. 0 -> 1,284
+function countUp() {
+  if (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  for (const el of $$('.kpi .value')) {
+    const m = el.textContent.match(/^([\d,]+)(.*)$/); if (!m) continue;
+    const end = Number(m[1].replace(/,/g, '')), rest = m[2]; if (!end || end > 1e7) continue;
+    const t0 = performance.now(), dur = 900;
+    const tick = now => { const k = Math.min(1, (now - t0) / dur), v = Math.round(end * (1 - Math.pow(1 - k, 3))); el.textContent = v.toLocaleString('en-IN') + rest; if (k < 1) requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  }
+}
 
 /* ------------------------------------------------------------ notifications: red badges, pop sound, pop-up */
 // A red circle with the number of new items sits on the menu item (and tab) where they arrived; it clears when you open it.
 // Each new client reply or qualified lead plays a short "pop" and shows a Windows pop-up.
 const N = { data: null, seen: null, known: null, user: '', timer: null };
-const NSECS = ['gmail', 'linkedin', 'qualified', 'accepted'];
-const NLABEL = { gmail: 'New Gmail reply', linkedin: 'New LinkedIn reply', qualified: 'New qualified lead', accepted: 'Accepted on LinkedIn' };
-const NPAGE = { gmail: 'replies', linkedin: 'replies', qualified: 'qualified', accepted: 'linkedin' };
+const NSECS = ['gmail', 'linkedin', 'qualified', 'accepted', 'alarm'];
+const NLABEL = { gmail: 'New Gmail reply', linkedin: 'New LinkedIn reply', qualified: 'New interested lead (Hot / Warm)', accepted: 'Accepted on LinkedIn', alarm: '⚠ ALARM' };
+const NPAGE = { gmail: 'replies', linkedin: 'replies', qualified: 'interested', accepted: 'linkedin', alarm: 'dashboard' };
 const seenKey = () => 'aav_seen_' + ((S.me && (S.me.username || S.me.name)) || '');
 const store_ = { get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
 const unseen = sec => (N.data && N.data[sec] || []).filter(x => !(N.seen && (N.seen[sec] || []).includes(x.id)));
@@ -71,8 +85,9 @@ function markSeen(sec) { if (!N.data || !N.seen || !N.data[sec]) return; N.seen[
 function autoSeen() {
   if (!N.data || document.visibilityState !== 'visible' || !document.hasFocus()) return;
   const page = (location.hash.replace(/^#\/?/, '').split('?')[0]) || 'dashboard';
-  if (page === 'qualified') markSeen('qualified');
+  if (page === 'interested') markSeen('qualified');
   if (page === 'linkedin') markSeen('accepted');
+  if (page === 'dashboard') markSeen('alarm');
   if (page === 'replies') markSeen(S.me.role === 'linkedin' ? 'linkedin' : (sessionStorage.getItem('rp_src') || 'gmail'));
 }
 function badgeOn(el, n) {
@@ -83,10 +98,10 @@ function badgeOn(el, n) {
 }
 function drawBadges() {
   const g = unseen('gmail').length, l = unseen('linkedin').length, q = unseen('qualified').length, a = unseen('accepted').length;
-  badgeOn($('.nav a[href="#/replies"]'), g + l); badgeOn($('.nav a[href="#/qualified"]'), q); badgeOn($('.nav a[href="#/linkedin"]'), a);
+  badgeOn($('.nav a[href="#/replies"]'), g + l); badgeOn($('.nav a[href="#/interested"]'), q); badgeOn($('.nav a[href="#/linkedin"]'), a); const al = unseen('alarm').length; badgeOn($('.nav a[href="#/dashboard"]'), al);
   badgeOn($('.head .seg button[data-s="gmail"]'), g); badgeOn($('.head .seg button[data-s="linkedin"]'), l);
-  badgeOn($('#menuBtn'), g + l + q + a);
-  const total = g + l + q + a;
+  badgeOn($('#menuBtn'), g + l + q + a + al);
+  const total = g + l + q + a + al;
   document.title = (total ? `(${total}) ` : '') + 'AAVORAA Lead Agent';
   if (window.aavDesktop) window.aavDesktop.badge(total);
 }
@@ -101,9 +116,21 @@ function pop() {
     o.connect(g).connect(actx.destination); o.start(t); o.stop(t + 0.22);
   } catch (e) {}
 }
+function siren() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+    for (let k = 0; k < 3; k++) {
+      const t = actx.currentTime + k * 0.32, o = actx.createOscillator(), g = actx.createGain();
+      o.type = 'square'; o.frequency.setValueAtTime(880, t); o.frequency.setValueAtTime(660, t + 0.14);
+      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+      o.connect(g).connect(actx.destination); o.start(t); o.stop(t + 0.3);
+    }
+  } catch (e) {}
+}
 function popup(items) {
   const one = items.length === 1, x = items[0];
-  const title = one ? `${NLABEL[x.sec]}: ${x.who || ''}` : `${items.length} new: ` + NSECS.map(s => [s, items.filter(i => i.sec === s).length]).filter(a => a[1]).map(([s, n]) => `${n} ${s === 'qualified' ? 'qualified' : s === 'gmail' ? 'Gmail' : s === 'accepted' ? 'accepted on LinkedIn' : 'LinkedIn'}`).join(', ');
+  const title = one ? `${NLABEL[x.sec]}: ${x.who || ''}` : `${items.length} new: ` + NSECS.map(s => [s, items.filter(i => i.sec === s).length]).filter(a => a[1]).map(([s, n]) => `${n} ${s === 'qualified' ? 'interested' : s === 'gmail' ? 'Gmail' : s === 'accepted' ? 'accepted on LinkedIn' : s === 'alarm' ? 'ALARM' : 'LinkedIn'}`).join(', ');
   const body = one ? x.text || '' : items.slice(0, 3).map(i => `${i.who}: ${i.text}`).join('\n');
   const page = NPAGE[x.sec];
   if (window.aavDesktop) return window.aavDesktop.notify({ title, body, page, src: x.sec });
@@ -121,7 +148,7 @@ async function pollNotify() {
   if (N.known) for (const s of NSECS) for (const x of d[s] || []) if (!N.known[s].has(x.id) && !(N.seen[s] || []).includes(x.id)) fresh.push({ sec: s, ...x });
   N.known = {}; NSECS.forEach(s => N.known[s] = new Set((d[s] || []).map(x => x.id)));
   if (fresh.length) {
-    pop(); popup(fresh);
+    if (fresh.some(f => f.sec === 'alarm')) siren(); else pop(); popup(fresh);
     // refresh the page you are on if the new item belongs there and you are not typing
     const page = (location.hash.replace(/^#\/?/, '').split('?')[0]) || 'dashboard';
     if (fresh.some(f => NPAGE[f.sec] === page) && !$$('#page textarea, #page input').some(t => t.value && t.value.trim() && t.matches(':focus'))) { route(); return; }
@@ -145,7 +172,7 @@ function shell(active) {
     nav += `<a href="#/${id}" class="${id === active ? 'on' : ''}"><span class="ic">${p.ic}</span>${p.title}</a>`;
   }
   root().innerHTML = `<div class="shell">
-    <aside class="side" id="side"><div class="brand"><span class="word">AAVORAA</span><small>Lead Agent</small></div>
+    <aside class="side" id="side"><div class="brand"><img class="mark" src="/logo-mark.png" alt=""><span class="wordmark" aria-label="AAVORAA">ΛΛVORΛΛ</span><span class="tagline">Beyond Possibilities</span><small>Lead Agent</small></div>
       <nav class="nav">${nav}</nav>
       <div class="me"><div class="avatar">${esc((S.me.name || '?')[0].toUpperCase())}</div><div class="who"><b>${esc(S.me.name)}</b><span>${ROLE_NAME[S.me.role]}</span></div>
       <a class="btn sm ghost" href="#/account" title="My account">⋯</a></div>
@@ -233,11 +260,11 @@ async function pageSetup() {
     } catch (err) { msg(err.message, 'err'); }
   });
 }
-function pageNotReady() { root().innerHTML = `<div class="center"><div class="authcard"><span class="word">AAVORAA</span><div class="tag2">Lead Agent</div><div class="notice">The owner hasn't finished setting up the app on the main PC yet.</div></div></div>`; }
+function pageNotReady() { root().innerHTML = `<div class="center"><div class="authcard"><div class="halo"><img src="/logo-mark.png" alt=""></div><span class="word" aria-label="AAVORAA">ΛΛVORΛΛ</span><div class="tag2">Beyond Possibilities · Lead Agent</div><div class="notice">The owner hasn't finished setting up the app on the main PC yet.</div></div></div>`; }
 
 /* ------------------------------------------------------------ login */
 function pageLogin() {
-  root().innerHTML = `<div class="center"><form class="authcard" id="lf"><span class="word">AAVORAA</span><div class="tag2">Lead Agent</div>
+  root().innerHTML = `<div class="center"><form class="authcard" id="lf"><div class="halo"><img src="/logo-mark.png" alt=""></div><span class="word" aria-label="AAVORAA">ΛΛVORΛΛ</span><div class="tag2">Beyond Possibilities · Lead Agent</div>
     <div id="msg"></div>
     <label class="f"><span>Username</span><input type="text" id="u" autocomplete="username" required autofocus></label>
     <label class="f"><span>Password</span><input type="password" id="p" autocomplete="current-password" required></label>
@@ -262,31 +289,95 @@ async function pageDashboard(el) {
       ${kpi('Leads found', fmt(t.raw + t.linkedin), `+${fmt(last7('found'))} in 7 days`)}
       ${kpi('Emailed', fmt(t.emailed), `${fmt(t.waiting)} waiting · ${fmt(t.bounced)} bounced`)}
       ${kpi('Replies', fmt(t.replied), `${pct(t.replied, t.emailed)} reply rate`)}
-      ${kpi('Qualified leads', fmt(t.qualified), `+${fmt(last7('qualified'))} in 7 days`, 'gold')}
+      ${kpi('Qualified leads', fmt(t.qualified), `confirmed, ready to work · ${fmt(t.interested)} interested (hot / warm)`, 'gold')}
       ${kpi('LinkedIn to connect', fmt(t.linkedinToConnect), `${fmt(t.linkedin)} prospects total`)}
       <div class="kpi"><div class="label">Emails sent today</div><div class="value">${fmt(a.sentToday)} / ${fmt(a.todayLimit)}</div><div class="bar"><i style="width:${Math.min(100, a.todayLimit ? a.sentToday / a.todayLimit * 100 : 0)}%"></i></div><div class="hint">limit grows each week</div></div>
     </section>
     <section class="grid"><div class="panel"><h2>Last 14 days</h2><div class="desc">What the agent did each day</div><div class="legend" id="lg"></div><div id="chart" style="height:240px"></div></div>
-      <div class="panel"><h2>Pipeline</h2><div class="desc">From found to qualified, all time</div>${funnel([['Leads found', t.raw], ['Email found', t.withEmail], ['Emailed', t.emailed], ['Replied', t.replied], ['Qualified', t.qualified]])}
-      <div class="sub" style="margin-top:12px">Reply rate ${pct(t.replied, t.emailed)} · Qualified from replies ${pct(t.qualified, t.replied)}</div></div></section>
-    <section class="grid3"><div class="panel"><h2>Lead status</h2><div class="desc">Email leads</div>${blist(d.rawStatus, '#c9a24d', 8)}</div>
-      <div class="panel"><h2>Services in demand</h2><div class="desc">${t.qualified ? 'What qualified leads want' : 'Best-fit service picked by AI'}</div>${blist(d.services, '#6fbf8a')}</div>
-      <div class="panel"><h2>Newest qualified leads</h2><div class="desc">Hand these to the team leader</div>${d.recentQualified.length ? d.recentQualified.map(q => `<div class="field"><div class="strong">${esc(q['Business Name'] || q['Contact Name'])} ${tag(q['Lead Score'])}</div><div class="sub">${esc(q['Service Needed'])} · ${esc(q.Source)} · ${esc(q['Date Qualified'])}</div></div>`).join('') : '<div class="sub">None yet. They appear when someone says yes.</div>'}</div></section>`;
+      <div class="panel"><h2>Pipeline</h2><div class="desc">From found to qualified, all time</div>${funnel([['Leads found', t.raw], ['Email found', t.withEmail], ['Emailed', t.emailed], ['Replied', t.replied], ['Interested', t.interested + t.qualified], ['Qualified', t.qualified]])}
+      <div class="sub" style="margin-top:12px">Reply rate ${pct(t.replied, t.emailed)} · Interested from replies ${pct(t.interested + t.qualified, t.replied)} · Qualified from interested ${pct(t.qualified, t.interested + t.qualified)}</div></div></section>
+    <section class="grid3"><div class="panel"><h2>Lead status</h2><div class="desc">Email leads</div>${blist(d.rawStatus, '#7a1f35', 8)}</div>
+      <div class="panel"><h2>Services in demand</h2><div class="desc">${t.qualified ? 'What qualified leads want' : 'Best-fit service picked by AI'}</div>${blist(d.services, '#5b7a5f')}</div>
+      <div class="panel"><h2>Newest qualified leads</h2><div class="desc">Confirmed after the call: ready to work with AAVORAA</div>${d.recentQualified.length ? d.recentQualified.map(q => `<div class="field"><div class="strong">${esc(q['Business Name'] || q['Contact Name'])} ${tag(q['Lead Score'])}</div><div class="sub">${esc(q['Service Needed'])} · ${esc(q.Source)} · ${esc(q['Date Qualified'])}</div></div>`).join('') : '<div class="sub">None yet. They appear when someone says yes.</div>'}</div></section>`;
   chart($('#chart'), $('#lg'), s);
+  if (S.me.role !== 'linkedin') dashExtras(el, isOwner);
   $('#rf').onclick = () => route();
   if ($('#onoff')) $('#onoff').onchange = async e => { try { await api('/agent/toggle', { method: 'POST', body: { on: e.target.checked } }); toast(e.target.checked ? 'Agent switched ON' : 'Agent paused'); route(); } catch (err) { toast(err.message, true); } };
+}
+// Alarms (problems to look at), sending inboxes (auto-switch + how many are needed), today's lead target
+async function dashExtras(el, isOwner) {
+  const box = document.createElement('section'); box.className = 'grid'; box.style.marginTop = '18px'; el.appendChild(box);
+  const [al, ib, us] = await Promise.all([api('/alarms').catch(() => []), api('/inboxes').catch(() => null), api('/usage').catch(() => null)]);
+  const when = iso => new Date(iso).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  box.innerHTML = `<div class="panel alarmpanel"><h2>⚠ Alarms ${al.length ? `<span class="tag red">${al.length}</span>` : ''}</h2><div class="desc">Emails not delivered (address not found), inboxes paused, replies that could not be sent</div>
+      ${al.length ? `<div class="alarms">${al.slice(0, 12).map(a => `<div class="alarm ${esc(a.kind)}"><div class="strong">${esc(a.title)}</div><div class="sub">${esc(a.text)}</div><div class="sub">${when(a.at)}</div></div>`).join('')}</div>${isOwner || S.me.role === 'leader' ? '<button class="btn sm ghost" id="clrAl" style="margin-top:10px">Clear all alarms</button>' : ''}` : '<div class="sub">✓ No problems. Everything is running.</div>'}</div>
+    <div class="panel"><h2>Sending inboxes</h2><div class="desc">If an inbox has a problem it is paused and the others take over automatically</div>
+      ${ib ? `<div class="ilist">${ib.list.map(i => `<div class="irow"><span class="dot ${i.paused ? 'off' : 'on'}"></span><div style="flex:1;min-width:0"><div class="strong" style="overflow:hidden;text-overflow:ellipsis">${esc(i.user)}${i.main ? ' <span class="sub">(main)</span>' : ''}</div><div class="sub">${i.paused ? `Paused: ${esc(i.reason)} (until ${when(i.pausedUntil)})` : `Sent today ${i.sentToday} / ${i.limit}`}</div></div>${i.paused && isOwner ? `<button class="btn sm" data-resume="${esc(i.user)}">Resume</button>` : ''}</div>`).join('')}</div>
+      <div class="notice" style="margin-top:12px">For <b>${ib.target}</b> emails a day you need about <b>${ib.needed}</b> inboxes (each sends at most ${ib.perInbox} a day once warmed up). You have <b>${ib.list.length}</b>.${ib.list.length < ib.needed ? ' Add more under Connections → Extra sending inboxes (5-10 is safest).' : ''}</div>` : '<div class="sub">–</div>'}</div>
+    ${us ? `<div class="panel"><h2>Leads today</h2><div class="desc">Daily target and quality leads</div>
+      <div class="kpis" style="grid-template-columns:1fr 1fr;margin:0"><div class="kpi"><div class="label">Leads found today</div><div class="value">${fmt(us.leads.today)} / ${fmt(us.leads.target)}</div><div class="bar"><i style="width:${Math.min(100, us.leads.target ? us.leads.today / us.leads.target * 100 : 0)}%"></i></div></div>
+      <div class="kpi gold"><div class="label">Quality leads today</div><div class="value">${fmt(us.leads.qualityToday)}</div><div class="hint">target ${us.leads.qualityTarget}</div></div></div></div>
+    <div class="panel"><h2>Tokens today</h2><div class="desc">Full details on <a href="#/usage">Tokens &amp; usage</a></div>
+      ${tokbar('AI requests', us.ai.requestsToday, us.ai.limit)}${tokbar('Emails', us.mail.sentToday, us.mail.capacityToday)}<div class="sub" style="margin-top:8px">${fmt(us.ai.tokensToday)} AI tokens today · about ${fmt(us.perLead.tokens)} tokens per lead</div></div>` : ''}`;
+  if ($('#clrAl')) $('#clrAl').onclick = e => busy(e.currentTarget, async () => { if (!confirm('Clear all alarms?')) return; await api('/alarms', { method: 'DELETE' }); route(); });
+  $$('[data-resume]').forEach(b => b.onclick = () => busy(b, async () => { await api('/inboxes/' + encodeURIComponent(b.dataset.resume) + '/resume', { method: 'POST', body: {} }); toast('Inbox resumed'); route(); }));
+}
+const tokbar = (l, used, max) => `<div style="margin-top:10px"><div class="sub" style="display:flex"><span>${l}</span><span style="margin-left:auto">${fmt(used)} used · ${fmt(Math.max(0, max - used))} left</span></div><div class="bar"><i style="width:${Math.min(100, max ? used / max * 100 : 0)}%"></i></div></div>`;
+
+// Token & usage dashboard: AI (ChatGPT / Gemini), mail, lead platforms - combined, and per lead
+async function pageUsage(el) {
+  const u = await api('/usage');
+  const SRC = { osm: 'OpenStreetMap', ddg: 'Web search (DuckDuckGo)', googlePlaces: 'Google Places', tomtom: 'TomTom', geoapify: 'Geoapify', here: 'HERE', apify: 'Apify' };
+  const maxS = Math.max(1, ...u.series.map(d => d.tokens));
+  el.innerHTML = head('Tokens & usage', 'Everything the app uses (AI, email, lead platforms) in one place, and what one lead costs on average.') +
+    `<section class="kpis">
+      ${kpi('AI requests left today', fmt(u.ai.requestsLeft), `${fmt(u.ai.requestsToday)} used of ${fmt(u.ai.limit)} · ${esc(u.ai.provider)}`)}
+      ${kpi('AI tokens used', fmt(u.ai.tokensToday), `${fmt(u.ai.tokens7)} in 7 days · ${fmt(u.ai.tokens30)} in 30 days`)}
+      ${kpi('Emails left today', fmt(Math.max(0, u.mail.capacityToday - u.mail.sentToday)), `${fmt(u.mail.sentToday)} sent of ${fmt(u.mail.capacityToday)} · ${u.mail.inboxes} inboxes${u.mail.paused ? ', ' + u.mail.paused + ' paused' : ''}`)}
+      ${kpi('Platform searches', fmt(u.platform.searchesToday), `${fmt(u.platform.searches30)} in 30 days`)}
+      ${kpi('Tokens per lead', fmt(u.perLead.tokens), `${u.perLead.aiRequests} AI requests · ${u.perLead.searches} searches · ${u.perLead.emails} emails per lead (30 days)`, 'gold')}
+      ${kpi('Leads (30 days)', fmt(u.leads.found30), `${fmt(u.leads.analysed30)} analysed by the AI agent`)}
+    </section>
+    <section class="grid"><div class="panel"><h2>AI tokens, last 14 days</h2><div class="desc">Every AI request the app made (writing emails, replies, analysing leads)</div>
+      <div class="bars">${u.series.map(d => `<div class="bcol" title="${d.day}: ${fmt(d.tokens)} tokens, ${d.ai} requests, ${d.sent} emails, ${d.leads} leads"><i style="height:${Math.max(2, d.tokens / maxS * 100)}%"></i><span>${d.day.slice(8)}</span></div>`).join('')}</div></div>
+      <div class="panel"><h2>Free AI models</h2><div class="desc">When one model's free requests run out, the next one is used</div>
+      ${(u.ai.models || []).length ? (u.ai.models || []).map(m => `<div class="irow"><span class="dot ${m.free ? 'on' : 'off'}"></span><span>${esc(m.model)}</span><span class="sub" style="margin-left:auto">${m.free ? 'available' : 'used up today'}</span></div>`).join('') : `<div class="sub">${esc(u.ai.provider)}${u.ai.model ? ' · ' + esc(u.ai.model) : ''}</div>`}</div></section>
+    <section class="grid"><div class="panel"><h2>Lead platforms (30 days)</h2><div class="desc">Searches made on each source, and the businesses each one returned</div>
+      ${Object.keys(SRC).filter(k => u.platform.bySource[k] || u.platform.leadsBySource[SRC[k]] || u.platform.leadsBySource[k]).map(k => `<div class="irow"><span>${SRC[k]}</span><span class="sub" style="margin-left:auto">${fmt(u.platform.bySource[k] || 0)} searches · ${fmt(u.platform.leadsBySource[SRC[k]] || u.platform.leadsBySource[k] || 0)} businesses</span></div>`).join('') || '<div class="sub">No searches yet</div>'}</div>
+      <div class="panel"><h2>How "per lead" is worked out</h2><div class="desc">All usage of the last 30 days divided by the leads found in those 30 days</div>
+      <div class="sub">AI tokens ${fmt(u.ai.tokens30)} ÷ ${fmt(u.leads.found30)} leads = <b>${fmt(u.perLead.tokens)}</b> tokens per lead. Money per lead: see <a href="#/bills">Bills &amp; payments</a>.</div></div></section>`;
+}
+
+// Bills & payments: every tool's monthly cost in one place, with the total
+async function pageBills(el) {
+  const rows = await api('/bills');
+  const num = v => Number(String(v || '').replace(/[^\d.]/g, '')) || 0;
+  const draw = () => {
+    el.innerHTML = head('Bills & payments', 'Every tool this app uses and what it costs each month: ChatGPT API, mail, lead platforms, your service charges, Claude. Fill in the amounts; the total is worked out for you.') +
+      `<div class="tablewrap"><table class="tbl"><thead><tr><th>No.</th><th>Item</th><th>Monthly amount (Rs)</th><th>Paid on</th><th>Paid by</th><th>Notes</th><th>Pay / billing page</th></tr></thead><tbody>
+      ${rows.map((r, i) => `<tr data-i="${i}"><td>${i + 1}</td><td><input type="text" data-k="Item" value="${esc(r.Item)}"></td><td><input type="text" inputmode="decimal" data-k="Monthly Amount (Rs)" value="${esc(r['Monthly Amount (Rs)'])}" placeholder="0"></td>
+        <td><input type="date" data-k="Paid On" value="${esc(r['Paid On'])}"></td><td><input type="text" data-k="Paid By" value="${esc(r['Paid By'])}"></td><td><input type="text" data-k="Notes" value="${esc(r.Notes)}"></td>
+        <td>${r['Billing Link'] ? `<a href="${esc(r['Billing Link'])}" target="_blank" rel="noopener">Open ↗</a>` : '<span class="sub">–</span>'}</td></tr>`).join('')}
+      <tr class="total"><td></td><td><b>Total price of this software</b></td><td><b id="tot">Rs. ${fmt(rows.reduce((a, r) => a + num(r['Monthly Amount (Rs)']), 0))}</b></td><td colspan="4" class="sub">per month</td></tr></tbody></table></div>
+      <div class="acts" style="margin-top:12px"><button class="btn" id="addB">+ Add a bill</button><button class="btn primary" id="saveB">Save</button></div>
+      <div class="sub" style="margin-top:8px">Payments are made on each company's own billing page (the "Open" links). The app keeps the amounts in one place; it never stores card details.</div>`;
+    $$('tbody input').forEach(inp => inp.oninput = () => { rows[+inp.closest('tr').dataset.i][inp.dataset.k] = inp.value; $('#tot').textContent = 'Rs. ' + fmt(rows.reduce((a, r) => a + num(r['Monthly Amount (Rs)']), 0)); });
+    $('#addB').onclick = () => { rows.push({ Item: '', 'Monthly Amount (Rs)': '' }); draw(); };
+    $('#saveB').onclick = e => busy(e.currentTarget, async () => { await api('/bills', { method: 'PUT', body: rows }); toast('Bills saved'); route(); });
+  };
+  draw();
 }
 const kpi = (l, v, h, cls = '') => `<div class="kpi ${cls}"><div class="label">${l}</div><div class="value">${v}</div><div class="hint">${h}</div></div>`;
 function funnel(steps) { const max = Math.max(1, steps[0][1]); return `<div class="funnel">${steps.map(([n, v]) => `<div class="frow"><span class="l">${n}</span><div class="ftrack"><div class="ffill" style="width:${Math.max(2, v / max * 100)}%"></div></div><span class="n">${fmt(v)}</span></div>`).join('')}</div>`; }
 function blist(obj, color, n = 7) { const e = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]).slice(0, n); if (!e.length) return '<div class="sub">No data yet</div>'; const m = e[0][1]; return `<div class="blist">${e.map(([k, v]) => `<div class="bi"><div class="t"><span class="nm" title="${esc(k)}">${esc(k)}</span><span class="bb"><i style="width:${v / m * 100}%;background:${color}"></i></span></div><span class="v">${fmt(v)}</span></div>`).join('')}</div>`; }
 function chart(el, lg, s) {
-  const SR = [{ k: 'found', n: 'Leads found', c: '#7fa7d9' }, { k: 'emailed', n: 'Emails sent', c: '#c9a24d' }, { k: 'replies', n: 'Replies', c: '#e07a63' }, { k: 'qualified', n: 'Qualified', c: '#6fbf8a' }];
+  const SR = [{ k: 'found', n: 'Leads found', c: '#8ab4ff' }, { k: 'emailed', n: 'Emails sent', c: '#7a1f35' }, { k: 'replies', n: 'Replies', c: '#ff7a6b' }, { k: 'interested', n: 'Interested', c: '#8f9c8c' }, { k: 'qualified', n: 'Qualified', c: '#5b7a5f' }];
   lg.innerHTML = SR.map(x => `<span><i style="background:${x.c}"></i>${x.n}</span>`).join('');
   const W = el.clientWidth || 700, H = 240, P = { l: 34, r: 12, t: 10, b: 26 };
   const max = Math.max(4, ...s.flatMap(r => SR.map(x => r[x.k]))), step = Math.ceil(max / 4), top = step * 4;
   const x = i => P.l + (W - P.l - P.r) * (i / (s.length - 1)), y = v => P.t + (H - P.t - P.b) * (1 - v / top);
   let g = '';
-  for (let i = 0; i <= 4; i++) { const yy = y(i * step); g += `<line x1="${P.l}" x2="${W - P.r}" y1="${yy}" y2="${yy}" stroke="#2b2620"/><text x="${P.l - 8}" y="${yy + 4}" text-anchor="end">${i * step}</text>`; }
+  for (let i = 0; i <= 4; i++) { const yy = y(i * step); g += `<line x1="${P.l}" x2="${W - P.r}" y1="${yy}" y2="${yy}" stroke="#ece3d1"/><text x="${P.l - 8}" y="${yy + 4}" text-anchor="end">${i * step}</text>`; }
   s.forEach((r, i) => { if (i % 2 === 1 || i === s.length - 1) { const d = new Date(r.date); g += `<text x="${x(i)}" y="${H - 6}" text-anchor="${i === s.length - 1 ? 'end' : 'middle'}">${d.getDate()} ${d.toLocaleString('en', { month: 'short' })}</text>`; } });
   const lines = SR.map(sr => `<polyline points="${s.map((r, i) => `${x(i)},${y(r[sr.k])}`).join(' ')}" fill="none" stroke="${sr.c}" stroke-width="2" stroke-linejoin="round"/>${s.map((r, i) => `<circle cx="${x(i)}" cy="${y(r[sr.k])}" r="2.6" fill="${sr.c}"/>`).join('')}`).join('');
   const hits = s.map((r, i) => `<rect x="${x(i) - W / s.length / 2}" y="${P.t}" width="${W / s.length}" height="${H - P.t - P.b}" fill="transparent" data-i="${i}"/>`).join('');
@@ -362,14 +453,34 @@ async function pageLeads(el) {
       });
     } });
 }
-async function pageQualified(el) {
-  const rows = await api('/leads/qualified');
-  el.innerHTML = head('Qualified leads', 'People who said yes. The team leader also gets an email for each one.') + '<div id="t"></div>';
-  table($('#t'), { rows, statusKey: 'Lead Score', empty: ['No qualified leads yet', 'When someone replies "yes, interested", they appear here.'],
+// Interested leads = said yes / showed interest (Hot / Warm), from email, LinkedIn or calls.
+// Qualified leads = confirmed after the call: they want to work with AAVORAA and their requirement is filled in.
+async function pageQualified(el, mode = 'qualified') {
+  const all = await api('/leads/qualified'), conf = r => r.Stage === 'Qualified';
+  const rows = all.filter(r => mode === 'qualified' ? conf(r) : !conf(r));
+  el.innerHTML = head(mode === 'qualified' ? 'Qualified leads' : 'Interested leads',
+    mode === 'qualified' ? 'Confirmed clients: after the call they want to work with AAVORAA and their requirement is filled in. From email, LinkedIn and calls.'
+      : 'Hot and warm leads who showed interest (email, LinkedIn, calls). After the call, open one and click <b>✓ Confirm as qualified</b> when they are ready to work with us.') + '<div id="t"></div>';
+  table($('#t'), { rows, statusKey: 'Lead Score', empty: mode === 'qualified' ? ['No qualified leads yet', 'Confirm an interested lead after the call and it moves here.'] : ['No interested leads yet', 'When someone replies "yes, interested", they appear here.'],
     cols: [{ k: 'Date Qualified', l: 'Date' }, { k: 'Business Name', l: 'Business', h: r => `<div class="strong">${esc(r['Business Name'] || r['Contact Name'])}</div><div class="sub">${esc(r['Contact Name'])}</div>` }, { k: 'Source', l: 'Source', h: r => tag(r.Source === 'LinkedIn' ? 'LinkedIn' : 'Email') }, { k: 'Service Needed', l: 'Service needed' }, { k: 'Lead Score', l: 'Score', h: r => tag(r['Lead Score']) }, { k: 'Country', l: 'Country' }, { k: 'Next Step', l: 'Next step' }, { k: 'Owner', l: 'Owner' }, { k: 'Last Contact On', l: 'Last contact', h: r => r['Last Contact On'] ? `${esc(r['Last Contact On'])}<div class="sub">${esc(r['Last Contact By'])}</div>` : '<span class="sub">not yet</span>' }],
     onRow: r => {
       const d = drawer(r['Business Name'] || r['Contact Name'], tag(r['Lead Score']) + ' ' + tag(r.Source), `<div class="row2"><label class="f"><span>Next step</span><input type="text" id="nx" value="${esc(r['Next Step'])}"></label><label class="f"><span>Owner</span><input type="text" id="ow" value="${esc(r.Owner)}"></label></div>
         <label class="f"><span>Score</span><select id="sc">${['Hot', 'Warm', 'Cold'].map(s => `<option ${s === r['Lead Score'] ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
+        ${conf(r) ? `<div class="field confirmed"><div class="k">✓ Qualified: confirmed by ${esc(r['Confirmed By'] || '-')} on ${esc(r['Confirmed On'] || '-')}</div>
+            <div class="sub">Call on ${esc(r['Call Done On'] || '-')} · Service: <b>${esc(r['Service Needed'] || '-')}</b> · Budget: ${esc(r.Budget || '-')} · Timeline: ${esc(r.Timeline || '-')} · Decision maker: ${esc(r['Decision Maker'] || '-')}</div>
+            <div class="msg" style="margin-top:6px">${esc(r['Requirement Details'] || '')}</div>
+            <button class="btn sm ghost" id="unq" style="margin-top:8px">Move back to interested</button></div>`
+          : `<details class="field confirmbox"><summary class="strong" style="cursor:pointer">✓ Confirm as qualified (after the call)</summary>
+            <div class="sub" style="margin:6px 0 10px">Fill this in when they are ready to work with AAVORAA. The lead then moves to Qualified leads and the team leader gets an email.</div>
+            <label class="switch" style="margin-bottom:12px"><input type="checkbox" id="cfReady"><i></i><span>They want to work with AAVORAA</span></label>
+            <div class="row2"><label class="f"><span>Call done on</span><input type="date" id="cfCall" value="${new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10)}"></label>
+              <label class="f"><span>Service they want *</span><input type="text" id="cfSvc" value="${esc(r['Service Needed'])}"></label>
+              <label class="f"><span>Budget</span><input type="text" id="cfBud" value="${esc(r.Budget)}"></label>
+              <label class="f"><span>Timeline</span><input type="text" id="cfTime" value="${esc(r.Timeline)}"></label></div>
+            <label class="f"><span>Decision maker (name / role)</span><input type="text" id="cfDm" value="${esc(r['Decision Maker'] || r['Contact Name'])}"></label>
+            <label class="f"><span>Their requirement *</span><textarea id="cfReq" rows="4" placeholder="What exactly they need, from the call">${esc(r['Requirement Details'] || '')}</textarea></label>
+            <label class="f"><span>Next step</span><input type="text" id="cfNext" value="${esc(r['Next Step'])}" placeholder="e.g. send proposal by Friday"></label>
+            <button class="btn primary" id="cfGo">✓ Confirm as qualified</button></details>`}
         <div class="field"><div class="k">Reply to them</div>
           <div class="seg" style="margin:6px 0" id="ch">${r.LinkedIn ? `<button data-c="linkedin" class="${r.LinkedIn ? 'on' : ''}">in LinkedIn</button>` : ''}<button data-c="email" class="${r.LinkedIn ? '' : 'on'}">✉ Email</button></div>
           <textarea id="lt" rows="3" placeholder="Optional: paste their latest message, so the AI answers it"></textarea>
@@ -391,7 +502,7 @@ async function pageQualified(el) {
         if (t.email && !$('#qe', d).value) $('#qe', d).value = t.email;
         if (t.emailHow) $('#qe', d).title = 'Found: ' + t.emailHow;
         if (!t.email && r.LinkedIn) $('#qe', d).placeholder = 'No email yet – the AI reply asks them for it on LinkedIn';
-        $('#conv', d).innerHTML = t.messages.length ? t.messages.map(m => `<div class="msg" style="white-space:pre-wrap;${m.who === 'us' ? 'margin-left:24px;border-left:3px solid var(--gold, #c9a24a)' : 'margin-right:24px'}"><div class="sub" style="margin-bottom:4px">${m.who === 'us' ? 'We' : 'They'} · ${m.channel === 'linkedin' ? 'LinkedIn' : m.channel === 'email' ? 'Email' : ''}${m.when ? ' · ' + esc(m.when) : ''}${m.meta ? ' · ' + esc(m.meta) : ''}</div>${esc(m.text)}</div>`).join('') : '<div class="sub">No messages saved yet.</div>';
+        $('#conv', d).innerHTML = t.messages.length ? t.messages.map(m => `<div class="msg" style="white-space:pre-wrap;${m.who === 'us' ? 'margin-left:24px;border-left:3px solid var(--gold, #d4a24c)' : 'margin-right:24px'}"><div class="sub" style="margin-bottom:4px">${m.who === 'us' ? 'We' : 'They'} · ${m.channel === 'linkedin' ? 'LinkedIn' : m.channel === 'email' ? 'Email' : ''}${m.when ? ' · ' + esc(m.when) : ''}${m.meta ? ' · ' + esc(m.meta) : ''}</div>${esc(m.text)}</div>`).join('') : '<div class="sub">No messages saved yet.</div>';
       }).catch(e => { $('#conv', d).innerHTML = `<div class="sub">${esc(e.message)}</div>`; });
       $('#qd', d).onclick = e => busy(e.currentTarget, async () => { const x = await api('/leads/qualified/' + id + '/draft', { method: 'POST', body: { channel: ch, latest: $('#lt', d).value.trim() } }); $('#qt', d).value = x.text; if (!x.ai) toast('AI not available right now, a simple reply was filled in', true); $('#qt', d).focus(); });
       const save = async () => api('/leads/qualified/' + id + '/reply', { method: 'POST', body: { channel: ch, to: $('#qe', d).value.trim(), text: $('#qt', d).value.trim() } });
@@ -401,6 +512,11 @@ async function pageQualified(el) {
         if (!confirm(`Send this email to ${$('#qe', d).value.trim()} now?`)) return;
         const x = await save(); toast('Sent: ' + x.where); closeLayer(); route();
       });
+      if ($('#cfGo', d)) $('#cfGo', d).onclick = e => busy(e.currentTarget, async () => {
+        await api('/leads/qualified/' + id + '/confirm', { method: 'POST', body: { readyToWork: $('#cfReady', d).checked, callOn: $('#cfCall', d).value, service: $('#cfSvc', d).value, budget: $('#cfBud', d).value, timeline: $('#cfTime', d).value, decisionMaker: $('#cfDm', d).value, requirement: $('#cfReq', d).value, nextStep: $('#cfNext', d).value } });
+        toast('Confirmed. It is now in Qualified leads.'); closeLayer(); route();
+      });
+      if ($('#unq', d)) $('#unq', d).onclick = e => busy(e.currentTarget, async () => { if (!confirm('Move this lead back to Interested leads?')) return; await api('/leads/qualified/' + id + '/unconfirm', { method: 'POST', body: {} }); toast('Moved back to interested'); closeLayer(); route(); });
       $('#qm', d).onclick = e => busy(e.currentTarget, async () => { if (!$('#qt', d).value.trim()) throw new Error('The reply box is empty.'); await save(); toast('Saved as sent on LinkedIn'); closeLayer(); route(); });
       $('#sv', d).onclick = e => busy(e.currentTarget, async () => { await api('/leads/qualified/' + id, { method: 'PATCH', body: { 'Next Step': $('#nx', d).value, Owner: $('#ow', d).value, 'Lead Score': $('#sc', d).value, ...($('#qe', d).value.trim() ? { Email: $('#qe', d).value.trim() } : {}) } }); toast('Saved'); closeLayer(); route(); });
     } });
@@ -456,7 +572,9 @@ function liBotPanel(b, owner) {
   return `<div class="panel" style="margin-bottom:14px"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
     <div style="flex:1;min-width:260px"><h2>Auto-connect</h2><div class="desc" style="margin:0">${state}</div>
       <div class="sub" style="margin-top:6px">Sent today <b>${b.today}/${b.perDay}</b> · this week ${b.week}/${b.weekMax} · ${b.waiting} waiting to accept · ${b.queue} in the queue · LinkedIn ${b.signedIn ? '<b>signed in</b>' : 'not signed in'}</div>
-      ${b.lastResult ? `<div class="sub" style="margin-top:2px">Last: ${esc(b.lastResult)}</div>` : ''}</div>
+      ${b.lastResult ? `<div class="sub" style="margin-top:2px">Last: ${esc(b.lastResult)}</div>` : ''}
+      ${b.signedIn ? `<div class="oneclick"><button class="btn primary" id="sendAll" ${b.msgJob && b.msgJob.running || !b.toSend ? 'disabled' : ''}>⚡ Send all on LinkedIn (${b.toSend})</button>
+        <span class="sub">${b.msgJob && b.msgJob.running ? `Sending… ${b.msgJob.done + b.msgJob.failed} of ${b.msgJob.total} done${b.msgJob.current ? ' · now: ' + esc(b.msgJob.current) : ''}` : `One click sends every first message (people who accepted) and every AI reply (people who answered). Today ${b.msgToday}/${b.msgMax}.`}</span></div>` : ''}</div>
     ${owner ? `<div class="acts" style="margin:0">${b.signedIn ? '<button class="btn sm" data-bot="run">Send one now</button><button class="btn sm ghost" data-bot="signout">Sign out of LinkedIn</button>' : '<button class="btn sm primary" data-bot="signin">in&nbsp; Sign in to LinkedIn</button>'}
       <label class="switch"><input type="checkbox" id="botsw" ${b.on ? 'checked' : ''}><i></i><span>${b.on ? 'ON' : 'OFF'}</span></label></div>` : ''}</div>
     ${owner && !b.on ? '<div class="sub" style="margin-top:8px">Uses your own LinkedIn. LinkedIn does not allow automation tools, so the app goes slowly (15 a day by default, never more than 25 a day / 80 a week, only in working hours) and stops if LinkedIn shows a limit. A small risk of a LinkedIn restriction remains.</div>' : ''}</div>`;
@@ -470,7 +588,8 @@ function liBotWire(b) {
     if (e.target.checked && !confirm('Send LinkedIn connection requests automatically from your LinkedIn account?\n\nLinkedIn does not allow automation tools. The app sends only a few a day, slowly, in working hours, but LinkedIn could still restrict the account.')) { e.target.checked = false; return; }
     try { await api('/linkedin/bot/switch', { method: 'POST', body: { on: e.target.checked } }); toast(e.target.checked ? (b.signedIn ? 'Auto-connect is ON' : 'Auto-connect is ON. Now click "Sign in to LinkedIn".') : 'Auto-connect is OFF'); route(); } catch (err) { toast(err.message, true); }
   };
-  if (b.busy) setTimeout(() => { if (location.hash === '#/linkedin') route(); }, 8000);
+  if ($('#sendAll')) $('#sendAll').onclick = e => { if (!confirm(`Send ${b.toSend} prepared message(s) on LinkedIn now from your LinkedIn account?\n\nThey go out one by one, 1-2 minutes apart. Check the messages in the cards below first if you want to change any.`)) return; busy(e.currentTarget, async () => { const r = await api('/linkedin/bot/sendall', { method: 'POST', body: {} }); toast(r.msg); route(); }); };
+  if (b.busy || (b.msgJob && b.msgJob.running)) setTimeout(() => { if (location.hash === '#/linkedin' && !$$('#page textarea').some(t => t.matches(':focus'))) route(); }, 8000);
 }
 
 /* ------------------------------------------------------------ import */
@@ -569,7 +688,7 @@ async function pageCalls(el) {
       <div class="top"><div><div class="strong">${esc(r['Business Name'])}</div><div class="sub">${esc([r['Contact Name'], r.City, r.Phone].filter(Boolean).join(' · '))}</div></div>${tag(r.Status)}</div>
       <div class="msg">${esc(r.message)}</div>
       <div class="acts">${r.wa ? `<a class="btn sm primary" href="https://wa.me/${esc(r.wa)}?text=${encodeURIComponent(r.message)}" target="_blank" rel="noopener">Open WhatsApp</a>` : ''}<button class="btn sm" data-copy>Copy message</button><button class="btn sm" data-num>Copy number</button>${r.Website ? `<a class="btn sm ghost" href="${esc(r.Website)}" target="_blank" rel="noopener">Website</a>` : ''}</div>
-      <div class="acts">${[['Messaged', 'WhatsApp sent'], ['No Answer', 'Called, no answer'], ['Interested', 'Interested ★'], ['Not Interested', 'Not interested'], ['Wrong Number', 'Wrong number']].map(([v, l]) => `<button class="btn sm" data-set="${v}">${l}</button>`).join('')}</div>
+      <div class="acts">${[['Messaged', 'WhatsApp sent'], ['No Answer', 'Called, no answer'], ['Interested', 'Interested ★'], ['Ready to work', 'Ready to work ✓ (qualified)'], ['Not Interested', 'Not interested'], ['Wrong Number', 'Wrong number']].map(([v, l]) => `<button class="btn sm" data-set="${v}">${l}</button>`).join('')}</div>
     </article>`).join('')}</div>`;
   $$('.task').forEach(card => {
     const r = d.tasks[+card.dataset.i];
@@ -752,13 +871,17 @@ async function pageConnections(el) {
       <label class="f"><span>Which AI writes the emails</span><select id="aiProvider"><option value="gemini" ${c.aiProvider !== 'openai' ? 'selected' : ''}>Google Gemini (free)</option><option value="openai" ${c.aiProvider === 'openai' ? 'selected' : ''}>ChatGPT (paid)</option></select><small>Without a key (or when the free daily requests are used up) your email templates are used.</small></label>
       <label class="f" data-ai="gemini"><span>Gemini API key (free)</span><input type="password" id="geminiKey" value="${esc(c.geminiKey)}" autocomplete="off"><small>Free, no card: aistudio.google.com/apikey → Create API key</small></label>
       <label class="f" data-ai="openai"><span>ChatGPT (OpenAI) API key</span><input type="password" id="openaiKey" value="${esc(c.openaiKey)}" placeholder="sk-…" autocomplete="off"><small>Paid: needs credit on your OpenAI account</small></label>
+      <label class="f"><span>Google Places API key (optional)</span><input type="password" id="googlePlacesKey" value="${esc(c.googlePlacesKey)}" autocomplete="off"><small>More leads with ratings: console.cloud.google.com → Places API (New) → Credentials. Free monthly allowance.</small></label>
+      <label class="f"><span>TomTom API key (optional)</span><input type="password" id="tomtomKey" value="${esc(c.tomtomKey)}" autocomplete="off"><small>developer.tomtom.com → free 2,500 searches a day, no card.</small></label>
+      <label class="f"><span>Geoapify API key (optional)</span><input type="password" id="geoapifyKey" value="${esc(c.geoapifyKey)}" autocomplete="off"><small>myprojects.geoapify.com → free 3,000 credits a day, no card.</small></label>
+      <label class="f"><span>HERE API key (optional)</span><input type="password" id="hereKey" value="${esc(c.hereKey)}" autocomplete="off"><small>platform.here.com → free monthly allowance.</small></label>
       <label class="f"><span>Where to find new leads</span><select id="leadSource"><option value="free" ${c.leadSource !== 'apify' ? 'selected' : ''}>Free: OpenStreetMap + web search (no key)</option><option value="apify" ${c.leadSource === 'apify' ? 'selected' : ''}>Apify Google Maps (paid)</option></select></label>
       <label class="f" data-src="apify"><span>Apify token</span><input type="password" id="apifyToken" value="${esc(c.apifyToken)}" autocomplete="off"></label></div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn primary" id="sv">Save</button>${[['sheet', 'Google Sheet'], ['gmail', 'Gmail'], ['gemini', 'Gemini', 'gemini'], ['openai', 'ChatGPT', 'openai'], ['free', 'free lead finding', '', 'free'], ['apify', 'Apify', '', 'apify']].map(([w, l, ai, src]) => `<button class="btn" data-t="${w}"${ai ? ` data-ai="${ai}"` : ''}${src ? ` data-src="${src}"` : ''}>Test ${l}</button>`).join('')}</div><div id="msg" style="margin-top:14px"></div></div>`;
+      <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn primary" id="sv">Save</button>${[['sheet', 'Google Sheet'], ['gmail', 'Gmail'], ['gemini', 'Gemini', 'gemini'], ['openai', 'ChatGPT', 'openai'], ['free', 'free lead finding', '', 'free'], ['googlePlaces', 'Google Places'], ['tomtom', 'TomTom'], ['geoapify', 'Geoapify'], ['here', 'HERE'], ['apify', 'Apify', '', 'apify']].map(([w, l, ai, src]) => `<button class="btn" data-t="${w}"${ai ? ` data-ai="${ai}"` : ''}${src ? ` data-src="${src}"` : ''}>Test ${l}</button>`).join('')}</div><div id="msg" style="margin-top:14px"></div></div>`;
   const show = () => { $$('[data-ai]').forEach(x => x.classList.toggle('hidden', x.dataset.ai !== $('#aiProvider').value)); $$('[data-src]').forEach(x => x.classList.toggle('hidden', x.dataset.src !== $('#leadSource').value)); };
   $('#aiProvider').onchange = show; $('#leadSource').onchange = show; show();
   storageWire(c);
-  const save = async () => { const b = {}; for (const id of ['sheetUrl', 'gmailUser', 'gmailAppPassword', 'geminiKey', 'openaiKey', 'apifyToken', 'aiProvider', 'leadSource']) b[id] = $('#' + id).value.trim(); await api('/connections', { method: 'POST', body: b }); };
+  const save = async () => { const b = {}; for (const id of ['sheetUrl', 'gmailUser', 'gmailAppPassword', 'geminiKey', 'openaiKey', 'apifyToken', 'aiProvider', 'leadSource', 'googlePlacesKey', 'tomtomKey', 'geoapifyKey', 'hereKey']) b[id] = $('#' + id).value.trim(); await api('/connections', { method: 'POST', body: b }); };
   $('#sv').onclick = e => busy(e.currentTarget, async () => { await save(); toast('Saved'); });
   $$('[data-t]').forEach(b => b.onclick = () => busy(b, async () => { try { await save(); const r = await api('/connections/test', { method: 'POST', body: { what: b.dataset.t } }); $('#msg').innerHTML = `<div class="notice ok">${esc(r.msg)}</div>`; } catch (err) { $('#msg').innerHTML = `<div class="notice err">${esc(err.message)}</div>`; } }));
   // extra sending inboxes: more inboxes = more emails a day without pushing any one account too hard

@@ -81,7 +81,7 @@ async function canEditConnections(req) {
 app.get('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
   const c = config.get(); const mask = v => v ? '•••• saved' : '';
-  res.json({ storage: c.storage === 'supabase' ? 'supabase' : 'sheet', supabaseUrl: c.supabaseUrl || '', supabaseKey: mask(c.supabaseKey), supabaseSql: require('./supabase').SETUP_SQL, sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), aiProvider: c.aiProvider === 'openai' ? 'openai' : 'gemini', leadSource: c.leadSource === 'apify' ? 'apify' : 'free', openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
+  res.json({ googlePlacesKey: mask(c.googlePlacesKey), tomtomKey: mask(c.tomtomKey), geoapifyKey: mask(c.geoapifyKey), hereKey: mask(c.hereKey), storage: c.storage === 'supabase' ? 'supabase' : 'sheet', supabaseUrl: c.supabaseUrl || '', supabaseKey: mask(c.supabaseKey), supabaseSql: require('./supabase').SETUP_SQL, sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), aiProvider: c.aiProvider === 'openai' ? 'openai' : 'gemini', leadSource: c.leadSource === 'apify' ? 'apify' : 'free', openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
 }));
 app.post('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
@@ -124,6 +124,7 @@ app.post('/api/connections', wrap(async (req, res) => {
     patch.geminiKey = k;
   }
   if (b.aiProvider !== undefined) patch.aiProvider = b.aiProvider === 'openai' ? 'openai' : 'gemini';
+  for (const k of ['googlePlacesKey', 'tomtomKey', 'geoapifyKey', 'hereKey']) if (b[k] !== undefined && !String(b[k]).startsWith('••')) { const v = String(b[k]).replace(/[\s"'`]/g, ''); if (v && v.length < 10) throw new Error('That key looks too short. Copy the whole key.'); patch[k] = v; }
   if (b.leadSource !== undefined) patch.leadSource = b.leadSource === 'apify' ? 'apify' : 'free';
   if (b.apifyToken && !String(b.apifyToken).startsWith('••')) patch.apifyToken = String(b.apifyToken).trim();
   config.set(patch);
@@ -163,6 +164,7 @@ app.post('/api/connections/test', wrap(async (req, res) => {
     if (!a) throw new Error(`${ai.aiName()} answered but not as expected.`);
     return res.json({ ok: true, msg: `${ai.aiName()} is working (model: ${ai.currentModel() || 'auto'}).` });
   }
+  if (['googlePlaces', 'tomtom', 'geoapify', 'here'].includes(what)) return res.json({ ok: true, msg: await require('./free').testSource(what) });
   if (what === 'free') {
     const n = await require('./free').testSearch();
     return res.json({ ok: true, msg: `Free lead finding works (a test web search found ${n} results). No key or payment needed.` });
@@ -211,7 +213,8 @@ function lanUrls() {
 
 // ---------------------------------------------------------------- dashboard
 app.get('/api/dashboard', need(), wrap(async (req, res) => {
-  const [s, raw, qual, li] = await Promise.all([store.settings(), store.read('Raw Leads'), store.read('Qualified Leads'), store.read('LinkedIn Leads')]);
+  const [s, raw, allQ, li] = await Promise.all([store.settings(), store.read('Raw Leads'), store.read('Qualified Leads'), store.read('LinkedIn Leads')]);
+  const qual = allQ.filter(r => r.Stage === 'Qualified'), hot = allQ.filter(r => r.Stage !== 'Qualified');
   const t = new Date(Date.now() + 5.5 * 3600e3);
   const series = [];
   for (let i = 13; i >= 0; i--) {
@@ -219,22 +222,24 @@ app.get('/api/dashboard', need(), wrap(async (req, res) => {
     series.push({ date: d,
       found: raw.filter(r => r['Date Found'] === d).length + li.filter(r => r['Date Found'] === d).length,
       emailed: engine.sentOn(raw, d), replies: raw.filter(r => r['Last Reply On'] === d).length,
-      qualified: qual.filter(r => r['Date Qualified'] === d).length });
+      qualified: qual.filter(r => r['Confirmed On'] === d).length, interested: hot.filter(r => r['Date Qualified'] === d).length });
   }
   const by = (arr, k) => arr.reduce((m, r) => { const v = String(r[k] || 'Unknown'); m[v] = (m[v] || 0) + 1; return m; }, {});
   const c = f => raw.filter(f).length;
   const lim = engine.dailyLimit(s);
   res.json({
     agent: { on: ['yes', 'on', 'true', '1'].includes(String(s.AGENT_ON).toLowerCase()), replyMode: s.REPLY_MODE, tone: s.TONE, todayLimit: lim.limit, sentToday: engine.sentOn(raw, today()), started: lim.started, startDate: s.START_DATE, sheetUrl: config.get().sheetUrl },
-    totals: { raw: raw.length, withEmail: c(r => r.Email), emailed: c(r => r['Pitched On']), replied: c(r => r['Last Reply On']), interested: c(r => r.Status === 'Interested'), qualified: qual.length, linkedin: li.length, linkedinToConnect: li.filter(r => r.Status === 'To Connect').length, bounced: c(r => r.Status === 'Bounced'), doNotContact: c(r => r.Status === 'Do Not Contact'), waiting: c(r => r.Status === 'New') },
-    series, rawStatus: by(raw, 'Status'), services: qual.length ? by(qual, 'Service Needed') : by(raw.filter(r => r['Best Service']), 'Best Service'), countries: by(raw, 'Country'),
-    recentQualified: qual.slice(-8).reverse(),
+    totals: { raw: raw.length, withEmail: c(r => r.Email), emailed: c(r => r['Pitched On']), replied: c(r => r['Last Reply On']), interested: hot.length, qualified: qual.length, linkedin: li.length, linkedinToConnect: li.filter(r => r.Status === 'To Connect').length, bounced: c(r => r.Status === 'Bounced'), doNotContact: c(r => r.Status === 'Do Not Contact'), waiting: c(r => r.Status === 'New') },
+    series, rawStatus: by(raw, 'Status'), services: allQ.length ? by(allQ, 'Service Needed') : by(raw.filter(r => r['Best Service']), 'Best Service'), countries: by(raw, 'Country'),
+    recentQualified: qual.slice(-8).reverse(), recentInterested: hot.slice(-8).reverse(),
   });
 }));
 
 // ---------------------------------------------------------------- leads
 const strip = rows => rows.map(({ _row, ...r }) => r);
 app.get('/api/leads/raw', need('owner', 'leader'), wrap(async (req, res) => res.json(strip(await store.read('Raw Leads')).reverse())));
+app.post('/api/leads/qualified/:id/confirm', need('owner', 'leader'), wrap(async (req, res) => res.json({ ok: true, ...(await engine.confirmQualified(req.params.id, req.body || {}, req.user.name)) })));
+app.post('/api/leads/qualified/:id/unconfirm', need('owner', 'leader'), wrap(async (req, res) => { await engine.unconfirmQualified(req.params.id, req.user.name); res.json({ ok: true }); }));
 app.get('/api/leads/qualified', need('owner', 'leader'), wrap(async (req, res) => res.json(strip(await store.read('Qualified Leads')).reverse())));
 app.get('/api/leads/linkedin', need(), wrap(async (req, res) => res.json(strip(await store.read('LinkedIn Leads')).reverse())));
 const RAW_STATUSES = ['New', 'Pitched', 'Follow-up 1', 'Follow-up 2', 'Replied', 'Interested', 'Not Interested', 'Do Not Contact', 'Bounced', 'No Email', 'Low Fit', 'Send Failed', 'Bad Email'];
@@ -269,16 +274,64 @@ app.get('/api/notify', need(), wrap(async (req, res) => {
     gmail: rep.filter(r => r.Category !== 'automatic').map(r => ({ id: r['Reply ID'], who: r['Contact Name'] || r['Business Name'] || r.From, text: String(r['Their Message'] || '').slice(0, 120) })),
     linkedin: li.filter(r => String(r['Their Reply'] || '').trim()).map(r => ({ id: liKey(r), who: r.Name, text: String(r['Their Reply']).slice(0, 120) })),
     accepted: li.filter(r => r.Status === 'Connected').map(r => ({ id: r['Lead ID'], who: r.Name, text: 'Accepted your connection request. Send them the first message.' })),
-    qualified: qual.map(r => ({ id: r['Lead ID'], who: r['Business Name'] || r['Contact Name'], text: r.Summary || r['Service Needed'] || '' })),
+    alarm: engine.alarms().slice(0, 60).map(a => ({ id: a.id, who: a.title, text: a.text })),
+    qualified: qual.filter(r => r.Stage !== 'Qualified').map(r => ({ id: r['Lead ID'], who: r['Business Name'] || r['Contact Name'], text: r.Summary || r['Service Needed'] || '' })),
   });
 }));
 
 // LinkedIn auto-connect (runs in the Windows app on the main PC)
 app.get('/api/linkedin/bot', need(), wrap(async (req, res) => res.json(global.liBot ? await global.liBot.status() : { available: false })));
+app.post('/api/linkedin/bot/sendall', need(), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app on the main PC.'); res.json({ ok: true, msg: await global.liBot.sendAll(req.user.name) }); }));
 app.post('/api/linkedin/bot/run', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); res.json({ ok: true, msg: await global.liBot.runNow() }); }));
 app.post('/api/linkedin/bot/signin', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); global.liBot.signIn(); res.json({ ok: true }); }));
 app.post('/api/linkedin/bot/signout', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); await global.liBot.signOut(); res.json({ ok: true }); }));
 app.post('/api/linkedin/bot/switch', need('owner'), wrap(async (req, res) => { await store.saveSettings({ LINKEDIN_AUTO_CONNECT: req.body && req.body.on ? 'yes' : 'no' }); res.json({ ok: true }); }));
+// ---------------------------------------------------------------- alarms, inbox health, token dashboard, bills
+app.get('/api/alarms', need(), wrap(async (req, res) => res.json(engine.alarms())));
+app.delete('/api/alarms', need('owner', 'leader'), wrap(async (req, res) => { engine.clearAlarms(); res.json({ ok: true }); }));
+app.get('/api/inboxes', need('owner', 'leader'), wrap(async (req, res) => {
+  const s = await store.settings(), raw = await store.read('Raw Leads'), day = today(), main = (require('./mail').accounts()[0] || {}).user;
+  const list = engine.inboxHealth(s).map(i => ({ ...i, sentToday: raw.filter(r => String(r['Sent From'] || main).toLowerCase() === i.user && [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(day)).length }));
+  const target = Number(s.EMAILS_PER_DAY_TARGET || 200), perInbox = Number(s.DAILY_MAX_LIMIT || 50);
+  res.json({ list, target, perInbox, needed: Math.ceil(target / Math.max(1, perInbox)) });
+}));
+app.post('/api/inboxes/:user/resume', need('owner'), wrap(async (req, res) => { engine.resumeInbox(String(req.params.user).toLowerCase()); res.json({ ok: true }); }));
+// Token & usage dashboard: everything the app uses (AI, mail, lead platforms), combined, and per lead
+app.get('/api/usage', need('owner', 'leader'), wrap(async (req, res) => {
+  const meter = require('./usage'), ai = require('./ai'), s = await store.settings(); ai.configure(s);
+  const t = meter.sum(1), w = meter.sum(7), m = meter.sum(30), st = ai.aiStatus();
+  const raw = await store.read('Raw Leads'), day = today();
+  const leadsToday = raw.filter(r => String(r['Date Found']) === day).length;
+  const inb = engine.inboxHealth(s), sentToday = raw.filter(r => [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(day)).length;
+  const per = (x, n) => n ? Math.round(x / n) : 0;
+  const leads30 = (m.leads && m.leads.found) || 0, aiTok30 = (m.ai && m.ai.tokens) || 0, aiReq30 = (m.ai && m.ai.requests) || 0;
+  const srch = g => Object.values((g && g.search) || {}).reduce((a, b) => a + b, 0);
+  res.json({
+    ai: { provider: ai.aiName(), model: ai.currentModel(), requestsToday: st.used, requestsLeft: Math.max(0, st.limit - st.used), limit: st.limit, models: st.models || [], blockedUntil: st.blockedUntil,
+      tokensToday: (t.ai && t.ai.tokens) || 0, tokens7: (w.ai && w.ai.tokens) || 0, tokens30: aiTok30 },
+    mail: { sentToday, capacityToday: inb.filter(i => !i.paused).reduce((a, i) => a + i.limit, 0), inboxes: inb.length, paused: inb.filter(i => i.paused).length, sent30: (m.mail && m.mail.sent) || 0 },
+    platform: { searchesToday: srch(t), searches30: srch(m), bySource: (m.search || {}), leadsBySource: (m.sourceLeads || {}), apify: config.get().leadSource === 'apify' },
+    leads: { today: leadsToday, target: Number(s.LEADS_PER_DAY ?? 200), qualityToday: raw.filter(r => String(r['Date Found']) === day && r.Quality === 'yes').length, qualityTarget: '10-30', found30: leads30, analysed30: (m.leads && m.leads.analysed) || 0 },
+    perLead: { tokens: per(aiTok30, leads30), aiRequests: Math.round((aiReq30 / Math.max(1, leads30)) * 10) / 10, searches: Math.round((srch(m) / Math.max(1, leads30)) * 100) / 100, emails: Math.round((((m.mail && m.mail.sent) || 0) / Math.max(1, leads30)) * 100) / 100 },
+    series: meter.series(14).map(d => ({ day: d.day, tokens: (d.ai && d.ai.tokens) || 0, ai: (d.ai && d.ai.requests) || 0, sent: (d.mail && d.mail.sent) || 0, leads: (d.leads && d.leads.found) || 0 })),
+  });
+}));
+// Bills: every tool's monthly cost in one place (ChatGPT API, mail, lead platforms, our service, Claude...)
+const BILL_DEFAULTS = [['ChatGPT API (OpenAI)', 'https://platform.openai.com/settings/organization/billing'], ['Mail (Google Workspace / Gmail)', 'https://admin.google.com/ac/billing'], ['Platform charges (Apify, Google Places, ...)', 'https://console.apify.com/billing'], ['Our service charges', ''], ['Claude (optional)', 'https://claude.ai/settings/billing'], ['Supabase (database)', 'https://supabase.com/dashboard/org/_/billing']];
+app.get('/api/bills', need('owner'), wrap(async (req, res) => {
+  let rows = await store.read('Bills', true).catch(() => []);
+  if (!rows.length) { await store.append('Bills', BILL_DEFAULTS.map(([Item, link]) => ({ Item, 'Monthly Amount (Rs)': '', 'Billing Link': link }))); rows = await store.read('Bills', true); }
+  res.json(strip(rows));
+}));
+app.put('/api/bills', need('owner'), wrap(async (req, res) => {
+  const list = Array.isArray(req.body) ? req.body.slice(0, 50) : [];
+  const have = await store.read('Bills', true);
+  const clean = o => ({ 'Monthly Amount (Rs)': String(o['Monthly Amount (Rs)'] ?? '').replace(/[^\d.]/g, '').slice(0, 12), 'Paid On': String(o['Paid On'] || '').slice(0, 20), 'Paid By': String(o['Paid By'] || '').slice(0, 60), Notes: String(o.Notes || '').slice(0, 300), 'Billing Link': /^https?:\/\//.test(o['Billing Link'] || '') ? String(o['Billing Link']).slice(0, 300) : '' });
+  const upd = [], add = [];
+  for (const o of list) { const it = String(o.Item || '').trim().slice(0, 80); if (!it) continue; (have.some(h => h.Item === it) ? upd : add).push(have.some(h => h.Item === it) ? { key: it, set: clean(o) } : { Item: it, ...clean(o) }); }
+  if (upd.length) await store.update('Bills', 'Item', upd); if (add.length) await store.append('Bills', add);
+  res.json({ ok: true });
+}));
 app.post('/api/leads/linkedin/:id/reply', need(), wrap(async (req, res) => {
   const b = req.body || {};
   if (b.channel === 'email' && req.user.role === 'linkedin') throw new Error('Only the owner or team leader can send emails.');
@@ -316,7 +369,7 @@ app.post('/api/replies/:id/answer', need('owner', 'leader'), wrap(async (req, re
 }));
 
 // ---------------------------------------------------------------- call / WhatsApp tasks (sent by a person, so no account can be banned)
-const CALL_STATUSES = ['Messaged', 'No Answer', 'Interested', 'Not Interested', 'Wrong Number'];
+const CALL_STATUSES = ['Messaged', 'No Answer', 'Interested', 'Ready to work', 'Not Interested', 'Wrong Number'];
 const DIAL = { IN: '91', AU: '61', US: '1', CA: '1', GB: '44', UK: '44', AE: '971', SG: '65', MY: '60', SA: '966', QA: '974', OM: '968', BH: '973', KW: '965', IE: '353', NZ: '64', ES: '34', PT: '351', DE: '49', NL: '31', BE: '32', FR: '33', IT: '39', PL: '48', CZ: '420', BR: '55', MX: '52', ZA: '27', KE: '254', NG: '234', PH: '63', ID: '62', TH: '66', LK: '94', PK: '92', BD: '880', NP: '977', HK: '852', JP: '81' };
 const CITY_COUNTRY = { dubai: 'AE', 'abu dhabi': 'AE', sharjah: 'AE', riyadh: 'SA', doha: 'QA', muscat: 'OM', london: 'GB', manchester: 'GB', birmingham: 'GB', dublin: 'IE', 'new york': 'US', 'los angeles': 'US', houston: 'US', chicago: 'US', miami: 'US', dallas: 'US', toronto: 'CA', vancouver: 'CA', sydney: 'AU', melbourne: 'AU', auckland: 'NZ', singapore: 'SG', 'kuala lumpur': 'MY', madrid: 'ES', barcelona: 'ES', lisbon: 'PT', berlin: 'DE', munich: 'DE', amsterdam: 'NL', brussels: 'BE', paris: 'FR', milan: 'IT', warsaw: 'PL', prague: 'CZ', 'sao paulo': 'BR', 'mexico city': 'MX', johannesburg: 'ZA', nairobi: 'KE', mumbai: 'IN', bengaluru: 'IN', chennai: 'IN', coimbatore: 'IN', hyderabad: 'IN', delhi: 'IN', pune: 'IN', kochi: 'IN' };
 // "+61 2 9000 0000" -> "61290000000"; "02 9000 0000" + Australia -> "61290000000"

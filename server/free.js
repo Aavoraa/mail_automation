@@ -47,7 +47,7 @@ let lastSearch = 0;
 async function searchOne(q) {
   if (Date.now() < ddgBusyUntil) throw new Error('The free web search asked us to slow down. It is tried again in about ' + Math.ceil((ddgBusyUntil - Date.now()) / 60e3) + ' minutes.');
   const gap = 9000 - (Date.now() - lastSearch); if (gap > 0) await sleep(gap + rand(0, 4000)); // slow and polite
-  lastSearch = Date.now();
+  lastSearch = Date.now(); meter.add('search', 'ddg');
   let res = await ddg(simple(q));
   if (res && !res.length && /\bOR\b/.test(q)) { await sleep(rand(8000, 12000)); lastSearch = Date.now(); res = await ddg(q.replace(/[()]/g, '')); }
   if (!res) throw new Error('The free web search asked us to slow down. It is tried again in about 45 minutes.');
@@ -102,7 +102,7 @@ async function cityArea(city) {
   const best = list.find(x => x.osm_type === 'relation') || list[0];
   if (!best) throw new Error(`Could not find "${city}" on the map.`);
   const bb = best.boundingbox.map(Number); // [south, north, west, east]
-  return (cityCache[city] = { area: best.osm_type === 'relation' ? 3600000000 + Number(best.osm_id) : 0, bbox: `${bb[0]},${bb[2]},${bb[1]},${bb[3]}`, country: String((best.address && best.address.country_code) || '').toUpperCase() });
+  return (cityCache[city] = { center: [Number(best.lat), Number(best.lon)], area: best.osm_type === 'relation' ? 3600000000 + Number(best.osm_id) : 0, bbox: `${bb[0]},${bb[2]},${bb[1]},${bb[3]}`, country: String((best.address && best.address.country_code) || '').toUpperCase() });
 }
 const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
 async function overpass(q) {
@@ -153,11 +153,76 @@ async function webPlaces(industry, city) {
   }
   return out;
 }
-async function places(industry, city, max = 10) {
-  const [osm, webR] = await Promise.allSettled([osmPlaces(industry, city), webPlaces(industry, city)]);
-  const a = osm.status === 'fulfilled' ? shuffle(osm.value) : [], b = webR.status === 'fulfilled' ? webR.value : [];
-  if (!a.length && !b.length) throw new Error('Free lead finding found nothing: ' + [osm.reason, webR.reason].filter(Boolean).map(e => e.message).join('; ') || 'no businesses with a website');
-  // map businesses first (real places with a website), then web results; extra candidates so already-known ones can be skipped
-  return [...a, ...b].slice(0, Math.max(max * 4, 40));
+// ---------------------------------------------------------------- lead sources with a free API key (each optional)
+// Google Places, TomTom, Geoapify and HERE all have free monthly/daily allowances; a source is used only once its key is saved.
+const config = require('./config');
+const meter = require('./usage');
+const keyOf = k => String(config.get()[k] || '').trim();
+const norm = (source, o) => ({ source, title: o.title || '', website: String(o.website || '').split(/[;\s]/)[0], phone: o.phone || '', emails: (o.emails || []).filter(Boolean), city: o.city || '', countryCode: String(o.countryCode || '').toUpperCase(), categoryName: o.category || '', totalScore: o.rating ?? '', reviewsCount: o.reviews ?? '' });
+async function googlePlaces(industry, city) {
+  const key = keyOf('googlePlacesKey'); if (!key) return [];
+  const out = []; let pageToken = '';
+  for (let i = 0; i < 3; i++) {
+    const r = await fetch('https://places.googleapis.com/v1/places:searchText', { method: 'POST', signal: AbortSignal.timeout(30000), headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key,
+      'X-Goog-FieldMask': 'places.displayName,places.websiteUri,places.internationalPhoneNumber,places.rating,places.userRatingCount,places.primaryTypeDisplayName,places.addressComponents,nextPageToken' },
+      body: JSON.stringify({ textQuery: `${industry} in ${city}`, pageSize: 20, ...(pageToken ? { pageToken } : {}) }) });
+    const j = await r.json().catch(() => ({})); meter.add('search', 'googlePlaces');
+    if (!r.ok) throw new Error('Google Places: ' + ((j.error && j.error.message) || r.status));
+    for (const p of j.places || []) {
+      const comp = t => ((p.addressComponents || []).find(c => (c.types || []).includes(t)) || {});
+      out.push(norm('Google Places', { title: p.displayName && p.displayName.text, website: p.websiteUri, phone: p.internationalPhoneNumber, rating: p.rating, reviews: p.userRatingCount, category: p.primaryTypeDisplayName && p.primaryTypeDisplayName.text, city: comp('locality').longText || city, countryCode: comp('country').shortText }));
+    }
+    if (!j.nextPageToken) break; pageToken = j.nextPageToken; await sleep(2000);
+  }
+  return out;
 }
-module.exports = { places, search, testSearch, _t: { ddgParse, tagsFor, osmPlaces, webPlaces, searchOne } };
+async function tomtom(industry, city) {
+  const key = keyOf('tomtomKey'); if (!key) return [];
+  const r = await fetch(`https://api.tomtom.com/search/2/search/${encodeURIComponent(industry + ' ' + city)}.json?` + new URLSearchParams({ key, limit: '100', idxSet: 'POI' }), { signal: AbortSignal.timeout(30000) });
+  const j = await r.json().catch(() => ({})); meter.add('search', 'tomtom');
+  if (!r.ok) throw new Error('TomTom: ' + ((j.errorText || (j.error && j.error.description)) || r.status));
+  return (j.results || []).map(x => norm('TomTom', { title: x.poi && x.poi.name, website: x.poi && x.poi.url && (/^https?:/.test(x.poi.url) ? x.poi.url : 'https://' + x.poi.url), phone: x.poi && x.poi.phone, category: x.poi && (x.poi.categories || [])[0], city: x.address && x.address.municipality, countryCode: x.address && x.address.countryCode }));
+}
+const GEO_CAT = { 'amenity=dentist': 'healthcare.dentist', 'healthcare=dentist': 'healthcare.dentist', 'amenity=clinic': 'healthcare.clinic_or_praxis', 'amenity=doctors': 'healthcare.clinic_or_praxis', 'amenity=hospital': 'healthcare.hospital', 'amenity=veterinary': 'pet.veterinary', 'amenity=restaurant': 'catering.restaurant', 'amenity=cafe': 'catering.cafe', 'shop=bakery': 'commercial.food_and_drink.bakery', 'tourism=hotel': 'accommodation.hotel', 'shop=travel_agency': 'service.travel_agency', 'shop=furniture': 'commercial.furniture_and_interior', 'shop=interior_decoration': 'commercial.furniture_and_interior', 'shop=jewelry': 'commercial.jewelry', 'shop=clothes': 'commercial.clothing', 'shop=boutique': 'commercial.clothing', 'leisure=fitness_centre': 'sport.fitness', 'shop=hairdresser': 'service.beauty.hairdresser', 'shop=beauty': 'service.beauty', 'leisure=spa': 'service.beauty.spa', 'shop=car': 'commercial.vehicle', 'shop=car_repair': 'service.vehicle.repair', 'amenity=school': 'education.school', 'amenity=pharmacy': 'healthcare.pharmacy', 'shop=optician': 'commercial.health_and_beauty.optician', 'shop=florist': 'commercial.florist', 'office=estate_agent': 'office.estate_agent', 'office=lawyer': 'office.lawyer', 'office=accountant': 'office.accountant', 'office=it': 'office.it', 'office=insurance': 'office.insurance' };
+async function geoapify(industry, city) {
+  const key = keyOf('geoapifyKey'); if (!key) return [];
+  const cats = [...new Set(tagsFor(industry).map(t => GEO_CAT[t]).filter(Boolean))];
+  if (!cats.length) return [];
+  const g = await (await fetch('https://api.geoapify.com/v1/geocode/search?' + new URLSearchParams({ text: city, type: 'city', limit: '1', apiKey: key }), { signal: AbortSignal.timeout(30000) })).json().catch(() => ({}));
+  const pid = g.features && g.features[0] && g.features[0].properties.place_id; meter.add('search', 'geoapify');
+  if (!pid) throw new Error('Geoapify: city not found (check the key)');
+  const r = await fetch('https://api.geoapify.com/v2/places?' + new URLSearchParams({ categories: cats.join(','), filter: 'place:' + pid, limit: '200', apiKey: key }), { signal: AbortSignal.timeout(40000) });
+  const j = await r.json().catch(() => ({})); meter.add('search', 'geoapify');
+  if (!r.ok) throw new Error('Geoapify: ' + (j.message || r.status));
+  return (j.features || []).map(f => { const p = f.properties || {}, raw = (p.datasource && p.datasource.raw) || {}; return norm('Geoapify', { title: p.name, website: p.website || raw.website || raw['contact:website'], phone: (p.contact && p.contact.phone) || raw.phone, emails: [(p.contact && p.contact.email) || raw.email], category: (p.categories || [])[0], city: p.city || city, countryCode: p.country_code }); });
+}
+async function here(industry, city) {
+  const key = keyOf('hereKey'); if (!key) return [];
+  const c = await cityArea(city).catch(() => null);
+  const at = c && c.center ? `${c.center[0]},${c.center[1]}` : '';
+  const r = await fetch('https://discover.search.hereapi.com/v1/discover?' + new URLSearchParams({ q: `${industry} ${city}`, limit: '100', apiKey: key, ...(at ? { at } : { qq: 'city=' + city }) }), { signal: AbortSignal.timeout(30000) });
+  const j = await r.json().catch(() => ({})); meter.add('search', 'here');
+  if (!r.ok) throw new Error('HERE: ' + (j.title || j.error_description || r.status));
+  return (j.items || []).map(x => { const ct = (x.contacts || [])[0] || {}; const v = k => ((ct[k] || [])[0] || {}).value; return norm('HERE', { title: x.title, website: v('www'), phone: v('phone') || v('mobile'), emails: [v('email')], category: ((x.categories || [])[0] || {}).name, city: x.address && x.address.city, countryCode: x.address && x.address.countryCode }); });
+}
+const KEY_SOURCES = { googlePlaces: ['googlePlacesKey', googlePlaces], tomtom: ['tomtomKey', tomtom], geoapify: ['geoapifyKey', geoapify], here: ['hereKey', here] };
+async function testSource(name) {
+  const [k, fn] = KEY_SOURCES[name] || []; if (!fn) throw new Error('Unknown source');
+  if (!keyOf(k)) throw new Error('Paste the key first.');
+  const r = await fn('restaurant', 'London');
+  return `${r.length} businesses found for a test search (${r.filter(x => x.website).length} with a website).`;
+}
+
+async function places(industry, city, max = 10) {
+  const named = [['OpenStreetMap', osmPlaces], ['Web search', webPlaces], ...Object.entries(KEY_SOURCES).filter(([, [k]]) => keyOf(k)).map(([n, [, fn]]) => [n, fn])];
+  const res = await Promise.allSettled(named.map(([n, fn]) => fn(industry, city).then(v => { meter.add('sourceLeads', n, v.length); return v; })));
+  const lists = res.map(r => (r.status === 'fulfilled' ? r.value : []).filter(p => p.title && p.website));
+  if (res[0].status === 'fulfilled') meter.add('search', 'osm');
+  for (const [i, r] of res.entries()) if (r.status === 'rejected') console.warn(`[find] ${named[i][0]}: ${r.reason.message}`);
+  if (!lists.some(l => l.length)) throw new Error('Lead finding found nothing: ' + (res.filter(r => r.status === 'rejected').map(r => r.reason.message).join('; ') || 'no businesses with a website'));
+  // mix the sources (one from each in turn) so no single source fills the day; key sources + map first, web search last
+  const order = [...lists.slice(2), shuffle(lists[0]), lists[1]].filter(l => l.length), out = [];
+  for (let i = 0; out.length < Math.max(max * 4, 40) && order.some(l => i < l.length); i++) for (const l of order) if (l[i]) out.push(l[i]);
+  return out;
+}
+module.exports = { places, search, testSearch, testSource, KEY_SOURCES, _t: { ddgParse, tagsFor, osmPlaces, webPlaces, searchOne } };

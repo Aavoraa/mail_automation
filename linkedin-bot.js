@@ -19,8 +19,9 @@ const rand = (a, b) => Math.round(a + Math.random() * (b - a));
 const log = (msg, level) => engine.log('linkedin', msg, level);
 const indiaNow = () => new Date(Date.now() + 5.5 * 3600e3); // same clock as the email sending hours
 
-let st = { nextSendAt: 0, lastCheck: 0, pausedUntil: 0, profileChecked: {}, fails: 0, lastResult: '', lastSignInWarn: '' };
+let st = { nextSendAt: 0, lastCheck: 0, pausedUntil: 0, profileChecked: {}, replyChecked: {}, fails: 0, lastResult: '', lastSignInWarn: '' };
 try { st = { ...st, ...JSON.parse(fs.readFileSync(FILE, 'utf8')) }; } catch (e) {}
+st.replyChecked = st.replyChecked || {};
 const save = () => { try { fs.writeFileSync(FILE, JSON.stringify(st)); } catch (e) {} };
 let busy = false, signedIn = false, loginWin = null, timer = null, onChange = () => {};
 
@@ -195,6 +196,110 @@ async function connectNext(s, rows) {
   return `Skipped ${r.Name}: ${why}`;
 }
 
+
+// ---------------------------------------------------------------- one-click: send every prepared LinkedIn message
+// "Send all" = the first message to everyone who accepted + the AI's suggested answer to everyone who replied.
+// Sent one by one, 40-90 seconds apart, at most 40 messages a day. The app also reads new replies on LinkedIn
+// (people we messaged), saves them, and the AI prepares the next answer for the next click.
+const HARD_MSG_DAY = 40, FAST = process.env.AAVORAA_LI_FAST === '1'; // FAST: tests only
+let msgJob = { running: false, total: 0, done: 0, failed: 0, current: '', startedAt: 0, last: '' };
+const OPEN_MSG = `
+  const b = btns(top).find(el => /^message\\b/i.test((el.getAttribute('aria-label') || '').trim()) || /^message$/i.test((el.innerText || '').trim()));
+  if (b) { click(b); return true; } return false;`;
+const BOX = `all().find(el => el.getAttribute('contenteditable') === 'true' && vis(el) && (/msg-form|message/i.test(el.className + ' ' + (el.getAttribute('aria-label') || '')) || el.getAttribute('role') === 'textbox'))`;
+async function openThread(w, r) {
+  await open(w, profileUrl(r['LinkedIn URL']));
+  const s = await run(w, STATE_JS);
+  if (!s.name) throw new Error('Could not read the profile page');
+  if (s.state !== 'connected') return { ok: false, why: 'not connected yet' };
+  if (!(await run(w, OPEN_MSG))) return { ok: false, why: 'no Message button' };
+  await sleep(rand(2200, 3500));
+  return { ok: true, name: s.name };
+}
+// the last message in the open conversation: who wrote it and what
+const LAST_MSG = `
+  const names = all().filter(el => /msg-s-message-group__name|message-group__name/.test(el.className) && vis(el));
+  const bodies = all().filter(el => /msg-s-event-listitem__body|event-listitem__body/.test(el.className) && vis(el));
+  return { who: names.length ? names[names.length - 1].innerText.trim() : '', text: bodies.length ? bodies[bodies.length - 1].innerText.trim() : '', count: bodies.length };`;
+async function sendMessage(r, text) {
+  const w = pageWindow();
+  try {
+    const t = await openThread(w, r); if (!t.ok) return { result: 'skip', why: t.why };
+    const box = await run(w, `const b = ${BOX}; if (!b) return false; b.focus(); return true;`);
+    if (!box) return { result: 'skip', why: 'message box did not open' };
+    w.webContents.insertText(String(text).slice(0, 7900));
+    await sleep(rand(1500, 2600));
+    const sent = await run(w, `const s = btns().find(el => /msg-form__send|send-button/.test(el.className) || /^send$/i.test((el.innerText || '').trim()) || /^send$/i.test((el.getAttribute('aria-label') || '').trim())); if (s) { click(s); return true; } return false;`);
+    if (!sent) return { result: 'skip', why: 'could not find the Send button' };
+    await sleep(rand(2000, 3200));
+    const last = await run(w, LAST_MSG);
+    return { result: 'sent', verified: last.text && String(text).slice(0, 40).trim().startsWith(last.text.slice(0, 40).trim().slice(0, 20)) };
+  } finally { w.destroy(); }
+}
+function messageTasks(rows) {
+  const out = [];
+  for (const r of rows) {
+    if (!slug(r['LinkedIn URL'])) continue;
+    if (r.Status === 'Connected' && String(r['First Message'] || '').trim()) out.push({ r, text: r['First Message'], kind: 'first message' });
+    else if (r.Status === 'Replied' && String(r['Their Reply'] || '').trim() && String(r['Suggested Reply'] || '').trim()) out.push({ r, text: r['Suggested Reply'], kind: 'reply' });
+  }
+  return out;
+}
+const msgToday = rows => rows.filter(r => String(r['Message Sent On'] || '') === engine.today()).length;
+async function sendAll(by) {
+  if (msgJob.running) return `Already sending: ${msgJob.done} of ${msgJob.total} done.`;
+  if (!(await checkSignedIn())) throw new Error('Sign in to LinkedIn first (button above).');
+  const rows = await store.read('LinkedIn Leads', true);
+  const left = HARD_MSG_DAY - msgToday(rows);
+  const tasks = messageTasks(rows).slice(0, Math.max(0, left));
+  if (!tasks.length) return left <= 0 ? `Daily limit reached (${HARD_MSG_DAY} LinkedIn messages a day). The rest go tomorrow.` : 'Nothing to send: no accepted connections or replies waiting.';
+  msgJob = { running: true, total: tasks.length, done: 0, failed: 0, current: '', startedAt: Date.now(), last: '' };
+  (async () => {
+    for (const [i, t] of tasks.entries()) {
+      while (busy) await sleep(3000); // auto-connect is using the LinkedIn window: wait for it
+      busy = true; msgJob.current = t.r.Name;
+      try {
+        const res = await sendMessage(t.r, t.text);
+        if (res.result === 'sent') {
+          await engine.linkedinAnswer(t.r['Lead ID'], { channel: 'linkedin', text: t.text }, by + ' (one-click)');
+          await store.update('LinkedIn Leads', 'Lead ID', [{ key: t.r['Lead ID'], set: { 'Message Sent On': engine.today(), 'Suggested Reply': '', Notes: note(t.r, `${t.kind} sent on LinkedIn (one-click)`) } }]);
+          msgJob.done++; log(`Sent the ${t.kind} to ${t.r.Name} on LinkedIn`);
+        } else { msgJob.failed++; await store.update('LinkedIn Leads', 'Lead ID', [{ key: t.r['Lead ID'], set: { Notes: note(t.r, `one-click send skipped: ${res.why} - please send it yourself`) } }]); log(`Skipped ${t.r.Name}: ${res.why}`, 'warn'); }
+      } catch (e) {
+        msgJob.failed++; log(`Could not message ${t.r.Name}: ${e.message}`, 'warn');
+        if (e.signOut) { msgJob.last = e.message; break; }
+      } finally { busy = false; onChange(); }
+      if (i < tasks.length - 1) await sleep(FAST ? 300 : rand(40e3, 90e3)); // slow, like a person
+    }
+    msgJob.running = false; msgJob.current = '';
+    msgJob.last = `Sent ${msgJob.done} of ${msgJob.total}${msgJob.failed ? `, ${msgJob.failed} skipped (left for you in the task list)` : ''}.`;
+    log('One-click LinkedIn: ' + msgJob.last); st.lastResult = msgJob.last; save(); onChange();
+  })();
+  return `Sending ${tasks.length} message(s) on LinkedIn, one every 1-2 minutes. You can keep working; the page shows the progress.`;
+}
+// Reads new replies from people we messaged: they land in the app, the AI suggests an answer, the next "Send all" sends it.
+async function readReplies(rows, max = 6) {
+  const due = rows.filter(r => r.Status === 'Message Sent' && slug(r['LinkedIn URL']) && Date.now() - (st.replyChecked[r['Lead ID']] || 0) > 6 * 3600e3).slice(0, max);
+  let n = 0;
+  for (const r of due) {
+    st.replyChecked[r['Lead ID']] = Date.now(); save();
+    const w = pageWindow();
+    try {
+      const t = await openThread(w, r); if (!t.ok) continue;
+      const last = await run(w, LAST_MSG);
+      const first = String(r.Name || '').split(/\s+/)[0].toLowerCase();
+      if (last.text && first && last.who.toLowerCase().includes(first) && last.text !== String(r['Their Reply'] || '')) {
+        const shared = (last.text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/) || [])[0];
+        await store.update('LinkedIn Leads', 'Lead ID', [{ key: r['Lead ID'], set: { 'Their Reply': last.text.slice(0, 3000), 'Suggested Reply': '', Status: 'Replied', ...(shared ? { Email: shared.toLowerCase() } : {}), Notes: note(r, 'replied on LinkedIn (read automatically)') } }]);
+        n++; log(`${r.Name} replied on LinkedIn - the AI is preparing an answer`);
+      }
+    } catch (e) { if (e.signOut) throw e; } finally { w.destroy(); }
+    await sleep(FAST ? 300 : rand(15e3, 35e3));
+  }
+  if (n) engine.run('linkedinFollow').catch(() => {});
+  return n;
+}
+
 async function tick(force) {
   if (busy) return 'Auto-connect is already working.';
   busy = true;
@@ -209,6 +314,7 @@ async function tick(force) {
     const now = indiaNow(), h = now.getUTCHours(), workday = now.getUTCDay() !== 0;
     if (force || Date.now() - st.lastCheck > CHECK_EVERY) {
       const n = await checkAccepted(rows); if (n) out.push(`${n} accepted`);
+      const rep = await readReplies(rows).catch(e => { if (e.signOut) throw e; return 0; }); if (rep) out.push(`${rep} new LinkedIn repl${rep > 1 ? 'ies' : 'y'}`);
       rows = await store.read('LinkedIn Leads', true);
     }
     const c = counts(rows);
@@ -251,6 +357,7 @@ async function status() {
     pausedUntil: st.pausedUntil > Date.now() ? new Date(st.pausedUntil).toISOString() : '',
     nextSendAt: st.nextSendAt > Date.now() ? new Date(st.nextSendAt).toISOString() : '',
     lastCheck: st.lastCheck ? new Date(st.lastCheck).toISOString() : '', lastResult: st.lastResult,
+    toSend: messageTasks(rows).length, msgToday: msgToday(rows), msgMax: HARD_MSG_DAY, msgJob,
   };
 }
 
@@ -260,6 +367,6 @@ function start(opts = {}) {
   ses().setUserAgent(ua);
   checkSignedIn();
   if (!timer) { timer = setInterval(() => tick(false), 60e3); setTimeout(() => tick(false), 20e3); }
-  global.liBot = { status, runNow: () => tick(true), signIn: () => signIn(opts.parent && opts.parent()), signOut };
+  global.liBot = { status, sendAll, runNow: () => tick(true), signIn: () => signIn(opts.parent && opts.parent()), signOut };
 }
-module.exports = { start, _t: { tick, sendRequest, checkAccepted, slug, settings, counts, st } };
+module.exports = { start, _t: { tick, sendAll, sendMessage, readReplies, messageTasks, msgJob: () => msgJob, sendRequest, checkAccepted, slug, settings, counts, st } };

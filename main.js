@@ -14,7 +14,7 @@ global.desktop = {
 
 function createWindow(show = true) {
   win = new BrowserWindow({
-    width: 1400, height: 900, minWidth: 980, minHeight: 640, show: false, backgroundColor: '#0c0b09',
+    width: 1400, height: 900, minWidth: 980, minHeight: 640, show: false, backgroundColor: '#f4f4f0',
     title: 'AAVORAA Lead Agent', icon: path.join(__dirname, 'assets', 'icon.png'), autoHideMenuBar: true,
     webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, preload: path.join(__dirname, 'preload.js'), backgroundThrottling: false },
   });
@@ -70,7 +70,7 @@ ipcMain.on('aav-badge', (e, n) => {
   } catch (err) {}
   lastBadge = n;
 });
-const PAGES = ['replies', 'qualified', 'linkedin'];
+const PAGES = ['replies', 'qualified', 'interested', 'linkedin', 'dashboard'];
 ipcMain.on('aav-notify', (e, o) => {
   try {
     const n = new Notification({ title: o.title || 'AAVORAA Lead Agent', body: o.body || '', silent: true, icon: path.join(__dirname, 'assets', 'icon.png') });

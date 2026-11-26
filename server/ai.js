@@ -1,5 +1,6 @@
 // Gemini AI + all prompts.
 const config = require('./config');
+const meter = require('./usage');
 const { TONES } = require('./schema');
 
 let last = 0;
@@ -159,7 +160,7 @@ async function gemini(prompt, model, opts = {}) {
     if (attempt < 2) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
     throw new AIUnavailable('Gemini could not be reached (' + e.message + '), will try again later', 'network');
   }
-  today().used++; saveUsage();
+  today().used++; saveUsage(); meter.add('ai', 'requests'); meter.add('ai', provider() === 'openai' ? 'chatgpt' : 'gemini');
   const j = await res.json().catch(() => ({}));
   const msg = (j.error && j.error.message) || String(res.status);
   if (!res.ok && (res.status === 404 || res.status === 400) && gone(msg) && attempt < 2) {
@@ -185,6 +186,7 @@ async function gemini(prompt, model, opts = {}) {
   }
   if (!res.ok) throw new Error('Gemini: ' + msg);
   const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).filter(p => !p.thought).map(p => p.text || '').join('');
+  const um = j.usageMetadata || {}; meter.add('ai', 'tokens', um.totalTokenCount || 0); meter.add('ai', 'tokensIn', um.promptTokenCount || 0); meter.add('ai', 'tokensOut', (um.totalTokenCount || 0) - (um.promptTokenCount || 0));
   return parseJSON(text);
 }
 // ---- ChatGPT (OpenAI API). Needs an API key from platform.openai.com with credit (a ChatGPT Plus plan does not include it).
@@ -223,7 +225,7 @@ async function openaiCall(prompt, opts = {}) {
     if (attempt < 2) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
     throw new AIUnavailable('ChatGPT could not be reached (' + e.message + '), will try again later', 'network');
   }
-  today().used++; saveUsage();
+  today().used++; saveUsage(); meter.add('ai', 'requests'); meter.add('ai', provider() === 'openai' ? 'chatgpt' : 'gemini');
   const j = await res.json().catch(() => ({}));
   const err = j.error || {}, msg = err.message || String(res.status);
   if (res.status === 401) throw new Error('ChatGPT: this API key was not accepted. Create a new one at platform.openai.com/api-keys and paste it on the Connections page.');
@@ -246,6 +248,7 @@ async function openaiCall(prompt, opts = {}) {
   }
   if (!res.ok) throw new Error('ChatGPT: ' + msg);
   oaCache.chosen = oaCache.chosen || use;
+  const uu = j.usage || {}; meter.add('ai', 'tokens', uu.total_tokens || 0); meter.add('ai', 'tokensIn', uu.prompt_tokens || 0); meter.add('ai', 'tokensOut', uu.completion_tokens || 0);
   return parseJSON(((j.choices && j.choices[0] && j.choices[0].message) || {}).content);
 }
 // called by the agent before each job with the Settings values
@@ -310,13 +313,15 @@ Return ONLY a JSON object:
  "best_service": "the ONE most relevant service from our list",
  "website_issues": "2-3 short, specific, polite observations separated by ' ; ' (based only on the data above)",
  "pitch_angle": "one sentence: the specific opportunity we would mention to them",
+ "what_they_have": "one short line: what they already have online (website quality, booking, social, reviews...)",
+ "what_they_need": "one short line: their most likely requirement we can solve, and how we would develop it",
  "contact_name": "owner or founder full name only if clearly written in the website text, else empty",
  "language": "main language of the website, e.g. English",
  "is_real_business": true or false}`;
   },
   email(s, lead, stage, tpl) {
     const L = lead;
-    const base = `${who(s)}\n${rules(s)} ${langRule(s, L)}\n\nLead:\nBusiness: ${L['Business Name']}\nContact name: ${L['Contact Name'] || 'unknown, so greet with "Hi there" or "Hi ' + L['Business Name'] + ' team"'}\nIndustry: ${L.Industry} | Location: ${L.City} ${L.Country}\nWebsite: ${L.Website}\nWhat we noticed: ${L['Website Issues'] || 'not analysed'}\nBest service for them: ${L['Best Service'] || 'choose the most relevant one from our services'}\nOpportunity: ${L['Pitch Angle'] || ''}`;
+    const base = `${who(s)}\n${rules(s)} ${langRule(s, L)}\n\nLead:\nBusiness: ${L['Business Name']}\nContact name: ${L['Contact Name'] || 'unknown, so greet with "Hi there" or "Hi ' + L['Business Name'] + ' team"'}\nIndustry: ${L.Industry} | Location: ${L.City} ${L.Country}\nWebsite: ${L.Website}\nWhat we noticed: ${L['Website Issues'] || 'not analysed'}\nWhat they already have: ${L['What They Have'] || 'unknown'}\nWhat they most likely need (our AI agent's analysis): ${L['What They Need'] || 'unknown'}\nBest service for them: ${L['Best Service'] || 'choose the most relevant one from our services'}\nOpportunity: ${L['Pitch Angle'] || ''}`;
     let task;
     if (stage === 0) task = `Write the FIRST cold email (70-120 words). Open with one specific, genuine observation about their business. In one or two sentences explain how the best service could help them. End with a soft, low-pressure question, for example offering a free short audit or a 15-minute call. Final line exactly: "If this isn't relevant, just reply 'no' and I won't email again."\nSubject: 2-6 words, mostly lowercase, personal, no clickbait.`;
     else if (stage === 1) task = `Our first email (subject "${L['Email Subject']}") got no reply. Write a short, friendly FOLLOW-UP (40-70 words) that adds one new useful idea or quick tip related to the best service. No guilt-tripping. End with a simple yes/no question. Subject must be "".`;
