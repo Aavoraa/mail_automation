@@ -17,6 +17,7 @@ const TABS = {
 const SETTINGS = [
   ['AGENT_ON', 'yes', 'Master switch for the whole agent', 'Agent', 'switch'],
   ['REPLY_FALLBACK_MINUTES', '60', 'If the AI is unavailable when a lead replies, wait this many minutes, then send a short polite holding reply and alert the team leader. Type off to always wait for the AI', 'Agent', 'text'],
+  ['AI_FOLLOW_UP_HELD', 'yes', 'yes = when the AI was out and only a short holding reply was sent, the AI writes and sends the real answer as soon as it is back (in the same email thread)', 'Agent', 'select', ['yes', 'no']],
   ['REPLY_MODE', 'send', 'send = agent replies by itself. draft = replies are saved as Gmail drafts for you to check', 'Agent', 'select', ['send', 'draft']],
   ['TONE', 'Warm & friendly', 'How every email and message sounds', 'Writing', 'select', ['Warm & friendly', 'Formal & professional', 'Short & direct', 'Consultative expert']],
   ['EMAIL_LANGUAGE', 'auto', 'auto = the language of the lead\'s website, or type a language like English', 'Writing', 'text'],
@@ -43,7 +44,7 @@ const SETTINGS = [
   ['SEND_PACING', 'even', 'even = spread each day\'s emails evenly over the sending hours (safest for Gmail). fast = one email every 5 minutes per inbox until the daily limit', 'Sending limits', 'select', ['even', 'fast']],
   ['SEND_HOURS', '8-20', 'Only send new emails between these hours (India time), e.g. 8-20. Use 0-24 for all day', 'Sending limits', 'text'],
   ['MIN_FIT_SCORE', '5', 'Leads the AI scores below this are still emailed, but after the better-fitting ones', 'Lead finding', 'number'],
-  ['APIFY_CONTACTS', 'yes', 'yes = Apify also reads each business website for emails (finds far more emails, small extra Apify cost per place)', 'Lead finding', 'select', ['yes', 'no']],
+  ['APIFY_CONTACTS', 'yes', 'Only when Apify (paid) is chosen on the Connections page: Apify also reads each business website for emails', 'Lead finding', 'select', ['yes', 'no']],
   ['GUESS_EMAILS', 'yes', 'yes = if no email is found anywhere, use info@ their domain (only when that domain accepts email). A few may bounce', 'Lead finding', 'select', ['yes', 'no']],
   ['LEADS_PER_SEARCH', '10', 'Businesses fetched from Google Maps per search', 'Lead finding', 'number'],
   ['FIND_EVERY_HOURS', '8', 'How often to search for new businesses', 'Lead finding', 'number'],
@@ -56,11 +57,11 @@ const SETTINGS = [
   ['INDUSTRIES', INDUSTRIES, 'Comma separated. One is picked at random each search', 'Targets', 'textarea'],
   ['CITIES', CITIES, 'Comma separated. Any city or country', 'Targets', 'textarea'],
   ['SERVICES', SERVICES, 'What the AI is allowed to offer', 'Targets', 'textarea'],
-  ['OPENAI_MODEL', 'auto', 'ChatGPT model. auto = a fast, low-cost model your key can use (recommended). Or type an exact name, e.g. gpt-4.1-mini', 'Advanced', 'text'],
-  ['OPENAI_DAILY_LIMIT', '500', 'Most ChatGPT requests per day, to cap your OpenAI bill (about 1 request per email or reply). Some are always kept for answering customer replies', 'Advanced', 'number'],
+  ['OPENAI_MODEL', 'auto', 'Only when ChatGPT (paid) is chosen: ChatGPT model. auto = a fast, low-cost model your key can use (recommended). Or type an exact name, e.g. gpt-4.1-mini', 'Advanced', 'text'],
+  ['OPENAI_DAILY_LIMIT', '500', 'Only when ChatGPT (paid) is chosen: most ChatGPT requests per day, to cap your OpenAI bill (about 1 request per email or reply). Some are always kept for answering customer replies', 'Advanced', 'number'],
   ['AI_FALLBACK', 'template', 'When the AI is out of requests: template = still send pitches using your template (or a plain email), wait = hold pitches until the AI is back', 'Advanced', 'select', ['template', 'wait']],
-  ['AI_DAILY_LIMIT', '20', 'Only used if no ChatGPT key is saved (old Gemini key): Gemini requests per day (free keys: 20)', 'Advanced', 'number'],
-  ['GEMINI_MODEL', 'auto', 'Only used if no ChatGPT key is saved (old Gemini key). auto = newest Gemini Flash model', 'Advanced', 'text'],
+  ['AI_DAILY_LIMIT', '20', 'Gemini requests per day for EACH free Gemini model (Google allows about 20 each). When one model is used up the app switches to the next free Gemini or Gemma model, so the AI keeps answering. Only if all are used up are your templates used until the next day', 'Advanced', 'number'],
+  ['GEMINI_MODEL', 'auto', 'Gemini model. auto = the best free Gemini Flash model your key can use', 'Advanced', 'text'],
 ];
 
 const TONES = {

@@ -81,12 +81,24 @@ async function canEditConnections(req) {
 app.get('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
   const c = config.get(); const mask = v => v ? '•••• saved' : '';
-  res.json({ sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
+  res.json({ storage: c.storage === 'supabase' ? 'supabase' : 'sheet', supabaseUrl: c.supabaseUrl || '', supabaseKey: mask(c.supabaseKey), supabaseSql: require('./supabase').SETUP_SQL, sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), aiProvider: c.aiProvider === 'openai' ? 'openai' : 'gemini', leadSource: c.leadSource === 'apify' ? 'apify' : 'free', openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
 }));
 app.post('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
   const b = req.body || {}; const patch = {};
   if (b.sheetUrl) patch.sheetUrl = String(b.sheetUrl).trim();
+  if (b.supabaseUrl !== undefined && String(b.supabaseUrl).trim()) {
+    const u = String(b.supabaseUrl).trim().replace(/\/+$/, '').replace(/\/rest\/v1$/, '');
+    if (!/^https:\/\/[a-z0-9-]+\.supabase\.(co|in)$/i.test(u) && !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(u)) throw new Error('The Supabase Project URL looks like https://abcdefgh.supabase.co (Project Settings → Data API).');
+    patch.supabaseUrl = u;
+  }
+  if (b.supabaseKey && !String(b.supabaseKey).startsWith('••')) {
+    const k = String(b.supabaseKey).replace(/[\s\u200b-\u200d\ufeff"'`]/g, '');
+    if (k.length < 30) throw new Error('That does not look like a full Supabase key. Copy the secret key from Project Settings → API Keys.');
+    patch.supabaseKey = k;
+  }
+  // choosing Google Sheet again is allowed any time; moving to Supabase goes through "Move to Supabase" (it copies the data first)
+  if (b.storage === 'sheet') patch.storage = 'sheet';
   if (b.serviceAccountJson) {
     let sa; try { sa = JSON.parse(b.serviceAccountJson); } catch (e) { throw new Error('That key file is not valid JSON. Upload the .json file Google gave you.'); }
     if (!sa.client_email || !sa.private_key) throw new Error('This JSON is not a service account key (missing client_email / private_key).');
@@ -105,7 +117,14 @@ app.post('/api/connections', wrap(async (req, res) => {
     }
     patch.openaiKey = k;
   }
-  if (b.geminiKey && !String(b.geminiKey).startsWith('••')) patch.geminiKey = String(b.geminiKey).trim();
+  if (b.geminiKey && !String(b.geminiKey).startsWith('••')) {
+    const k = String(b.geminiKey).replace(/[\s\u200b-\u200d\ufeff"'`]/g, '');
+    if (/^sk-/.test(k)) throw new Error('That is a ChatGPT (OpenAI) key. The free Gemini key comes from aistudio.google.com/apikey.');
+    if (k.length < 20) throw new Error('That does not look like a full Gemini API key. Copy the whole key from aistudio.google.com/apikey.');
+    patch.geminiKey = k;
+  }
+  if (b.aiProvider !== undefined) patch.aiProvider = b.aiProvider === 'openai' ? 'openai' : 'gemini';
+  if (b.leadSource !== undefined) patch.leadSource = b.leadSource === 'apify' ? 'apify' : 'free';
   if (b.apifyToken && !String(b.apifyToken).startsWith('••')) patch.apifyToken = String(b.apifyToken).trim();
   config.set(patch);
   res.json({ ok: true, serviceAccountEmail: config.get().serviceAccount ? config.get().serviceAccount.client_email : '' });
@@ -132,14 +151,21 @@ app.post('/api/connections/test', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Not allowed.' });
   const what = (req.body || {}).what;
   if (what === 'sheet') { const r = await store.ensureTabs(); return res.json({ ok: true, msg: `Connected to "${r.title}". Tabs are ready.` }); }
+  if (what === 'supabase') { await store.supabase().createTables(); return res.json({ ok: true, msg: 'Supabase connected. The tables are ready.' }); }
   if (what === 'gmail') { await mail.test(); return res.json({ ok: true, msg: 'Gmail connected (sending and reading).' }); }
   if (what === 'openai' || what === 'gemini') {
     const ai = require('./ai');
     if (what === 'openai' && !config.get().openaiKey) throw new Error('Paste your ChatGPT (OpenAI) API key first.');
+    if (what === 'gemini' && !config.get().geminiKey) throw new Error('Paste your free Gemini API key first (aistudio.google.com/apikey).');
+    if (ai.provider() !== (what === 'openai' ? 'openai' : 'gemini')) throw new Error(`Choose ${what === 'openai' ? 'ChatGPT' : 'Gemini (free)'} under "Which AI writes the emails" and save first.`);
     ai.configure(await store.settings().catch(() => ({})));
     const a = await gemini('Return ONLY this JSON: {"ok": true}', 'auto', { priority: 'reply' });
     if (!a) throw new Error(`${ai.aiName()} answered but not as expected.`);
     return res.json({ ok: true, msg: `${ai.aiName()} is working (model: ${ai.currentModel() || 'auto'}).` });
+  }
+  if (what === 'free') {
+    const n = await require('./free').testSearch();
+    return res.json({ ok: true, msg: `Free lead finding works (a test web search found ${n} results). No key or payment needed.` });
   }
   if (what === 'apify') {
     if (process.env.AAVORAA_MOCK === '1') return res.json({ ok: true, msg: 'Apify connected.' });
@@ -149,6 +175,20 @@ app.post('/api/connections/test', wrap(async (req, res) => {
     return res.json({ ok: true, msg: `Apify connected (${j.data && j.data.username}).` });
   }
   throw new Error('Unknown test');
+}));
+// Move all data to Supabase: create the tables, copy every tab from the Google Sheet (if one is connected), then switch over.
+app.post('/api/connections/supabase/move', wrap(async (req, res) => {
+  if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
+  const c = config.get();
+  if (!c.supabaseUrl || !c.supabaseKey) throw new Error('Save the Supabase Project URL and secret key first.');
+  if (c.storage === 'supabase') return res.json({ ok: true, msg: 'The app already saves to Supabase.' });
+  const supa = store.supabase();
+  let report = [];
+  if (c.sheetUrl && c.serviceAccount) report = await supa.copyFrom(store.sheet, m => engine.log('agent', 'Moving to Supabase: ' + m));
+  else { await supa.createTables(); await supa.seedDefaults(); report = ['No Google Sheet connected: Supabase starts empty.']; }
+  config.set({ storage: 'supabase' });
+  engine.log('agent', 'Data storage switched to Supabase. ' + report.join('; '));
+  res.json({ ok: true, msg: 'Done. The app now saves everything to Supabase. ' + report.join(' · '), report });
 }));
 app.post('/api/setup/owner', wrap(async (req, res) => {
   if (!isLocal(req)) throw new Error('Create the owner account on the main PC.');
@@ -226,7 +266,7 @@ app.get('/api/notify', need(), wrap(async (req, res) => {
   const mailOk = req.user.role !== 'linkedin';
   const [rep, li, qual] = await Promise.all([mailOk ? store.read('Replies') : [], store.read('LinkedIn Leads'), mailOk ? store.read('Qualified Leads') : []]);
   res.json({
-    gmail: rep.map(r => ({ id: r['Reply ID'], who: r['Contact Name'] || r['Business Name'] || r.From, text: String(r['Their Message'] || '').slice(0, 120) })),
+    gmail: rep.filter(r => r.Category !== 'automatic').map(r => ({ id: r['Reply ID'], who: r['Contact Name'] || r['Business Name'] || r.From, text: String(r['Their Message'] || '').slice(0, 120) })),
     linkedin: li.filter(r => String(r['Their Reply'] || '').trim()).map(r => ({ id: liKey(r), who: r.Name, text: String(r['Their Reply']).slice(0, 120) })),
     accepted: li.filter(r => r.Status === 'Connected').map(r => ({ id: r['Lead ID'], who: r.Name, text: 'Accepted your connection request. Send them the first message.' })),
     qualified: qual.map(r => ({ id: r['Lead ID'], who: r['Business Name'] || r['Contact Name'], text: r.Summary || r['Service Needed'] || '' })),
@@ -269,6 +309,7 @@ app.post('/api/leads/raw/:id/email', need('owner', 'leader'), wrap(async (req, r
   res.json({ ok: true, ...(await engine.emailLead(req.params.id, { to: b.to, subject: String(b.subject || '').slice(0, 300), text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
 }));
 
+app.post('/api/replies/:id/draft', need('owner', 'leader'), wrap(async (req, res) => res.json(await engine.replyDraft(req.params.id))));
 app.post('/api/replies/:id/answer', need('owner', 'leader'), wrap(async (req, res) => {
   await engine.answerReply(req.params.id, (req.body || {}).text, req.user.name);
   res.json({ ok: true });

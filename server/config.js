@@ -31,7 +31,7 @@ module.exports = {
   dir: DIR,
   get: () => cache,
   set(patch) { cache = { ...cache, ...patch }; save(cache); return cache; },
-  isConfigured: () => !!(cache.sheetUrl && cache.serviceAccount && cache.gmailUser && cache.gmailAppPassword && (cache.openaiKey || cache.geminiKey)),
+  isConfigured: () => !!((cache.storage === 'supabase' ? cache.supabaseUrl && cache.supabaseKey : cache.sheetUrl && cache.serviceAccount) && cache.gmailUser && cache.gmailAppPassword),
   loadState() { try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch (e) { return {}; } },
   saveState(s) { try { fs.writeFileSync(STATE, JSON.stringify(s)); } catch (e) {} },
 };

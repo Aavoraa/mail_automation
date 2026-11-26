@@ -60,7 +60,11 @@ class SheetStore {
         await this.api('PUT', `/values/${encodeURIComponent(q(tab) + '!A1')}?valueInputOption=RAW`, { values: [all] });
       }
     }
-    // defaults
+    await this.seedDefaults();
+    return { title: m.properties.title };
+  }
+  // default settings and templates (both storages)
+  async seedDefaults() {
     const settings = await this.read('Settings', true);
     const keys = new Set(settings.map(r => r.Key));
     const today = new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10);
@@ -69,7 +73,6 @@ class SheetStore {
     const tpl = await this.read('Templates', true);
     if (!tpl.length) await this.append('Templates', DEFAULT_TEMPLATES.map((t, i) => ({ 'Template ID': 'T' + (i + 1), ...t, 'Created By': 'system', 'Updated On': today })));
     this.cache = {};
-    return { title: m.properties.title };
   }
 
   async headers(tab) {
@@ -165,4 +168,13 @@ class MockStore extends SheetStore {
   }
 }
 
-module.exports = process.env.AAVORAA_MOCK === '1' ? new MockStore() : new SheetStore();
+// Where the data lives: the Google Sheet, or Supabase once it is chosen on the Connections page (checked on every call)
+function router() {
+  const sheet = new SheetStore();
+  let supa = null;
+  const pick = () => config.get().storage === 'supabase' ? (supa = supa || new (require('./supabase')(SheetStore))()) : sheet;
+  const r = { sheet, supabase: () => (supa = supa || new (require('./supabase')(SheetStore))()), kind: () => (config.get().storage === 'supabase' ? 'supabase' : 'sheet') };
+  for (const m of ['ensureTabs', 'headers', 'read', 'append', 'update', 'settings', 'saveSettings', 'seedDefaults']) r[m] = (...a) => pick()[m](...a);
+  return r;
+}
+module.exports = process.env.AAVORAA_MOCK === '1' && process.env.AAVORAA_MOCK_SUPABASE !== '1' ? new MockStore() : router();

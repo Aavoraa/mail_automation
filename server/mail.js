@@ -81,6 +81,7 @@ async function fetchNew(sinceDate, seen, user) {
           fromName: ((p.from && p.from.value && p.from.value[0]) || {}).name || '',
           subject: p.subject || '', text: p.text || '', inReplyTo: p.inReplyTo || '',
           references: Array.isArray(p.references) ? p.references : (p.references ? [p.references] : []), date: p.date, inbox: a.user,
+          auto: autoHeaders(p.headers),
         });
       }
     }
@@ -88,6 +89,13 @@ async function fetchNew(sinceDate, seen, user) {
   return out;
 }
 
+// headers that automatic senders (ticket systems, auto-responders, newsletters) add
+function autoHeaders(h) {
+  if (!h || !h.get) return false;
+  const v = k => String(h.get(k) || '').toLowerCase();
+  return (v('auto-submitted') && v('auto-submitted') !== 'no') || !!h.get('x-autoreply') || !!h.get('x-autorespond') || !!h.get('x-autoresponse') ||
+    /^(bulk|junk|auto_reply|list)$/.test(v('precedence')) || /oof|autoreply|all/.test(v('x-auto-response-suppress'));
+}
 // test() checks the main inbox; test({user, pass}) checks an inbox before it is saved
 async function test(acct) {
   const a = acct ? { user: String(acct.user).toLowerCase(), pass: acct.pass } : accounts()[0];

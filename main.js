@@ -97,5 +97,6 @@ app.whenReady().then(async () => {
   app.setAppUserModelId('com.aavoraa.leadagent');
   createTray();
   createWindow(!process.argv.includes('--hidden'));
+  require('./search-window').start();
   require('./linkedin-bot').start({ parent: () => win });
 });

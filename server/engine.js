@@ -51,7 +51,7 @@ const apifyEmails = p => [...(p.emails || []), ...((p.contactDetails && p.contac
 async function discoverEmail(s, website, domain, fromApify = []) {
   const site = await web.findEmails(website);
   const pool = [...new Set([...fromApify.filter(e => web.emailsFrom(e).length), ...site.emails])];
-  if (pool.length) return { email: web.bestEmail(pool, domain), all: pool, how: fromApify.length ? 'found by Apify' : 'website', html: site.html, contactHtml: site.contactHtml };
+  if (pool.length) return { email: web.bestEmail(pool, domain), all: pool, how: fromApify.length ? 'found in the business listing' : 'website', html: site.html, contactHtml: site.contactHtml };
   if (yes(s.GUESS_EMAILS ?? 'yes')) { const g = await web.guessEmail(domain); if (g) return { email: g, how: 'guessed (info@ of their domain, which accepts email)', html: site.html, contactHtml: site.contactHtml }; }
   return { email: '', how: '', html: site.html, contactHtml: site.contactHtml };
 }
@@ -61,7 +61,7 @@ async function findLeads(s, opts = {}) {
   if (!industries.length || !cities.length) throw new Error('Add industries and cities in Settings.');
   const industry = opts.industry || pick(industries), city = opts.city || pick(cities);
   const max = Number(opts.max || s.LEADS_PER_SEARCH || 10);
-  log('find', `Searching Google Maps: "${industry}" in ${city}`);
+  log('find', `Searching ${web.useApify() ? 'Google Maps (Apify)' : 'free map + web search'}: "${industry}" in ${city}`);
   const places = await web.mapsSearch(industry, city, max, yes(s.APIFY_CONTACTS ?? 'yes'));
   const existing = await store.read('Raw Leads');
   const seen = new Set();
@@ -69,6 +69,7 @@ async function findLeads(s, opts = {}) {
   const skip = ['facebook.com', 'instagram.com', 'linkedin.com', 'wa.me', 'whatsapp.com', 'google.com', 'youtube.com', 'twitter.com', 'x.com', 'linktr.ee', 'business.site', 'tiktok.com'];
   const rows = [];
   for (const p of places) {
+    if (rows.length >= max) break;
     if (!p || !p.title || !p.website) continue;
     const d = web.domainOf(p.website);
     if (!d || skip.some(x => d === x || d.endsWith('.' + x))) continue;
@@ -89,7 +90,7 @@ async function findLeads(s, opts = {}) {
     const email = web.bestEmail(emails, d);
     const fit = Number(a.fit_score || 0);
     rows.push({
-      'Lead ID': newId('L'), 'Date Found': today(), Source: 'Google Maps', 'Business Name': p.title, Industry: L.category, City: L.city, Country: L.country,
+      'Lead ID': newId('L'), 'Date Found': today(), Source: p.source || 'Google Maps', 'Business Name': p.title, Industry: L.category, City: L.city, Country: L.country,
       Website: website, Email: email, Phone: p.phone || p.phoneUnformatted || '', 'Contact Name': a.contact_name || '', LinkedIn: web.linkedinIn(html + contact) || (p.linkedIns || [])[0] || '',
       'Google Rating': L.rating, Reviews: L.reviews, 'Website Issues': a.website_issues || '', 'Best Service': a.best_service || '', 'Pitch Angle': a.pitch_angle || '',
       // every lead with an email is emailed; the fit score only decides the order (best first)
@@ -256,13 +257,23 @@ function safeReply(s, lead, m, text) {
     reply: `Hi ${name}, thank you for getting back to me. ${s.TEAM_LEADER_NAME ? s.TEAM_LEADER_NAME + ' from our team' : 'Someone from our team'} will reply to you personally with the details very shortly.${booking}` };
 }
 
+// Messages written by a machine (ticket systems, no-reply senders, "we received your message" confirmations):
+// never answered, so the agent does not talk to a robot or open support tickets.
+function isAutomatic(m, text) {
+  const from = String(m.from || '').toLowerCase(), t = (String(m.subject || '') + '\n' + text).toLowerCase();
+  if (m.auto) return true;
+  if (/^(no-?reply|do-?not-?reply|donotreply|noreply-|notifications?|notify|mailer|bounces?|alerts?|news(letter)?|marketing|updates?|system|automated?)[@.+_-]/.test(from)) return true;
+  const ticket = /type your reply above this line|reply above this line|ticket\s*(#|no\.?|number|id)|request\s*#\s*\d|case\s*#\s*\d|\(#\d{4,}\)|your (ticket|request|case) (has been|was) (received|created)|we('ve| have) received your (message|request|email|enquiry|inquiry)|thanks? (you )?for contacting|this is an automated|automatically generated|do not reply (to )?this|please do not reply|rate (our|your) (support|experience)|feedback on (your )?ticket|how did we do/;
+  return ticket.test(t);
+}
+
 async function checkReplies(s) {
   const since = new Date(Date.now() - 3 * 86400000);
   const seen = new Set(state.seen);
   // every sending inbox is checked; an inbox that cannot be read is reported but does not stop the others
   const msgs = [];
   for (const a of mail.accounts()) { try { msgs.push(...await mail.fetchNew(since, seen, a.user)); } catch (e) { log('replies', `Could not read ${a.user}: ${e.message}`, 'error'); } }
-  if (!msgs.length) return 'No new emails';
+  if (!msgs.length) { const later = await answerHeld(s).catch(e => { log('replies', 'AI follow-up: ' + e.message, 'warn'); return 0; }); return 'No new emails' + (later ? `, ${later} answered by AI after a holding reply` : ''); }
   const rows = await store.read('Raw Leads', true);
   const byEmail = {}, byMsg = {}, byDomain = {};
   const free = /^(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|icloud|me|aol|proton|protonmail|zoho|gmx|mail|yandex|rediffmail)\./;
@@ -287,6 +298,14 @@ async function checkReplies(s) {
     const lead = [m.inReplyTo, ...(m.references || [])].map(x => byMsg[x]).find(Boolean) || byEmail[from] || (!free.test(domainOf(from)) && byDomain[domainOf(from)]);
     if (!lead || lead.Status === 'Do Not Contact') { done(m); continue; }
     const text = String(m.text || '').split(/\n\s*On [^\n]{5,200}wrote:|\n-{2,}\s*Original Message|\nFrom: [^\n]*\n(?:Sent|Date): /i)[0].split('\n').filter(l => !l.trim().startsWith('>')).join('\n').trim().slice(0, 3000);
+    if (isAutomatic(m, text)) {
+      // keep it on the Replies page for reference, but never answer a machine
+      await store.append('Replies', [{ 'Reply ID': newId('R'), 'Received On': new Date(m.date || Date.now()).toISOString().slice(0, 16).replace('T', ' '), 'Lead ID': lead['Lead ID'], 'Business Name': lead['Business Name'],
+        'Contact Name': m.fromName || '', From: from, Inbox: m.inbox || '', Subject: m.subject || '', 'Their Message': text.slice(0, 4000), Category: 'automatic', Summary: 'Automatic message (ticket system / auto-response), not a person',
+        'Our Reply': '', 'Reply Status': 'Automatic - no reply needed', 'Message ID': m.messageId || '', References: '' }]).catch(() => {});
+      log('replies', `${lead['Business Name']}: automatic message from ${from}, not answered`);
+      done(m); continue;
+    }
     const tpls = await templates('Reply to interested lead');
     const ask = () => gemini(P.reply(s, { lead, subject: m.subject, text }, tpls.length ? pick(tpls) : null), s.GEMINI_MODEL, { priority: 'reply' });
     let a;
@@ -342,8 +361,53 @@ async function checkReplies(s) {
         `${lead['Business Name']} (${from}) replied while the AI was unavailable. The agent sent a short holding reply saying our team will get back to them.\n\nWhat they said:\n${text.slice(0, 1500)}\n\nPlease answer them personally from Gmail (aavoraa.marketing@gmail.com).`);
     }
   }
-  return `Checked ${msgs.length} new emails, ${handled} from leads answered` + (waiting ? `, ${waiting} waiting to be answered` : '');
+  const later = await answerHeld(s).catch(e => { log('replies', 'AI follow-up: ' + e.message, 'warn'); return 0; });
+  return `Checked ${msgs.length} new emails, ${handled} from leads answered` + (waiting ? `, ${waiting} waiting to be answered` : '') + (later ? `, ${later} answered by AI after a holding reply` : '');
 }
+// Replies that only got a short holding reply (the AI was out) or could not be answered: once the AI is back,
+// it writes the real answer and sends it in the same email thread. Machines are marked and skipped.
+async function aiAnswerFor(s, r, extra = '') {
+  const lead = (await store.read('Raw Leads')).find(x => x['Lead ID'] === r['Lead ID']) || { 'Business Name': r['Business Name'], 'Contact Name': r['Contact Name'], Website: '' };
+  const tpls = await templates('Reply to interested lead');
+  const note = r['Our Reply'] ? `\n(Our earlier message in this thread: [[[${String(r['Our Reply']).slice(-800)}]]]. Do not repeat it; now give the real, helpful answer.)` : '';
+  return gemini(P.reply(s, { lead, subject: r.Subject, text: String(r['Their Message'] || '') + note + extra }, tpls.length ? pick(tpls) : null), s.GEMINI_MODEL, { priority: 'reply' });
+}
+async function answerHeld(s) {
+  if (!yes(s.AI_FOLLOW_UP_HELD ?? 'yes') || !ai.canUse('reply')) return 0;
+  const rows = (await store.read('Replies', true)).filter(r => /Holding reply sent|Not sent - please answer/i.test(r['Reply Status'] || '') && !r['Answered By']);
+  const week = new Date(Date.now() - 14 * 86400e3).toISOString().slice(0, 10);
+  let n = 0;
+  for (const r of rows.filter(r => String(r['Received On']).slice(0, 10) >= week).slice(0, 5)) {
+    if (isAutomatic({ from: r.From, subject: r.Subject }, String(r['Their Message'] || ''))) {
+      await store.update('Replies', 'Reply ID', [{ key: r['Reply ID'], set: { Category: 'automatic', 'Reply Status': 'Automatic - no reply needed', Summary: 'Automatic message (ticket system / auto-response), not a person' } }]);
+      continue;
+    }
+    let a;
+    try { a = await aiAnswerFor(s, r); } catch (e) { if (aiUnavailable(e)) break; throw e; }
+    const reply = clean((a || {}).reply);
+    if (!reply) { await store.update('Replies', 'Reply ID', [{ key: r['Reply ID'], set: { 'Reply Status': 'No reply needed', Category: (a && a.category) || r.Category } }]); continue; }
+    const draft = String(s.REPLY_MODE || 'send').toLowerCase() === 'draft';
+    const msg = { to: r.From, from: r.Inbox || undefined, subject: 'Re: ' + String(r.Subject || '').replace(/^re:\s*/i, ''), text: reply + '\n\n' + signature(s), fromName: senderName(s), inReplyTo: r['Message ID'] || undefined, references: r.References || r['Message ID'] || undefined };
+    if (draft) await mail.saveDraft(msg); else await mail.send(msg);
+    const stamp = new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 16).replace('T', ' ');
+    await store.update('Replies', 'Reply ID', [{ key: r['Reply ID'], set: { 'Our Reply': [r['Our Reply'], `[AI, ${stamp}] ${reply}`].filter(Boolean).join('\n\n').slice(0, 8000), 'Reply Status': draft ? 'Draft saved in Gmail' : 'Agent replied', 'Answered By': 'AI', Category: (a && a.category) || r.Category, Summary: (a && a.summary) || r.Summary } }]);
+    log('replies', `AI answered ${r['Business Name'] || r.From} (after the holding reply)`); n++;
+  }
+  return n;
+}
+// AI-written answer for the Replies page; a person reads it, edits it and presses Send
+async function replyDraft(id) {
+  const r = (await store.read('Replies', true)).find(x => x['Reply ID'] === id);
+  if (!r) throw new Error('Reply not found');
+  if (r.Category === 'automatic') throw new Error('This is an automatic message (not a person), so it does not need an answer.');
+  const s = await store.settings();
+  let a;
+  try { a = await aiAnswerFor(s, r); } catch (e) { if (aiUnavailable(e)) throw new Error('The AI is not available right now: ' + e.message); throw e; }
+  const reply = clean((a || {}).reply);
+  if (!reply) throw new Error('The AI thinks this message needs no answer' + (a && a.category ? ` (${String(a.category).replace(/_/g, ' ')})` : '') + '. You can still write one yourself.');
+  return { text: reply };
+}
+
 async function upsertQualified(q) {
   const rows = await store.read('Qualified Leads', true);
   if (rows.find(r => r['Lead ID'] === q['Lead ID'])) { const { 'Lead ID': id, ...set } = q; await store.update('Qualified Leads', 'Lead ID', [{ key: id, set }]); }
@@ -376,8 +440,10 @@ function linkedinPlain(s, p) {
 
 async function linkedinProspects(s, opts = {}) {
   const industry = opts.industry || pick(list(s.INDUSTRIES)), city = opts.city || pick(list(s.CITIES));
-  const query = `site:linkedin.com/in ("founder" OR "co-founder" OR "CEO" OR "owner" OR "managing director") "${industry}" "${city}"`;
-  log('linkedin', `Searching LinkedIn via Google: ${industry} in ${city}`);
+  // the free web search gives about 10 results a search and no OR: one search per role instead
+  const query = web.useApify() ? `site:linkedin.com/in ("founder" OR "co-founder" OR "CEO" OR "owner" OR "managing director") "${industry}" "${city}"`
+    : ['founder', 'CEO', 'owner'].map(role => `linkedin ${role} ${industry} ${city}`).join('\n');
+  log('linkedin', `Searching LinkedIn via ${web.useApify() ? 'Google (Apify)' : 'free web search'}: ${industry} in ${city}`);
   const pages = await web.googleSearch(query);
   const keyOf = u => (String(u || '').toLowerCase().split('/in/')[1] || '').split(/[/?#]/)[0];
   const existing = new Set((await store.read('LinkedIn Leads')).map(r => keyOf(r['LinkedIn URL'])).filter(Boolean));
@@ -441,7 +507,7 @@ async function syncQualifiedEmail(id, email) {
   const q = (await store.read('Qualified Leads', true)).find(r => r['Lead ID'] === id);
   if (q && String(q.Email || '').toLowerCase() !== String(email).toLowerCase()) await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { Email: email } }]);
 }
-const NOT_COMPANY_SITE =/(^|\.)(linkedin|facebook|instagram|twitter|x|youtube|wikipedia|crunchbase|glassdoor|indeed|zoominfo|bloomberg|yelp|tripadvisor|justdial|indiamart|google|apollo|rocketreach|signalhire|pitchbook|dnb|owler|ambitionbox|naukri|tracxn|medium|github|reddit|quora|amazon)\.[a-z.]+$/;
+const NOT_COMPANY_SITE =/(^|\.)(linkedin|facebook|instagram|twitter|x|youtube|wikipedia|crunchbase|glassdoor|indeed|zoominfo|bloomberg|yelp|tripadvisor|justdial|indiamart|google|apollo|rocketreach|signalhire|pitchbook|dnb|owler|ambitionbox|naukri|naukrigulf|jooble|bayt|gulftalent|monster|tracxn|medium|github|reddit|quora|amazon)\.[a-z.]+$/;
 // For LinkedIn prospects: Google their company, take its own website, find an email, add it to Raw Leads so it is pitched like any other lead
 async function emailLinkedInCompanies(s, rows) {
   const todo = rows.filter(r => r.Company && r.Company.length > 1).slice(0, 10);
@@ -627,7 +693,7 @@ async function tick() {
 function start() {
   if (timer) return;
   // add any new columns / settings this version needs to the Google Sheet
-  if (config.isConfigured()) store.ensureTabs().then(() => log('agent', 'Google Sheet tabs checked')).catch(e => log('agent', 'Could not update the Sheet tabs: ' + e.message, 'warn'));
+  if (config.isConfigured()) store.ensureTabs().then(() => log('agent', (store.kind && store.kind() === 'supabase' ? 'Supabase tables' : 'Google Sheet tabs') + ' checked')).catch(e => log('agent', 'Could not check the ' + (store.kind && store.kind() === 'supabase' ? 'Supabase tables' : 'Sheet tabs') + ': ' + e.message, 'warn'));
   timer = setInterval(tick, 60000); setTimeout(tick, 5000); log('agent', 'Agent engine started');
 }
 function status() {
@@ -804,4 +870,4 @@ async function callResult(id, status, note, by) {
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, linkedinAnswer, _internals: { personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, replyDraft, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, linkedinAnswer, _internals: { isAutomatic, answerHeld, personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
