@@ -60,90 +60,90 @@ async function open(w, url) {
   if (/\/404|unavailable/i.test(at)) throw new Error('This LinkedIn profile is not available.');
 }
 // Runs a function inside the LinkedIn page with small helpers that also look inside LinkedIn's pop-up layers (shadow DOM).
+// Works with LinkedIn's 2026 profile layout (name in the page title, actions next to "More", Connect/Message as links)
+// and the older one (name in <h1>, buttons in the top card).
 const LIB = `
   const all = () => { const out = []; const walk = n => { for (const el of n.querySelectorAll('*')) { out.push(el); if (el.shadowRoot) walk(el.shadowRoot); } }; walk(document); return out; };
   const vis = el => { const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none'; };
-  const lab = el => ((el.getAttribute('aria-label') || '') + ' | ' + (el.innerText || el.textContent || '')).replace(/\\s+/g, ' ').trim();
+  const txt = el => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+  const lab = el => ((el.getAttribute('aria-label') || '') + ' | ' + txt(el)).trim();
   const btns = root => (root ? [...root.querySelectorAll('*')] : all()).filter(el => (/^(BUTTON|A)$/.test(el.tagName) || /^(button|menuitem)$/.test(el.getAttribute('role') || '')) && vis(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
   const h1 = document.querySelector('main h1') || document.querySelector('h1');
-  const name = h1 ? h1.innerText.trim() : '';
+  const title = document.title.replace(/^\\(\\d+\\+?\\)\\s*/, '');
+  const name = (h1 && txt(h1)) || (title.includes('|') ? title.split('|')[0].trim() : '');
   const first = name.split(/\\s+/)[0] || '';
-  let top = h1; for (let i = 0; top && i < 12 && !(top.tagName === 'SECTION' || (top.querySelectorAll && [...top.querySelectorAll('button')].length >= 2)); i++) top = top.parentElement;
+  // the profile's own action buttons sit next to the left-most "More" (LinkedIn repeats them in a sticky bar on the right)
+  const mores = btns().filter(el => /^more$/i.test(txt(el)) || /^more actions$/i.test((el.getAttribute('aria-label') || '').trim())).sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+  let top = null;
+  if (mores[0]) { top = mores[0].parentElement; for (let i = 0; top && i < 6 && top.querySelectorAll('a,button').length < 2; i++) top = top.parentElement; }
+  if (!top && h1) { top = h1; for (let i = 0; top && i < 12 && !(top.tagName === 'SECTION' || (top.querySelectorAll && top.querySelectorAll('button').length >= 2)); i++) top = top.parentElement; }
   top = top || document.querySelector('main') || document.body;
+  const card = (() => { let c = top; for (let i = 0; i < 6 && c.parentElement; i++) c = c.parentElement; return c; })();
+  const isConnect = el => /invite .* to connect/i.test(el.getAttribute('aria-label') || '') || /^connect$/i.test(txt(el)) || /custom-invite/.test(el.getAttribute('href') || '');
+  const isMessage = el => /^message$/i.test(txt(el)) || /^message\\b/i.test(el.getAttribute('aria-label') || '') || /messaging\\/compose/.test(el.getAttribute('href') || '');
   const isMine = el => { const a = el.getAttribute('aria-label') || ''; return !/invite .* to connect/i.test(a) || !first || a.toLowerCase().includes(first.toLowerCase()); };
   const click = el => { el.scrollIntoView({ block: 'center' }); el.click(); };
   const say = t => all().some(el => el.children.length === 0 && vis(el) && t.test(el.textContent || ''));
 `;
 const run = (w, body, arg) => w.webContents.executeJavaScript(`(() => { ${LIB} const arg = ${JSON.stringify(arg || null)}; ${body} })()`, true);
+// wait until something appears on the page (LinkedIn loads in pieces)
+async function waitFor(w, body, ms = 12000) { const t0 = Date.now(); let v; while (Date.now() - t0 < ms) { v = await run(w, body).catch(() => null); if (v) return v; await sleep(700); } return v; }
 
 // what the profile's top card says: connected (1st), pending, or can connect
 const STATE_JS = `
-  const text = (top.innerText || '').replace(/\\s+/g, ' ');
-  const b = btns(top);
-  if (b.some(el => /\\bpending\\b|withdraw/i.test(lab(el)))) return { state: 'pending', name };
-  if (/(^|[^a-z])1st([^a-z]|$)/i.test(text) && !b.some(el => /\\bconnect\\b/i.test(lab(el)) && !/connections/i.test(lab(el)))) return { state: 'connected', name };
-  return { state: 'other', name };
+  const b = btns(top), L = b.map(lab).join(' || ');
+  if (/\\bpending\\b|withdraw/i.test(L)) return { state: 'pending', name };
+  const hasConnect = b.some(isConnect), hasMsg = b.some(isMessage);
+  const wide = txt(card);
+  if (!hasConnect && (/(^|[^a-z])1st([^a-z]|$)/i.test(wide) || (hasMsg && !/(^|\\|\\s)follow\\b/i.test(L)))) return { state: 'connected', name };
+  return { state: 'other', name, hasConnect, hasMsg };
 `;
 
 async function sendRequest(r, note) {
   const w = pageWindow();
   try {
     await open(w, profileUrl(r['LinkedIn URL']));
-    let s = await run(w, STATE_JS);
-    if (!s.name) throw new Error('Could not read the profile page (LinkedIn may have changed its layout).');
-    if (s.state !== 'other') return { result: s.state };
-    // 1. the Connect button: on the profile card, or inside "More"
-    let how = await run(w, `
-      const direct = btns(top).find(el => isMine(el) && (/invite .* to connect/i.test(el.getAttribute('aria-label') || '') || /^connect$/i.test((el.innerText || '').trim())));
-      if (direct) { click(direct); return 'direct'; }
-      const more = btns(top).find(el => /more actions|^more$/i.test((el.getAttribute('aria-label') || '').trim()) || /^more$/i.test((el.innerText || '').trim()));
-      if (more) { click(more); return 'more'; }
-      return '';`);
-    if (how === 'more') {
-      await sleep(rand(900, 1600));
-      how = await run(w, `
-        const c = btns().find(el => isMine(el) && (/invite .* to connect/i.test(el.getAttribute('aria-label') || '') || /^connect$/i.test((el.innerText || '').trim())));
-        if (c) { click(c); return 'more'; } return '';`);
-    }
-    if (!how) return { result: 'noconnect' };
-    // 2. the invitation pop-up
-    await sleep(rand(1500, 2600));
-    const dlg = await run(w, `
+    let s = await waitFor(w, `const s = (() => { ${STATE_JS} })(); return s.name ? s : null;`, 10000) || await run(w, STATE_JS);
+    if (s.state === 'pending' || s.state === 'connected') return { result: s.state };
+    // 1. open LinkedIn's own invite box for this profile (works whether "Connect" is on the card or hidden under "More")
+    await open(w, BASE + '/preload/custom-invite/?vanityName=' + encodeURIComponent(slug(r['LinkedIn URL'])));
+    const dlg = await waitFor(w, `
       if (say(/enter (their|his|her) email|know .* outside of linkedin|how do you know/i)) return 'email';
+      if (say(/weekly invitation limit|reached the weekly limit|too many invitations/i)) return 'limit';
       const t = btns().map(lab).join(' || ');
-      return /add a note/i.test(t) ? 'note' : /send without a note|send now|^send\\b|\\| send$/i.test(t) ? 'send' : '';`);
+      return /add a note/i.test(t) ? 'note' : /send without a note/i.test(t) ? 'send' : '';`, 12000);
     if (dlg === 'email') return { result: 'needs-email' };
+    if (dlg === 'limit') return { result: 'limit' };
+    if (!dlg) return { result: 'noconnect' };
     let withNote = false;
     if (note && dlg === 'note') {
       await run(w, `const b = btns().find(el => /add a note/i.test(lab(el))); if (b) click(b);`);
-      await sleep(rand(1200, 2000));
-      const box = await run(w, `const t = all().find(el => el.tagName === 'TEXTAREA' && vis(el)); if (!t) return false; t.focus(); t.value = ''; return true;`);
+      const box = await waitFor(w, `const t = all().find(el => el.tagName === 'TEXTAREA' && vis(el)); if (!t) return false; t.focus(); t.value = ''; return true;`, 6000);
       if (box) {
         w.webContents.insertText(note.slice(0, 200)); // free accounts allow 200 characters
         await sleep(rand(1200, 2200));
-        withNote = await run(w, `const b = btns().find(el => /^(send|send invitation|send now)$/i.test((el.getAttribute('aria-label') || '').trim()) || /^send$/i.test((el.innerText || '').trim())); if (b) { click(b); return true; } return false;`);
+        withNote = await run(w, `const b = btns().find(el => /^(send|send invitation|send now)$/i.test((el.getAttribute('aria-label') || '').trim()) || /^send$/i.test(txt(el))); if (b) { click(b); return true; } return false;`);
       }
-      if (!withNote) { // out of free notes (Premium pop-up): close it and send without a note
-        await run(w, `const x = btns().find(el => /dismiss|close|cancel/i.test(lab(el))); if (x) click(x);`);
-        await sleep(1200);
-        await run(w, `const c = btns().find(el => isMine(el) && (/invite .* to connect/i.test(el.getAttribute('aria-label') || '') || /^connect$/i.test((el.innerText || '').trim()))); if (c) click(c);`);
-        await sleep(rand(1500, 2500));
+      if (!withNote) { // out of free notes (Premium pop-up): open the invite box again and send without a note
+        await open(w, BASE + '/preload/custom-invite/?vanityName=' + encodeURIComponent(slug(r['LinkedIn URL'])));
+        await waitFor(w, `return /send without a note/i.test(btns().map(lab).join(' '));`, 10000);
       }
     }
     if (!withNote) {
-      const ok = await run(w, `const b = btns().find(el => /send without a note|^send now$/i.test(lab(el).replace(/\\s*\\|.*$/, '')) || /send without a note/i.test(lab(el))) || btns().find(el => /^(send|send now)$/i.test((el.innerText || '').trim())); if (b) { click(b); return true; } return false;`);
+      const ok = await run(w, `const b = btns().find(el => /send without a note/i.test(lab(el))) || btns().find(el => /^(send|send now)$/i.test(txt(el))); if (b) { click(b); return true; } return false;`);
       if (!ok) return { result: 'nosend' };
     }
     await sleep(rand(2500, 4000));
     if (await run(w, `return say(/weekly invitation limit|reached the weekly limit|too many invitations/i);`)) return { result: 'limit' };
-    s = await run(w, STATE_JS);
+    await open(w, profileUrl(r['LinkedIn URL']));
+    s = await waitFor(w, `const s = (() => { ${STATE_JS} })(); return s.name ? s : null;`, 8000) || {};
     return { result: 'sent', withNote, verified: s.state === 'pending' };
   } finally { w.destroy(); }
 }
 
 async function profileState(r) {
   const w = pageWindow();
-  try { await open(w, profileUrl(r['LinkedIn URL'])); return (await run(w, STATE_JS)).state; } finally { w.destroy(); }
+  try { await open(w, profileUrl(r['LinkedIn URL'])); const s = await waitFor(w, `const s = (() => { ${STATE_JS} })(); return s.name ? s : null;`, 10000); return s ? s.state : ''; } finally { w.destroy(); }
 }
 async function recentConnections() {
   const w = pageWindow();
@@ -162,13 +162,14 @@ async function checkAccepted(rows) {
   const waiting = rows.filter(r => r.Status === 'Request Sent' && slug(r['LinkedIn URL']));
   st.lastCheck = Date.now(); save();
   if (!waiting.length) return 0;
-  const links = new Set((await recentConnections()).map(slug));
+  const links = new Set((await recentConnections().catch(() => [])).map(slug));
+  const perCheck = links.size ? 3 : 8; // LinkedIn's 2026 connections page no longer lists links: look at more profiles instead
   let n = 0;
   for (const r of waiting) if (links.has(slug(r['LinkedIn URL']))) { await setRow(r, { Status: 'Connected', 'Connected On': engine.today(), Notes: note(r, 'accepted the connection request') }); n++; log(`${r.Name} accepted your connection request - send them the first message`); }
   // older requests that are not in the recent list: look at up to 3 profiles a check
-  const old = waiting.filter(r => !links.has(slug(r['LinkedIn URL'])) && (Date.now() - (st.profileChecked[r['Lead ID']] || 0)) > 24 * 3600e3 && String(r['Request Sent On'] || '') < engine.today()).slice(0, 3);
+  const old = waiting.filter(r => !links.has(slug(r['LinkedIn URL'])) && (Date.now() - (st.profileChecked[r['Lead ID']] || 0)) > 12 * 3600e3 && (Date.now() - new Date(String(r['Request Sent On'] || '2000-01-01')).getTime()) > 6 * 3600e3).slice(0, perCheck);
   for (const r of old) {
-    await sleep(rand(20e3, 45e3));
+    await sleep(FAST ? 200 : rand(20e3, 45e3));
     st.profileChecked[r['Lead ID']] = Date.now(); save();
     const s = await profileState(r).catch(() => '');
     if (s === 'connected') { await setRow(r, { Status: 'Connected', 'Connected On': engine.today(), Notes: note(r, 'accepted the connection request') }); n++; log(`${r.Name} accepted your connection request - send them the first message`); }
@@ -177,7 +178,7 @@ async function checkAccepted(rows) {
 }
 
 async function connectNext(s, rows) {
-  const queue = rows.filter(r => r.Status === 'To Connect' && slug(r['LinkedIn URL']) && !/auto-connect skipped/i.test(String(r.Notes || '')))
+  const queue = rows.filter(r => r.Status === 'To Connect' && slug(r['LinkedIn URL']) && !/auto-connect skipped \(v2\)/i.test(String(r.Notes || '')))
     .sort((a, b) => Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0));
   const r = queue[0]; if (!r) return '';
   const res = await sendRequest(r, s.note ? String(r['Connection Note'] || '').trim() : '');
@@ -191,7 +192,7 @@ async function connectNext(s, rows) {
   if (res.result === 'limit') { st.pausedUntil = Date.now() + 7 * 86400e3; save(); log('LinkedIn says you reached the weekly invitation limit. Auto-connect is paused for 7 days.', 'warn'); return 'LinkedIn weekly limit reached - paused for 7 days'; }
   const why = { noconnect: 'no Connect button (they may only allow Follow)', 'needs-email': 'LinkedIn asks for their email address', nosend: 'could not find the Send button' }[res.result] || res.result;
   st.fails++; save();
-  await setRow(r, { Notes: note(r, `auto-connect skipped: ${why} - please send this request yourself`) });
+  await setRow(r, { Notes: note(r, `auto-connect skipped (v2): ${why} - please send this request yourself`) });
   if (st.fails >= 4) { st.pausedUntil = Date.now() + 24 * 3600e3; st.fails = 0; save(); log('Auto-connect failed 4 times in a row (LinkedIn may have changed its page). Paused for 24 hours; send requests yourself from the LinkedIn tasks page.', 'warn'); }
   return `Skipped ${r.Name}: ${why}`;
 }
@@ -209,11 +210,14 @@ const OPEN_MSG = `
 const BOX = `all().find(el => el.getAttribute('contenteditable') === 'true' && vis(el) && (/msg-form|message/i.test(el.className + ' ' + (el.getAttribute('aria-label') || '')) || el.getAttribute('role') === 'textbox'))`;
 async function openThread(w, r) {
   await open(w, profileUrl(r['LinkedIn URL']));
-  const s = await run(w, STATE_JS);
-  if (!s.name) throw new Error('Could not read the profile page');
+  const s = await waitFor(w, `const s = (() => { ${STATE_JS} })(); return s.name ? s : null;`, 10000);
+  if (!s) return { ok: false, why: 'could not read the profile page' };
   if (s.state !== 'connected') return { ok: false, why: 'not connected yet' };
-  if (!(await run(w, OPEN_MSG))) return { ok: false, why: 'no Message button' };
-  await sleep(rand(2200, 3500));
+  const href = await run(w, `const m = btns(top).find(isMessage); return m && /^(https?:|\\/)/.test(m.getAttribute('href') || '') ? m.href : '';`);
+  if (href) await open(w, href); // 2026 layout: Message is a link to the conversation
+  else if (!(await run(w, OPEN_MSG))) return { ok: false, why: 'no Message button' };
+  const ready = await waitFor(w, `return !!(${BOX});`, 15000);
+  if (!ready) return { ok: false, why: 'message box did not open' };
   return { ok: true, name: s.name };
 }
 // the last message in the open conversation: who wrote it and what
@@ -229,7 +233,7 @@ async function sendMessage(r, text) {
     if (!box) return { result: 'skip', why: 'message box did not open' };
     w.webContents.insertText(String(text).slice(0, 7900));
     await sleep(rand(1500, 2600));
-    const sent = await run(w, `const s = btns().find(el => /msg-form__send|send-button/.test(el.className) || /^send$/i.test((el.innerText || '').trim()) || /^send$/i.test((el.getAttribute('aria-label') || '').trim())); if (s) { click(s); return true; } return false;`);
+    const sent = await waitFor(w, `const s = btns().find(el => /msg-form__send|send-button/.test(String(el.className)) || (el.type === 'submit' && /send/i.test(lab(el))) || /^send$/i.test(txt(el)) || /^send$/i.test((el.getAttribute('aria-label') || '').trim())); if (s) { click(s); return true; } return false;`, 6000);
     if (!sent) return { result: 'skip', why: 'could not find the Send button' };
     await sleep(rand(2000, 3200));
     const last = await run(w, LAST_MSG);
@@ -300,6 +304,35 @@ async function readReplies(rows, max = 6) {
   return n;
 }
 
+// "Connect 10 people now" (Aavo or the button): sends the next requests in the queue one by one, 1-2 minutes apart, within the daily limits
+let connJob = { running: false, total: 0, done: 0, last: '' };
+async function connectBatch(n) {
+  if (connJob.running) return `Already sending connection requests: ${connJob.done} of ${connJob.total} done.`;
+  if (!(await checkSignedIn())) return 'Sign in to LinkedIn first (LinkedIn tasks → Sign in to LinkedIn).';
+  const s = settings(await store.settings()), rows = await store.read('LinkedIn Leads', true), c = counts(rows);
+  if (Date.now() < st.pausedUntil) return 'LinkedIn showed a limit earlier, so connecting is paused until ' + new Date(st.pausedUntil).toLocaleString() + '.';
+  const left = Math.min(HARD_DAY - c.today, HARD_WEEK - c.week, n);
+  const queue = rows.filter(r => r.Status === 'To Connect' && slug(r['LinkedIn URL']) && !/auto-connect skipped \(v2\)/i.test(String(r.Notes || ''))).length;
+  if (left <= 0) return `Today's safe limit is reached (${c.today} sent today, ${c.week} this week). The rest go out tomorrow.`;
+  if (!queue) return 'Nobody is waiting to be connected. Say "find LinkedIn prospects" to add more.';
+  const total = Math.min(left, queue);
+  connJob = { running: true, total, done: 0, last: '' };
+  (async () => {
+    for (let i = 0; i < total; i++) {
+      while (busy) await sleep(3000);
+      busy = true;
+      let m = '';
+      try { m = await connectNext(s, await store.read('LinkedIn Leads', true)); if (m) { log(m); if (/^Connection request sent/.test(m)) connJob.done++; } }
+      catch (e) { log('Connect: ' + e.message, 'warn'); if (e.signOut) { busy = false; break; } }
+      finally { busy = false; onChange(); }
+      if (/weekly limit/i.test(m || '')) break;
+      if (i < total - 1) await sleep(FAST ? 300 : rand(60e3, 120e3));
+    }
+    connJob.running = false; connJob.last = `Sent ${connJob.done} of ${total} connection requests.`; st.lastResult = connJob.last; save(); log(connJob.last); onChange();
+  })();
+  return `✓ Sending ${total} connection request(s) now, one every 1-2 minutes, with your AI-written note. Progress shows on LinkedIn tasks.` + (total < n ? ` (${n - total} more would pass today's safe limit, or the queue is shorter.)` : '');
+}
+
 async function tick(force) {
   if (busy) return 'Auto-connect is already working.';
   busy = true;
@@ -357,7 +390,7 @@ async function status() {
     pausedUntil: st.pausedUntil > Date.now() ? new Date(st.pausedUntil).toISOString() : '',
     nextSendAt: st.nextSendAt > Date.now() ? new Date(st.nextSendAt).toISOString() : '',
     lastCheck: st.lastCheck ? new Date(st.lastCheck).toISOString() : '', lastResult: st.lastResult,
-    toSend: messageTasks(rows).length, msgToday: msgToday(rows), msgMax: HARD_MSG_DAY, msgJob,
+    toSend: messageTasks(rows).length, connJob, msgToday: msgToday(rows), msgMax: HARD_MSG_DAY, msgJob,
   };
 }
 
@@ -367,6 +400,6 @@ function start(opts = {}) {
   ses().setUserAgent(ua);
   checkSignedIn();
   if (!timer) { timer = setInterval(() => tick(false), 60e3); setTimeout(() => tick(false), 20e3); }
-  global.liBot = { status, sendAll, runNow: () => tick(true), signIn: () => signIn(opts.parent && opts.parent()), signOut };
+  global.liBot = { status, sendAll, connectBatch, runNow: () => tick(true), signIn: () => signIn(opts.parent && opts.parent()), signOut };
 }
-module.exports = { start, _t: { tick, sendAll, sendMessage, readReplies, messageTasks, msgJob: () => msgJob, sendRequest, checkAccepted, slug, settings, counts, st } };
+module.exports = { start, _t: { LIB, STATE_JS, BOX, tick, sendAll, sendMessage, readReplies, messageTasks, msgJob: () => msgJob, sendRequest, checkAccepted, slug, settings, counts, st } };

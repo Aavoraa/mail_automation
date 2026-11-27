@@ -12,10 +12,11 @@
     const size = () => { W = innerWidth; H = innerHeight; cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + 'px'; cv.style.height = H + 'px'; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); };
     size(); addEventListener('resize', size);
     addEventListener('mousemove', e => { mx = e.clientX; my = e.clientY; });
+    addEventListener('scroll', () => { window.scrollBusy = performance.now(); }, { passive: true, capture: true }); // pause while scrolling: smoother
     let last = 0;
     const frame = now => {
       requestAnimationFrame(frame);
-      if (document.hidden || now - last < 33) return; // ~30 fps is plenty for a background
+      if (document.hidden || now - last < 40 || (window.scrollBusy && now - window.scrollBusy < 150)) return; // ~30 fps is plenty for a background
       last = now; ctx.clearRect(0, 0, W, H);
       for (const p of P) {
         p.x += p.vx; p.y += p.vy; p.t += .02;

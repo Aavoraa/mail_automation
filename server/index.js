@@ -81,7 +81,7 @@ async function canEditConnections(req) {
 app.get('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
   const c = config.get(); const mask = v => v ? '•••• saved' : '';
-  res.json({ googlePlacesKey: mask(c.googlePlacesKey), tomtomKey: mask(c.tomtomKey), geoapifyKey: mask(c.geoapifyKey), hereKey: mask(c.hereKey), storage: c.storage === 'supabase' ? 'supabase' : 'sheet', supabaseUrl: c.supabaseUrl || '', supabaseKey: mask(c.supabaseKey), supabaseSql: require('./supabase').SETUP_SQL, sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), aiProvider: c.aiProvider === 'openai' ? 'openai' : 'gemini', leadSource: c.leadSource === 'apify' ? 'apify' : 'free', openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
+  res.json({ waPhoneId: c.waPhoneId || '', waToken: mask(c.waToken), googlePlacesKey: mask(c.googlePlacesKey), tomtomKey: mask(c.tomtomKey), geoapifyKey: mask(c.geoapifyKey), hereKey: mask(c.hereKey), storage: c.storage === 'supabase' ? 'supabase' : 'sheet', supabaseUrl: c.supabaseUrl || '', supabaseKey: mask(c.supabaseKey), supabaseSql: require('./supabase').SETUP_SQL, sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), aiProvider: c.aiProvider === 'openai' ? 'openai' : 'gemini', leadSource: c.leadSource === 'apify' ? 'apify' : 'free', openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
 }));
 app.post('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
@@ -124,6 +124,8 @@ app.post('/api/connections', wrap(async (req, res) => {
     patch.geminiKey = k;
   }
   if (b.aiProvider !== undefined) patch.aiProvider = b.aiProvider === 'openai' ? 'openai' : 'gemini';
+  if (b.waPhoneId !== undefined) { const v = String(b.waPhoneId).replace(/D/g, ''); if (v && v.length < 8) throw new Error('The WhatsApp phone number ID is a long number (WhatsApp → API setup → Phone number ID).'); patch.waPhoneId = v; }
+  if (b.waToken !== undefined && !String(b.waToken).startsWith('••')) { const v = String(b.waToken).replace(/s/g, ''); if (v && v.length < 40) throw new Error('That WhatsApp access token looks too short. Copy the whole token.'); patch.waToken = v; }
   for (const k of ['googlePlacesKey', 'tomtomKey', 'geoapifyKey', 'hereKey']) if (b[k] !== undefined && !String(b[k]).startsWith('••')) { const v = String(b[k]).replace(/[\s"'`]/g, ''); if (v && v.length < 10) throw new Error('That key looks too short. Copy the whole key.'); patch[k] = v; }
   if (b.leadSource !== undefined) patch.leadSource = b.leadSource === 'apify' ? 'apify' : 'free';
   if (b.apifyToken && !String(b.apifyToken).startsWith('••')) patch.apifyToken = String(b.apifyToken).trim();
@@ -164,6 +166,7 @@ app.post('/api/connections/test', wrap(async (req, res) => {
     if (!a) throw new Error(`${ai.aiName()} answered but not as expected.`);
     return res.json({ ok: true, msg: `${ai.aiName()} is working (model: ${ai.currentModel() || 'auto'}).` });
   }
+  if (what === 'whatsapp') return res.json({ ok: true, msg: await require('./whatsapp').test() });
   if (['googlePlaces', 'tomtom', 'geoapify', 'here'].includes(what)) return res.json({ ok: true, msg: await require('./free').testSource(what) });
   if (what === 'free') {
     const n = await require('./free').testSearch();
@@ -213,7 +216,12 @@ function lanUrls() {
 
 // ---------------------------------------------------------------- dashboard
 app.get('/api/dashboard', need(), wrap(async (req, res) => {
-  const [s, raw, allQ, li] = await Promise.all([store.settings(), store.read('Raw Leads'), store.read('Qualified Leads'), store.read('LinkedIn Leads')]);
+  const [s, raw, allQ, li, reps] = await Promise.all([store.settings(), store.read('Raw Leads'), store.read('Qualified Leads'), store.read('LinkedIn Leads'), store.read('Replies').catch(() => [])]);
+  // a "reply" is a real person writing back (email or LinkedIn): bounces and automatic messages are counted separately
+  const people = reps.filter(r => !['automatic', 'bounce'].includes(r.Category));
+  const liReplied = li.filter(r => String(r['Their Reply'] || '').trim());
+  const repliedLeads = new Set(people.map(r => r['Lead ID'] || r.From));
+  for (const r of raw) if (r['Last Reply On'] && ['interested', 'question', 'referral', 'not_interested', 'unsubscribe', 'other'].includes(r['Reply Category']) && !reps.some(x => x['Lead ID'] === r['Lead ID'])) repliedLeads.add(r['Lead ID']); // replies from before the Replies page existed
   const qual = allQ.filter(r => r.Stage === 'Qualified'), hot = allQ.filter(r => r.Stage !== 'Qualified');
   const t = new Date(Date.now() + 5.5 * 3600e3);
   const series = [];
@@ -221,7 +229,7 @@ app.get('/api/dashboard', need(), wrap(async (req, res) => {
     const d = new Date(t.getTime() - i * 86400000).toISOString().slice(0, 10);
     series.push({ date: d,
       found: raw.filter(r => r['Date Found'] === d).length + li.filter(r => r['Date Found'] === d).length,
-      emailed: engine.sentOn(raw, d), replies: raw.filter(r => r['Last Reply On'] === d).length,
+      emailed: engine.sentOn(raw, d), replies: people.filter(r => String(r['Received On']).slice(0, 10) === d).length,
       qualified: qual.filter(r => r['Confirmed On'] === d).length, interested: hot.filter(r => r['Date Qualified'] === d).length });
   }
   const by = (arr, k) => arr.reduce((m, r) => { const v = String(r[k] || 'Unknown'); m[v] = (m[v] || 0) + 1; return m; }, {});
@@ -229,7 +237,7 @@ app.get('/api/dashboard', need(), wrap(async (req, res) => {
   const lim = engine.dailyLimit(s);
   res.json({
     agent: { on: ['yes', 'on', 'true', '1'].includes(String(s.AGENT_ON).toLowerCase()), replyMode: s.REPLY_MODE, tone: s.TONE, todayLimit: lim.limit, sentToday: engine.sentOn(raw, today()), started: lim.started, startDate: s.START_DATE, sheetUrl: config.get().sheetUrl },
-    totals: { raw: raw.length, withEmail: c(r => r.Email), emailed: c(r => r['Pitched On']), replied: c(r => r['Last Reply On']), interested: hot.length, qualified: qual.length, linkedin: li.length, linkedinToConnect: li.filter(r => r.Status === 'To Connect').length, bounced: c(r => r.Status === 'Bounced'), doNotContact: c(r => r.Status === 'Do Not Contact'), waiting: c(r => r.Status === 'New') },
+    totals: { raw: raw.length, withEmail: c(r => r.Email), emailed: c(r => r['Pitched On']), replied: repliedLeads.size + liReplied.length, repliedEmail: repliedLeads.size, repliedLinkedIn: liReplied.length, automatic: reps.filter(r => r.Category === 'automatic').length, waitingAnswer: people.filter(r => /please answer|Not sent/i.test(r['Reply Status'] || '')).length, interested: hot.length, qualified: qual.length, linkedin: li.length, linkedinToConnect: li.filter(r => r.Status === 'To Connect').length, bounced: c(r => r.Status === 'Bounced'), doNotContact: c(r => r.Status === 'Do Not Contact'), waiting: c(r => r.Status === 'New') },
     series, rawStatus: by(raw, 'Status'), services: allQ.length ? by(allQ, 'Service Needed') : by(raw.filter(r => r['Best Service']), 'Best Service'), countries: by(raw, 'Country'),
     recentQualified: qual.slice(-8).reverse(), recentInterested: hot.slice(-8).reverse(),
   });
@@ -287,6 +295,9 @@ app.post('/api/linkedin/bot/signin', need('owner'), wrap(async (req, res) => { i
 app.post('/api/linkedin/bot/signout', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); await global.liBot.signOut(); res.json({ ok: true }); }));
 app.post('/api/linkedin/bot/switch', need('owner'), wrap(async (req, res) => { await store.saveSettings({ LINKEDIN_AUTO_CONNECT: req.body && req.body.on ? 'yes' : 'no' }); res.json({ ok: true }); }));
 // ---------------------------------------------------------------- alarms, inbox health, token dashboard, bills
+// One button: pitch everyone on every channel (email + LinkedIn + WhatsApp)
+app.post('/api/pitch/all', need('owner'), wrap(async (req, res) => res.json(await require('./pitch').pitchEverything(req.user.name))));
+app.get('/api/pitch/status', need(), wrap(async (req, res) => res.json(require('./pitch').status())));
 app.get('/api/alarms', need(), wrap(async (req, res) => res.json(engine.alarms())));
 app.delete('/api/alarms', need('owner', 'leader'), wrap(async (req, res) => { engine.clearAlarms(); res.json({ ok: true }); }));
 app.get('/api/inboxes', need('owner', 'leader'), wrap(async (req, res) => {
@@ -332,6 +343,17 @@ app.put('/api/bills', need('owner'), wrap(async (req, res) => {
   if (upd.length) await store.update('Bills', 'Item', upd); if (add.length) await store.append('Bills', add);
   res.json({ ok: true });
 }));
+// ---------------------------------------------------------------- Aavo, the in-app assistant (chat + voice)
+app.post('/api/assistant/chat', need(), wrap(async (req, res) => {
+  const b = req.body || {}; const history = (Array.isArray(b.history) ? b.history : []).slice(-12).map(m => ({ role: m.role === 'user' ? 'user' : 'aavo', text: String(m.text || '').slice(0, 2000), draft: m.draft, confirm: m.confirm && typeof m.confirm === 'object' ? { name: String(m.confirm.name || ''), args: m.confirm.args || {} } : undefined, done: !!m.done }));
+  res.json(await require('./assistant').chat(req.user, history, String(b.page || ''), b.auto === true));
+}));
+app.post('/api/assistant/confirm', need(), wrap(async (req, res) => {
+  const b = req.body || {}; res.json(await require('./assistant').act(String(b.name || ''), b.args || {}, req.user, true));
+}));
+app.post('/api/assistant/voice', need(), express.json({ limit: '20mb' }), wrap(async (req, res) => {
+  const b = req.body || {}; res.json({ text: await require('./ai').transcribe(String(b.audio || ''), String(b.mime || 'audio/webm')) });
+}));
 app.post('/api/leads/linkedin/:id/reply', need(), wrap(async (req, res) => {
   const b = req.body || {};
   if (b.channel === 'email' && req.user.role === 'linkedin') throw new Error('Only the owner or team leader can send emails.');
@@ -362,6 +384,7 @@ app.post('/api/leads/raw/:id/email', need('owner', 'leader'), wrap(async (req, r
   res.json({ ok: true, ...(await engine.emailLead(req.params.id, { to: b.to, subject: String(b.subject || '').slice(0, 300), text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
 }));
 
+app.post('/api/replies/answer-all', need('owner'), wrap(async (req, res) => res.json(await require('./assistant').act('answer_all_replies', {}, req.user, true))));
 app.post('/api/replies/:id/draft', need('owner', 'leader'), wrap(async (req, res) => res.json(await engine.replyDraft(req.params.id))));
 app.post('/api/replies/:id/answer', need('owner', 'leader'), wrap(async (req, res) => {
   await engine.answerReply(req.params.id, (req.body || {}).text, req.user.name);

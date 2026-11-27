@@ -5,7 +5,7 @@ const CITIES = 'Dubai, Abu Dhabi, Sharjah, Riyadh, Doha, Muscat, London, Manches
 
 const TABS = {
   'Settings': ['Key', 'Value', 'What it means'],
-  'Raw Leads': ['Lead ID', 'Date Found', 'Source', 'Business Name', 'Industry', 'City', 'Country', 'Website', 'Email', 'Phone', 'Contact Name', 'LinkedIn', 'Google Rating', 'Reviews', 'Website Issues', 'Best Service', 'Pitch Angle', 'Fit Score', 'Status', 'Pitched On', 'Email Subject', 'Message ID', 'Thread ID', 'Template Used', 'Follow-up 1 On', 'Follow-up 2 On', 'Last Reply On', 'Reply Category', 'Notes', 'Sent From', 'Call Status', 'Called By', 'What They Have', 'What They Need', 'Quality'],
+  'Raw Leads': ['Lead ID', 'Date Found', 'Source', 'Business Name', 'Industry', 'City', 'Country', 'Website', 'Email', 'Phone', 'Contact Name', 'LinkedIn', 'Google Rating', 'Reviews', 'Website Issues', 'Best Service', 'Pitch Angle', 'Fit Score', 'Status', 'Pitched On', 'Email Subject', 'Message ID', 'Thread ID', 'Template Used', 'Follow-up 1 On', 'Follow-up 2 On', 'Last Reply On', 'Reply Category', 'Notes', 'Sent From', 'Call Status', 'Called By', 'What They Have', 'What They Need', 'Quality', 'WhatsApp Sent On'],
   'Qualified Leads': ['Lead ID', 'Date Qualified', 'Source', 'Business Name', 'Contact Name', 'Email', 'LinkedIn', 'Phone', 'Website', 'Country', 'Service Needed', 'Budget', 'Timeline', 'Lead Score', 'Their Message', 'Summary', 'Next Step', 'Owner', 'Team Alerted', 'Our Replies', 'Last Contact On', 'Last Contact By', 'Stage', 'Confirmed On', 'Confirmed By', 'Call Done On', 'Decision Maker', 'Requirement Details'],
   'LinkedIn Leads': ['Lead ID', 'Date Found', 'Name', 'Title', 'Company', 'Industry', 'Location', 'LinkedIn URL', 'Fit Score', 'Best Service', 'Connection Note', 'First Message', 'Status', 'Their Reply', 'Suggested Reply', 'AI Category', 'Forwarded To Team', 'Handled By', 'Notes', 'Email', 'Email Found How', 'Request Sent On', 'Connected On', 'Message Sent On'],
   'Templates': ['Template ID', 'Name', 'Stage', 'Subject', 'Body', 'AI Personalise', 'Active', 'Created By', 'Updated On'],
@@ -54,6 +54,11 @@ const SETTINGS = [
   ['FIND_EVERY_HOURS', '8', 'Only when LEADS_PER_DAY is 0: how often to search for new businesses', 'Lead finding', 'number'],
   ['LINKEDIN_PER_RUN', '10', 'LinkedIn prospects added per search', 'Lead finding', 'number'],
   ['LINKEDIN_EVERY_HOURS', '12', 'How often to search for LinkedIn prospects', 'Lead finding', 'number'],
+  ['WHATSAPP_TEMPLATE', '', 'Name of your APPROVED WhatsApp message template (WhatsApp Manager → Message templates). WhatsApp only allows templates for the first message', 'WhatsApp', 'text'],
+  ['WHATSAPP_TEMPLATE_LANG', 'en', 'Language code of that template, e.g. en, en_US, ta', 'WhatsApp', 'text'],
+  ['WHATSAPP_TEMPLATE_PARAMS', 'name', 'name = the template has one variable {{1}} for their name. none = no variables', 'WhatsApp', 'select', ['name', 'none']],
+  ['WHATSAPP_PITCH_TO', 'interested', 'Who gets a WhatsApp pitch: interested = leads who replied or showed interest (safest, WhatsApp blocks numbers that many people report). pitched = everyone already emailed. all = every lead with a phone number', 'WhatsApp', 'select', ['interested', 'pitched', 'all']],
+  ['WHATSAPP_PER_DAY', '50', 'Most WhatsApp pitches a day (new WhatsApp numbers may start at 250 a day)', 'WhatsApp', 'number'],
   ['LINKEDIN_AUTO_CONNECT', 'no', 'Windows app only: send LinkedIn connection requests automatically from your own LinkedIn (sign in once on the LinkedIn tasks page). You are notified when someone accepts, to send them the first message. LinkedIn does not allow automation tools, so keep the number low', 'LinkedIn auto-connect', 'switch'],
   ['LINKEDIN_CONNECT_PER_DAY', '15', 'Connection requests per day (the app never sends more than 25 a day or 80 a week)', 'LinkedIn auto-connect', 'number'],
   ['LINKEDIN_CONNECT_HOURS', '10-18', 'Only send requests between these hours (India time), Monday to Saturday', 'LinkedIn auto-connect', 'text'],

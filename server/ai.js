@@ -59,7 +59,9 @@ async function modelChain(key, wanted) {
   const list = (await listModels(key).catch(() => [first])).filter(n => !retired.has(n));
   const flash = list.filter(n => /^gemini-\d+(\.\d+)?-flash(-lite)?(-latest)?$/.test(n)).sort((a, b) => verOf(b) - verOf(a) || /lite/.test(a) - /lite/.test(b));
   const gemma = list.filter(n => /^gemma-\d/.test(n) && /-it$/.test(n) && !/e\d+b|nano/i.test(n)).sort((a, b) => sizeOf(b) - sizeOf(a) || verOf(b) - verOf(a));
-  return [...new Set([first, ...flash.slice(0, 3), ...gemma.slice(0, 2)])];
+  // newest full models, then the lighter "lite" ones (often free when the big ones are overloaded), then Gemma
+  const full = flash.filter(n => !/lite/.test(n)), lite = flash.filter(n => /lite/.test(n));
+  return [...new Set([first, ...full.slice(0, 3), ...lite.slice(0, 2), ...gemma.slice(0, 2)])];
 }
 const isGemma = n => /^gemma/.test(n);
 const blockedModel = m => ((usage.models || {})[m] || 0) > Date.now();
@@ -79,7 +81,11 @@ const quotaDay = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los
 let usage = (() => { try { return JSON.parse(fs.readFileSync(USAGE, 'utf8')); } catch (e) { return {}; } })();
 let dailyLimit = 20;
 // Which AI writes the emails: free Google Gemini, unless ChatGPT (paid) is chosen on the Connections page.
-const provider = () => (config.get().aiProvider === 'openai' && config.get().openaiKey ? 'openai' : 'gemini');
+// If ChatGPT is chosen but its key is refused or has no credit, the free Gemini key (when saved) takes over until the key is fixed.
+let oaBroken = { until: 0, key: '', why: '' };
+const oaOk = () => !(oaBroken.until > Date.now() && oaBroken.key === String(config.get().openaiKey || '').slice(-8));
+const provider = () => (config.get().aiProvider === 'openai' && config.get().openaiKey && (oaOk() || !config.get().geminiKey) ? 'openai' : 'gemini');
+let onProblem = () => {};
 const aiName = () => (provider() === 'openai' ? 'ChatGPT' : 'Gemini');
 const activeKey = () => (provider() === 'openai' ? config.get().openaiKey : config.get().geminiKey);
 // a different key has its own quota: forget the old key's usage and pause (only a fingerprint is stored, never the key)
@@ -136,7 +142,14 @@ async function gemini(prompt, model, opts = {}) {
     if (u.blockedUntil > Date.now()) throw new AIUnavailable(`${aiName()} is out of requests, AI is back at ${new Date(u.blockedUntil).toLocaleString()}`, 'quota');
     if (!canUse(priority)) throw new AIUnavailable(`AI budget for today (${u.used}/${effLimit()}) is kept for ${priority === 'low' ? 'emails and customer replies' : 'customer replies'}`, 'budget');
   }
-  if (provider() === 'openai') return openaiCall(prompt, opts);
+  if (provider() === 'openai') {
+    try { return await openaiCall(prompt, opts); } catch (e) {
+      if (!(config.get().geminiKey && /not accepted|no credit|quota|billing|invalid.api.key/i.test(e.message))) throw e;
+      oaBroken = { until: Date.now() + 6 * 3600e3, key: String(config.get().openaiKey || '').slice(-8), why: e.message };
+      onProblem('ChatGPT is not working, using the free Gemini AI instead', e.message + ' Until you fix it on the Connections page, the free Gemini key writes the emails and replies.');
+      return gemini(prompt, model, { ...opts, attempt: 0 });
+    }
+  }
   const key = config.get().geminiKey;
   if (!key) throw new AIUnavailable('No free Gemini key yet (Connections page), so your templates are used', 'nokey');
   const chain = chainCache = await modelChain(key, model); usage.chain = chain;
@@ -152,13 +165,18 @@ async function gemini(prompt, model, opts = {}) {
   let res;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(use)}:generateContent`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: AbortSignal.timeout(90000), // never wait forever
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: AbortSignal.timeout(opts.fast ? 11000 : 90000), // never wait forever
       body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: isGemma(use) ? { temperature: 0.7 } : { temperature: 0.7, responseMimeType: 'application/json' } }), // Gemma has no JSON mode: the prompt asks for JSON and it is read from the text
     });
   } catch (e) {
+    // this model is too slow / hanging right now: set it aside for 30 minutes and use the next free model straight away
+    if (/timeout|aborted/i.test(e.message) && chain.some(m => m !== use && !blockedModel(m))) {
+      usage.models[use] = Date.now() + 30 * 60e3; saveUsage(); console.warn(`[ai] ${use} is not answering, trying the next model`);
+      return gemini(prompt, model, opts);
+    }
     // no internet / Google unreachable: wait a bit and retry, then give up for now (the job tries again later)
-    if (attempt < 2) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
-    throw new AIUnavailable('Gemini could not be reached (' + e.message + '), will try again later', 'network');
+    if (attempt < 2 && !opts.fast) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
+    throw new AIUnavailable(/timeout|aborted/i.test(e.message) ? "Google's free AI is too slow right now" : "Google's free AI could not be reached (" + e.message + ')', 'network');
   }
   today().used++; saveUsage(); meter.add('ai', 'requests'); meter.add('ai', provider() === 'openai' ? 'chatgpt' : 'gemini');
   const j = await res.json().catch(() => ({}));
@@ -177,12 +195,15 @@ async function gemini(prompt, model, opts = {}) {
       console.warn(`[ai] ${use}: daily free limit reached, switching to the next free model`);
       return gemini(prompt, model, opts);
     }
-    if (attempt < 3) { await new Promise(r => setTimeout(r, Math.max(wait, 20000 * (attempt + 1)))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
+    if (attempt < 3 && !opts.fast) { await new Promise(r => setTimeout(r, Math.max(wait, 20000 * (attempt + 1)))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
+    if (opts.fast && !opts.switched) { usage.models[use] = Date.now() + 60e3; return gemini(prompt, model, { ...opts, switched: true }); }
     throw new AIUnavailable('Gemini is busy (too many requests a minute), will try again later', 'rate');
   }
   if (res.status >= 500) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, 20000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
-    throw new AIUnavailable('Gemini is having problems (' + res.status + '), will try again later', 'server');
+    // this model is overloaded (503) or failing: set it aside for 20 minutes and use the next free model straight away
+    if (chain.some(m => m !== use && !blockedModel(m))) { usage.models[use] = Date.now() + 20 * 60e3; saveUsage(); console.warn(`[ai] ${use} answered ${res.status}, trying the next model`); return gemini(prompt, model, opts); }
+    if (attempt < 3 && !opts.fast) { await new Promise(r => setTimeout(r, 20000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
+    throw new AIUnavailable(res.status === 503 ? "Google's free AI is overloaded right now" : "Google's free AI is having problems (" + res.status + ')', 'server');
   }
   if (!res.ok) throw new Error('Gemini: ' + msg);
   const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).filter(p => !p.thought).map(p => p.text || '').join('');
@@ -218,11 +239,11 @@ async function openaiCall(prompt, opts = {}) {
   let res;
   try {
     res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(90000), // never wait forever
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(opts.fast ? 30000 : 90000), // never wait forever
       body: JSON.stringify({ model: use, messages: [{ role: 'user', content: prompt }], response_format: { type: 'json_object' } }),
     });
   } catch (e) {
-    if (attempt < 2) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
+    if (attempt < 2 && !opts.fast) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
     throw new AIUnavailable('ChatGPT could not be reached (' + e.message + '), will try again later', 'network');
   }
   today().used++; saveUsage(); meter.add('ai', 'requests'); meter.add('ai', provider() === 'openai' ? 'chatgpt' : 'gemini');
@@ -239,11 +260,11 @@ async function openaiCall(prompt, opts = {}) {
       throw new AIUnavailable('ChatGPT: your OpenAI account has no credit left. Add credit at platform.openai.com/settings/organization/billing', 'quota');
     }
     const wait = Number(res.headers && res.headers.get && res.headers.get('retry-after')) * 1000 || 0;
-    if (attempt < 3) { await new Promise(r => setTimeout(r, Math.max(wait, 10000 * (attempt + 1)))); return again(); }
+    if (attempt < 3 && !opts.fast) { await new Promise(r => setTimeout(r, Math.max(wait, 10000 * (attempt + 1)))); return again(); }
     throw new AIUnavailable('ChatGPT is busy (too many requests a minute), will try again later', 'rate');
   }
   if (res.status >= 500) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
+    if (attempt < 3 && !opts.fast) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
     throw new AIUnavailable('ChatGPT is having problems (' + res.status + '), will try again later', 'server');
   }
   if (!res.ok) throw new Error('ChatGPT: ' + msg);
@@ -361,7 +382,35 @@ function mockAI(prompt) {
   if (prompt.includes('A lead replied')) return { category: /interest|yes|call/i.test(prompt.split('Their reply')[1] || '') ? 'interested' : 'question', lead_score: 'Hot', service_needed: 'SEO', summary: 'Wants a call next week', next_step: 'Book a call', reply: 'Thank you, happy to set up a short call. Would Tuesday or Wednesday suit you?' };
   if (prompt.includes('connection_note')) return { fit_score: 8, best_service: 'Performance Marketing', connection_note: 'Hi, I liked your work, would be glad to connect.', first_message: 'Thanks for connecting. One idea that helps businesses like yours is...' };
   if (prompt.includes('suggested_reply')) return { category: 'interested', lead_score: 'Warm', service_needed: 'SEO', summary: 'Open to a call', next_step: 'Message on LinkedIn', suggested_reply: 'Great, would a 15-minute call this week work?' };
+  if (prompt.includes('You are Aavo')) { const m = (prompt.split('Conversation so far:')[1] || '').toLowerCase(); return /start|run/.test(m) ? { say: 'Sure.', action: { name: 'run_job', args: { job: 'find' } } } : /find|search/.test(m) ? { say: 'Here you go.', action: { name: 'search', args: { query: (m.match(/(?:find|search)s+([a-z ]+)/) || [, 'co'])[1].trim() } } } : { say: 'Here are your numbers.', action: { name: 'stats', args: {} } }; }
   return { subject: 'quick idea for you', body: 'Hi there, I noticed your website could load faster on mobile. Would a free short audit help?\n\nIf this isn\'t relevant, just reply \'no\' and I won\'t email again.' };
 }
 
-module.exports = { gemini, askAI: gemini, currentModel, bestModel, P, clean, fill, leadVars, firstName, AIUnavailable, aiUnavailable, canUse, aiStatus, setDailyLimit, configure, provider, aiName };
+
+// Speech to text for the assistant's microphone: free Gemini (audio in), or OpenAI's transcription when ChatGPT is chosen.
+async function transcribe(b64, mime) {
+  if (process.env.AAVORAA_MOCK === '1') return 'show today numbers';
+  if (!b64 || b64.length < 200) throw new Error('No sound was recorded. Hold the mic button and speak.');
+  if (b64.length > 14e6) throw new Error('The recording is too long. Keep it under a minute.');
+  if (provider() === 'openai') {
+    const fd = new FormData(); fd.append('model', 'gpt-4o-mini-transcribe'); fd.append('file', new Blob([Buffer.from(b64, 'base64')], { type: mime || 'audio/webm' }), 'voice.webm');
+    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: 'Bearer ' + config.get().openaiKey }, body: fd, signal: AbortSignal.timeout(60000) });
+    const j = await r.json().catch(() => ({})); meter.add('ai', 'requests');
+    if (!r.ok) throw new Error('Voice: ' + ((j.error && j.error.message) || r.status));
+    return String(j.text || '').trim();
+  }
+  const key = config.get().geminiKey;
+  if (!key) throw new AIUnavailable('Voice needs the free Gemini key (Connections page). You can still type.', 'nokey');
+  const chain = await modelChain(key, 'auto');
+  const use = chain.find(m => !isGemma(m) && !blockedModel(m));
+  if (!use) throw new AIUnavailable('The free voice model is used up for today. Please type instead.', 'quota');
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(use) + ':generateContent', { method: 'POST', signal: AbortSignal.timeout(60000),
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify({ contents: [{ parts: [{ text: 'Write down exactly what is said in this recording (English, Tamil or Tanglish; keep Tamil in English letters). Return only the words, nothing else.' }, { inline_data: { mime_type: (mime || 'audio/webm').split(';')[0], data: b64 } }] }], generationConfig: { temperature: 0 } }) });
+  const j = await r.json().catch(() => ({})); today().used++; saveUsage(); meter.add('ai', 'requests'); meter.add('ai', 'tokens', (j.usageMetadata || {}).totalTokenCount || 0);
+  if (r.status === 429) { usage.models[use] = Date.now() + 3600e3; saveUsage(); throw new AIUnavailable('Voice is busy right now, please type or try again in a minute.', 'rate'); }
+  if (!r.ok) throw new Error('Voice: ' + ((j.error && j.error.message) || r.status));
+  return ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map(p => p.text || '').join('').trim();
+}
+
+module.exports = { setProblemHandler: fn => { onProblem = fn; }, aiProblem: () => (oaOk() ? '' : oaBroken.why), transcribe, gemini, askAI: gemini, currentModel, bestModel, P, clean, fill, leadVars, firstName, AIUnavailable, aiUnavailable, canUse, aiStatus, setDailyLimit, configure, provider, aiName };

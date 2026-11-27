@@ -481,3 +481,41 @@ tbody tr:hover td{background:rgba(143,156,140,.10)}
 #intro{background:radial-gradient(circle at 50% 45%,#fbfcf9,#e4e9e1 75%)}
 #intro .tl{color:#a8782b}
 #intro .sparkle{background:#a33a55;box-shadow:0 0 8px rgba(163,58,85,.6)}
+
+/* ---- smoothness fixes ---- */
+/* no blur behind panels: blurring the moving particles every frame made scrolling stutter */
+.side,.panel,.kpi,.agentbar,.task,.tablewrap,.authcard{backdrop-filter:none;-webkit-backdrop-filter:none}
+.panel,.kpi,.agentbar,.task,.tablewrap,.authcard{background:rgba(255,255,255,.94)}
+/* big panels no longer jump under the mouse; only the small number cards lift */
+.panel:hover,.task:hover{transform:none}
+.kpi:hover{transform:translateY(-2px)}
+/* entrance animation only plays once and lets go afterwards (so hover works), and never on an auto refresh */
+.head,.agentbar,.kpis>*,.grid>*,.grid3>*,.tasks>*,.tablewrap{animation-fill-mode:backwards}
+body.refreshing .head,body.refreshing .agentbar,body.refreshing .kpis>*,body.refreshing .grid>*,body.refreshing .grid3>*,body.refreshing .tasks>*,body.refreshing .tablewrap,body.refreshing .bar i,body.refreshing .bcol i,body.refreshing .alarm{animation:none}
+/* room for the Aavo robot so it never covers buttons at the bottom of a page */
+.main{padding-bottom:120px}
+#aavo-fab{will-change:transform}
+
+/* ---- clarity: crisp solid text (gradient text renders soft on Windows), darker greys, calmer background ---- */
+:root{--text:#1f1a1c;--muted:#454f43;--faint:#636d60;--line:#dfe4da;--line-2:#c9d1c4}
+html,body{font-size:14.5px;-webkit-font-smoothing:auto;text-rendering:optimizeLegibility}
+.head h1{background:none;-webkit-background-clip:border-box;background-clip:border-box;color:#3d0f1c;font-weight:650}
+.kpi .value,.kpi.gold .value{background:none;-webkit-background-clip:border-box;background-clip:border-box;color:#2b2326;font-weight:650}
+.kpi.gold .value{color:#7a1f35}
+.kpi .label{color:#454f43;font-weight:500}
+.sub,.desc,.kpi .hint,.head .sub{color:#4f584c}
+.panel h2{color:#1f1a1c}
+.panel,.kpi,.agentbar,.task,.tablewrap,.authcard{background:#ffffff;border-color:#dfe4da}
+.nav a{color:#3c4639;font-weight:500}
+.nav .sec{color:#5f6a5c}
+thead th{color:#3c4639}
+td{color:#1f1a1c}
+.tag{font-weight:500}
+#fx{opacity:.45}
+.orb{opacity:.18!important}
+
+/* dashboard cards open their page */
+.kpi.go{cursor:pointer}
+.kpi.go:after{content:"→";position:absolute;right:14px;top:12px;color:#7a1f35;opacity:0;transform:translateX(-4px);transition:.25s}
+.kpi.go:hover:after,.kpi.go:focus-visible:after{opacity:1;transform:none}
+.kpi .hint b{color:#7a1f35}
