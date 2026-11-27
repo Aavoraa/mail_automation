@@ -17,8 +17,9 @@ async function apify(actor, input) {
   } finally { clearTimeout(t); }
 }
 // contacts = true adds Apify's contact enrichment: it reads each business website (also JavaScript sites) and returns its emails
-const mapsSearch = (industry, city, max, contacts = true) => apify('compass~crawler-google-places', { searchStringsArray: [industry], locationQuery: city, maxCrawledPlacesPerSearch: max, language: 'en', skipClosedPlaces: true, ...(contacts ? { scrapeContacts: true } : {}) });
-const googleSearch = (query) => apify('apify~google-search-scraper', { queries: query, maxPagesPerQuery: 1, resultsPerPage: 20, mobileResults: false, saveHtml: false, saveHtmlToKeyValueStore: false });
+const useApify = () => config.get().leadSource === 'apify' && !!config.get().apifyToken;
+const mapsSearch = (industry, city, max, contacts = true) => !MOCK && !useApify() ? require('./free').places(industry, city, max) : apify('compass~crawler-google-places', { searchStringsArray: [industry], locationQuery: city, maxCrawledPlacesPerSearch: max, language: 'en', skipClosedPlaces: true, ...(contacts ? { scrapeContacts: true } : {}) });
+const googleSearch = (query) => !MOCK && !useApify() ? require('./free').search(query) : apify('apify~google-search-scraper', { queries: query, maxPagesPerQuery: 1, resultsPerPage: 20, mobileResults: false, saveHtml: false, saveHtmlToKeyValueStore: false });
 
 async function getHtml(url) {
   if (MOCK) return '<html><title>Demo Co</title><meta name="viewport"> © 2021 info@democo.com <a href="/contact">Contact</a></html>' + 'x'.repeat(600);
@@ -137,4 +138,4 @@ function mockApify(actor, input = {}) {
   return [{ organicResults: [{ url: 'https://www.linkedin.com/in/jane-demo-' + Math.floor(Math.random() * 1e6), title: 'Jane Demo - Founder - Demo Interiors | LinkedIn', description: 'Founder at Demo Interiors, Dubai' }] }];
 }
 
-module.exports = { mapsSearch, googleSearch, getHtml, emailsFrom, findEmails, guessEmail, hasMx, decodeCf, strip, domainOf, checkSite, contactUrl, linkedinIn, bestEmail };
+module.exports = { useApify, mapsSearch, googleSearch, getHtml, emailsFrom, findEmails, guessEmail, hasMx, decodeCf, strip, domainOf, checkSite, contactUrl, linkedinIn, bestEmail };

@@ -5,6 +5,7 @@ const mail = require('./mail');
 const web = require('./web');
 const ai = require('./ai');
 const { gemini, P, clean, fill, leadVars, aiUnavailable } = ai;
+const meter = require('./usage');
 
 // ---------------------------------------------------------------- helpers
 const today = () => new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10);
@@ -40,18 +41,78 @@ function log(job, msg, level = 'info') {
 }
 const persist = () => { state.seen = state.seen.slice(-3000); config.saveState(state); };
 
+// ---------------------------------------------------------------- alarms: problems the team must see at once
+// (email not delivered / address not found, an inbox stopped working, a reply that could not be sent, AI out ...)
+// They pop up with an alarm sound and a red badge on the Dashboard.
+state.alarms = state.alarms || []; state.inboxHealth = state.inboxHealth || {};
+function alarm(kind, title, text) {
+  const id = 'A' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+  state.alarms.unshift({ id, at: new Date().toISOString(), kind, title: String(title).slice(0, 160), text: String(text || '').slice(0, 600) });
+  state.alarms = state.alarms.slice(0, 200); persist();
+  log('alarm', title + (text ? ' - ' + text : ''), 'warn');
+}
+// An inbox with a problem is paused and the others take over its emails.
+function pauseInbox(user, hours, reason) {
+  const h = state.inboxHealth[user] = state.inboxHealth[user] || {};
+  h.pausedUntil = Date.now() + hours * 3600e3; h.reason = reason; h.fails = 0; persist();
+  alarm('inbox', `Inbox paused: ${user}`, `${reason}. Paused for ${hours} hours; the other inboxes send its emails meanwhile.`);
+}
+const inboxPaused = user => ((state.inboxHealth[user] || {}).pausedUntil || 0) > Date.now();
+function sendProblem(user, err) {
+  const m = String(err && err.message || err);
+  if (/535|invalid login|username and password not accepted|authentication|application-specific password/i.test(m)) return pauseInbox(user, 6, 'Gmail did not accept the login (App Password changed or removed)'), true;
+  if (/5\.4\.5|daily user sending (quota|limit)|sending limit exceeded|too many (messages|recipients)|4\.7\.0|rate limit|temporarily (rejected|blocked)|421/i.test(m)) return pauseInbox(user, 24, 'Gmail sending limit reached'), true;
+  if (/suspended|disabled|account.*(locked|blocked)/i.test(m)) return pauseInbox(user, 48, 'Gmail account blocked or suspended'), true;
+  const h = state.inboxHealth[user] = state.inboxHealth[user] || {};
+  h.fails = (h.fails || 0) + 1; h.lastError = m.slice(0, 200); persist();
+  if (h.fails >= 3) return pauseInbox(user, 2, '3 sends failed in a row: ' + m.slice(0, 120)), true;
+  return false;
+}
+function inboxHealth(s) {
+  return mail.accounts().map(a => { const h = state.inboxHealth[a.user] || {}; return { user: a.user, main: a.main, paused: inboxPaused(a.user), pausedUntil: inboxPaused(a.user) ? new Date(h.pausedUntil).toISOString() : '', reason: inboxPaused(a.user) ? h.reason : '', limit: inboxLimit(s, a).limit }; });
+}
+ai.setProblemHandler((title, text) => { if (!state.alarms.some(x => x.title === title && Date.now() - new Date(x.at).getTime() < 6 * 3600e3)) alarm('ai', title, text); });
+function resumeInbox(user) { if (state.inboxHealth[user]) { state.inboxHealth[user].pausedUntil = 0; state.inboxHealth[user].fails = 0; persist(); } }
+
 async function templates(stage) {
   const all = await store.read('Templates');
   return all.filter(t => t.Stage === stage && yes(t.Active) && String(t.Body || '').trim());
 }
 
 // ---------------------------------------------------------------- 01 find leads
+// Without the AI, a simple score from what we can see: website problems we can help with, an email, a phone, ratings.
+function heuristicFit(L) {
+  const c = L.checks || {}; let s = 4;
+  if (c.websiteLoaded === false) return 3;
+  for (const bad of [!c.usesHttps, !c.hasMobileViewportTag, !c.hasMetaDescription, c.footerLooksOutdated, !c.hasGoogleAnalytics, !c.hasOnlineBooking, !c.hasStructuredData]) if (bad) s += 0.7;
+  if (Number(L.reviews) >= 20) s += 0.5; if (Number(L.rating) && Number(L.rating) < 4) s += 0.5;
+  return Math.min(10, Math.round(s));
+}
+function heuristicHave(L) {
+  const c = L.checks || {}, have = [c.builtWith && c.builtWith !== 'Other/Custom' ? `${c.builtWith} website` : 'website'];
+  have.push(c.hasMobileViewportTag ? 'mobile-friendly' : 'not mobile-friendly');
+  if (!c.usesHttps) have.push('no HTTPS'); if (c.footerLooksOutdated) have.push(`last updated ${c.footerYear}`);
+  have.push(c.hasOnlineBooking ? 'online booking' : 'no online booking'); if (c.hasWhatsAppButton) have.push('WhatsApp button');
+  if (!c.hasGoogleAnalytics) have.push('no analytics'); if (L.rating) have.push(`rating ${L.rating} (${L.reviews || 0} reviews)`);
+  return have.join(', ');
+}
+// Leads found today (all sources), for the daily target
+async function foundToday() { const d = today(); return (await store.read('Raw Leads')).filter(r => String(r['Date Found']) === d && !/^Import/i.test(String(r.Source || ''))).length; }
+// The finder runs every 30 minutes until LEADS_PER_DAY is reached (each run searches a new industry + city)
+async function findToTarget(s, opts = {}) {
+  const target = Number(s.LEADS_PER_DAY ?? 200);
+  if (!(target > 0)) return findLeads(s, opts);
+  const have = await foundToday();
+  if (have >= target && !opts.force) return `Daily target reached: ${have}/${target} leads found today`;
+  const max = Math.min(Number(s.LEADS_PER_SEARCH || 25), Math.max(1, target - have));
+  return (await findLeads(s, { ...opts, max })) + ` (today ${have}+ of ${target})`;
+}
 const apifyEmails = p => [...(p.emails || []), ...((p.contactDetails && p.contactDetails.emails) || []), p.email].filter(Boolean).map(e => String(e).toLowerCase().trim());
 // Best email for a business: what Apify found, then the site itself (home, contact, about pages, hidden addresses), then info@domain
 async function discoverEmail(s, website, domain, fromApify = []) {
   const site = await web.findEmails(website);
   const pool = [...new Set([...fromApify.filter(e => web.emailsFrom(e).length), ...site.emails])];
-  if (pool.length) return { email: web.bestEmail(pool, domain), all: pool, how: fromApify.length ? 'found by Apify' : 'website', html: site.html, contactHtml: site.contactHtml };
+  if (pool.length) return { email: web.bestEmail(pool, domain), all: pool, how: fromApify.length ? 'found in the business listing' : 'website', html: site.html, contactHtml: site.contactHtml };
   if (yes(s.GUESS_EMAILS ?? 'yes')) { const g = await web.guessEmail(domain); if (g) return { email: g, how: 'guessed (info@ of their domain, which accepts email)', html: site.html, contactHtml: site.contactHtml }; }
   return { email: '', how: '', html: site.html, contactHtml: site.contactHtml };
 }
@@ -61,7 +122,7 @@ async function findLeads(s, opts = {}) {
   if (!industries.length || !cities.length) throw new Error('Add industries and cities in Settings.');
   const industry = opts.industry || pick(industries), city = opts.city || pick(cities);
   const max = Number(opts.max || s.LEADS_PER_SEARCH || 10);
-  log('find', `Searching Google Maps: "${industry}" in ${city}`);
+  log('find', `Searching ${web.useApify() ? 'Google Maps (Apify)' : 'free map + web search'}: "${industry}" in ${city}`);
   const places = await web.mapsSearch(industry, city, max, yes(s.APIFY_CONTACTS ?? 'yes'));
   const existing = await store.read('Raw Leads');
   const seen = new Set();
@@ -69,6 +130,7 @@ async function findLeads(s, opts = {}) {
   const skip = ['facebook.com', 'instagram.com', 'linkedin.com', 'wa.me', 'whatsapp.com', 'google.com', 'youtube.com', 'twitter.com', 'x.com', 'linktr.ee', 'business.site', 'tiktok.com'];
   const rows = [];
   for (const p of places) {
+    if (rows.length >= max) break;
     if (!p || !p.title || !p.website) continue;
     const d = web.domainOf(p.website);
     if (!d || skip.some(x => d === x || d.endsWith('.' + x))) continue;
@@ -83,21 +145,24 @@ async function findLeads(s, opts = {}) {
     const L = { name: p.title, category: p.categoryName || industry, city: p.city || city, country: p.countryCode || '', website, rating: p.totalScore ?? '', reviews: p.reviewsCount ?? '', checks: web.checkSite(website, html), siteText: web.strip(html).slice(0, 2500) };
     let a = null;
     // lead analysis is "nice to have": it only uses the AI when enough is left for emails and customer replies
-    if (ai.canUse('low')) { try { a = await gemini(P.analyse(s, L), s.GEMINI_MODEL, { priority: 'low' }); } catch (e) { log('find', 'AI analysis skipped: ' + e.message, 'warn'); } }
+    if (ai.canUse('low')) { try { a = await gemini(P.analyse(s, L), s.GEMINI_MODEL, { priority: 'low' }); if (a) meter.add('leads', 'analysed'); } catch (e) { log('find', 'AI analysis skipped: ' + e.message, 'warn'); } }
     a = a || {};
     if (a.is_real_business === false) continue;
     const email = web.bestEmail(emails, d);
     const fit = Number(a.fit_score || 0);
     rows.push({
-      'Lead ID': newId('L'), 'Date Found': today(), Source: 'Google Maps', 'Business Name': p.title, Industry: L.category, City: L.city, Country: L.country,
+      'Lead ID': newId('L'), 'Date Found': today(), Source: p.source || 'Google Maps', 'Business Name': p.title, Industry: L.category, City: L.city, Country: L.country,
       Website: website, Email: email, Phone: p.phone || p.phoneUnformatted || '', 'Contact Name': a.contact_name || '', LinkedIn: web.linkedinIn(html + contact) || (p.linkedIns || [])[0] || '',
       'Google Rating': L.rating, Reviews: L.reviews, 'Website Issues': a.website_issues || '', 'Best Service': a.best_service || '', 'Pitch Angle': a.pitch_angle || '',
       // every lead with an email is emailed; the fit score only decides the order (best first)
-      'Fit Score': fit || '', Status: email ? 'New' : 'No Email',
+      'Fit Score': fit || heuristicFit(L) || '', Status: email ? 'New' : 'No Email',
+      'What They Have': clean(a.what_they_have || '').slice(0, 500) || heuristicHave(L), 'What They Need': clean(a.what_they_need || '').slice(0, 500),
+      Quality: email && (fit || heuristicFit(L)) >= Number(s.QUALITY_FIT_SCORE || 7) ? 'yes' : '',
       Notes: [a.language ? 'Site language: ' + a.language : '', found.how && found.how !== 'website' ? `Email ${found.how}` : ''].filter(Boolean).join(' | '),
     });
   }
   await store.append('Raw Leads', rows);
+  meter.add('leads', 'found', rows.length); meter.add('leads', 'quality', rows.filter(r => r.Quality === 'yes').length);
   const msg = `Added ${rows.length} new leads (${rows.filter(r => r.Status === 'New').length} ready to email, ${rows.filter(r => r.Status === 'No Email').length} without any email) from "${industry}" in ${city}`;
   log('find', msg); return msg;
 }
@@ -164,6 +229,7 @@ async function sendEmails(s, opts = {}) {
   const cap = {}, info = [];
   let total = 0, limitAll = 0;
   for (const a of accs) {
+    if (inboxPaused(a.user)) { cap[a.user] = 0; info.push(`${a.user.split('@')[0]} paused`); continue; }
     const { started, limit } = inboxLimit(s, a);
     const done = rows.filter(r => sentFrom(r, main) === a.user && [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(day)).length;
     let allowed = started ? limit - done : 0;
@@ -181,7 +247,8 @@ async function sendEmails(s, opts = {}) {
     if (!validEmail(r.Email) || !r['Message ID'] || !r['Pitched On']) continue;
     const age = days(r['Pitched On'], day);
     if (r.Status === 'Pitched' && age >= f1) due.push({ lead: r, stage: 1 });
-    else if (r.Status === 'Follow-up 1' && age >= f2) due.push({ lead: r, stage: 2 });
+    // follow-up 2: f2 days after the first email AND a few days after follow-up 1 (never two follow-ups in a row when one went out late)
+    else if (r.Status === 'Follow-up 1' && age >= f2 && days(r['Follow-up 1 On'] || r['Pitched On'], day) >= Math.max(2, f2 - f1)) due.push({ lead: r, stage: 2 });
   }
   // leads that "failed" only because the AI was out of requests or offline (older versions) are tried again
   const retry = r => r.Status === 'Send Failed' && !r['Pitched On'] && /Gemini|ChatGPT|fetch failed|AI /i.test(String(r.Notes || '').split(' | ').pop());
@@ -227,11 +294,25 @@ async function sendEmails(s, opts = {}) {
         const col = stage === 1 ? 'Follow-up 1 On' : 'Follow-up 2 On';
         await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: stage === 1 ? 'Follow-up 1' : 'Follow-up 2', [col]: day } }]);
       }
-      sent++;
+      sent++; meter.add('mail', 'sent'); if (state.inboxHealth[from]) state.inboxHealth[from].fails = 0;
       log('send', `${['Pitched', 'Follow-up 1 to', 'Follow-up 2 to'][stage]} ${lead['Business Name']} (${to}) from ${from}`);
     } catch (err) {
       log('send', `Could not email ${lead['Business Name']} from ${from}: ${err.message}`, 'error');
+      const paused = sendProblem(from, err);
+      // switch to another inbox that still has room today and try this lead again from there
+      const other = stage === 0 && Object.keys(cap).find(u => u !== from && cap[u] > 0 && !inboxPaused(u));
+      if (other) {
+        cap[other]--; if (paused) for (const j of jobs.slice(i + 1)) if (j.from === from && j.stage === 0) j.from = other;
+        try {
+          const text = e.body + '\n\n' + signature(s);
+          const r = await mail.send({ to, from: other, subject: e.subject || ('quick idea for ' + lead['Business Name']), text, fromName: senderName(s) });
+          await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Pitched', 'Pitched On': day, 'Email Subject': e.subject, 'Message ID': r.messageId, 'Thread ID': r.messageId, 'Template Used': e.tpl ? e.tpl.Name : 'AI', 'Sent From': r.from || other } }]);
+          sent++; meter.add('mail', 'sent'); log('send', `Switched inbox: pitched ${lead['Business Name']} (${to}) from ${other} instead of ${from}`);
+          continue;
+        } catch (err2) { sendProblem(other, err2); log('send', `Also failed from ${other}: ${err2.message}`, 'error'); }
+      }
       await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Send Failed', Notes: [lead.Notes, `${day}: ${err.message}`.slice(0, 200)].filter(Boolean).join(' | ') } }]).catch(() => {});
+      if (mail.accounts().every(a => inboxPaused(a.user))) { alarm('inbox', 'All sending inboxes are paused', 'No emails can go out until an inbox works again (Dashboard -> Inboxes).'); break; }
     }
     if (i < jobs.length - 1) await sleep(opts.fast || process.env.AAVORAA_MOCK === '1' ? 50 : 20000 + Math.random() * 25000);
   }
@@ -256,17 +337,31 @@ function safeReply(s, lead, m, text) {
     reply: `Hi ${name}, thank you for getting back to me. ${s.TEAM_LEADER_NAME ? s.TEAM_LEADER_NAME + ' from our team' : 'Someone from our team'} will reply to you personally with the details very shortly.${booking}` };
 }
 
+// Messages written by a machine (ticket systems, no-reply senders, "we received your message" confirmations):
+// never answered, so the agent does not talk to a robot or open support tickets.
+function isAutomatic(m, text) {
+  const from = String(m.from || '').toLowerCase(), t = (String(m.subject || '') + '\n' + text).toLowerCase();
+  if (m.auto) return true;
+  if (/^(no-?reply|do-?not-?reply|donotreply|noreply-|notifications?|notify|mailer|bounces?|alerts?|news(letter)?|marketing|updates?|system|automated?)[@.+_-]/.test(from)) return true;
+  const ticket = /type your reply above this line|reply above this line|ticket\s*(#|no\.?|number|id)|request\s*#\s*\d|case\s*#\s*\d|\(#\d{4,}\)|your (ticket|request|case) (has been|was) (received|created)|we('ve| have) received your (message|request|email|enquiry|inquiry)|thanks? (you )?for contacting|this is an automated|automatically generated|do not reply (to )?this|please do not reply|rate (our|your) (support|experience)|feedback on (your )?ticket|how did we do/;
+  return ticket.test(t);
+}
+
 async function checkReplies(s) {
   const since = new Date(Date.now() - 3 * 86400000);
   const seen = new Set(state.seen);
   // every sending inbox is checked; an inbox that cannot be read is reported but does not stop the others
   const msgs = [];
   for (const a of mail.accounts()) { try { msgs.push(...await mail.fetchNew(since, seen, a.user)); } catch (e) { log('replies', `Could not read ${a.user}: ${e.message}`, 'error'); } }
-  if (!msgs.length) return 'No new emails';
+  if (!msgs.length) { const later = await answerHeld(s).catch(e => { log('replies', 'AI follow-up: ' + e.message, 'warn'); return 0; }); return 'No new emails' + (later ? `, ${later} answered by AI after a holding reply` : ''); }
   const rows = await store.read('Raw Leads', true);
   const byEmail = {}, byMsg = {}, byDomain = {};
   const free = /^(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|icloud|me|aol|proton|protonmail|zoho|gmx|mail|yandex|rediffmail)\./;
   const domainOf = e => String(e || '').toLowerCase().trim().split('@')[1] || '';
+  const subj = t => String(t || '').toLowerCase().replace(/^((re|fwd?|aw|sv)\s*:\s*)+/i, '').replace(/\s+/g, ' ').trim();
+  const bySubject = {};
+  for (const r of rows) if (r['Pitched On'] && subj(r['Email Subject']).length > 12) bySubject[subj(r['Email Subject'])] = r;
+  state.savedReply = state.savedReply || {};
   for (const r of rows) {
     if (r.Email) { byEmail[String(r.Email).toLowerCase().trim()] = r; const d = domainOf(r.Email); if (d && !free.test(d) && r['Pitched On']) byDomain[d] = r; }
     if (r['Message ID']) byMsg[r['Message ID']] = r;
@@ -280,16 +375,37 @@ async function checkReplies(s) {
     if (/mailer-daemon|postmaster/.test(from)) {
       const low = String(m.text).toLowerCase();
       const lead = rows.find(r => r.Email && low.includes(String(r.Email).toLowerCase().trim()));
-      if (lead) { await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Bounced', 'Last Reply On': today(), 'Reply Category': 'bounce' } }]); log('replies', `Bounced: ${lead.Email}`); }
+      if (lead) {
+        await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Bounced', 'Reply Category': 'bounce' } }]); log('replies', `Bounced: ${lead.Email}`); // a bounce is not a reply
+        const why = (low.match(/address not found|user unknown|does not exist|no such user|mailbox (unavailable|full|not found)|recipient (address )?rejected|domain not found|message blocked|spam/) || ['not delivered'])[0];
+        alarm('bounce', `Email not delivered (${why}): ${lead.Email}`, `${lead['Business Name']}. The lead is marked Bounced and gets no more emails.`);
+        // too many bounces hurt the inbox: pause it before Gmail blocks it
+        const inbox = sentFrom(lead, mail.accounts()[0] && mail.accounts()[0].user), week = new Date(Date.now() - 7 * 86400e3).toISOString().slice(0, 10);
+        const mine = rows.filter(r => sentFrom(r, mail.accounts()[0].user) === inbox && String(r['Pitched On']) >= week);
+        const bounced = mine.filter(r => r.Status === 'Bounced' || r['Lead ID'] === lead['Lead ID']).length;
+        if (bounced >= 3 && bounced / Math.max(1, mine.length) > 0.05 && !inboxPaused(inbox)) pauseInbox(inbox, 24, `${bounced} of its last ${mine.length} emails bounced (over 5%) - check the lead emails`);
+      } else alarm('bounce', 'An email was not delivered', String(m.subject || '').slice(0, 120));
       done(m); continue;
     }
     // match by email thread first, then by their address, then by a colleague at the same company domain
-    const lead = [m.inReplyTo, ...(m.references || [])].map(x => byMsg[x]).find(Boolean) || byEmail[from] || (!free.test(domainOf(from)) && byDomain[domainOf(from)]);
+    const lead = [m.inReplyTo, ...(m.references || [])].map(x => byMsg[x]).find(Boolean) || byEmail[from] || (!free.test(domainOf(from)) && byDomain[domainOf(from)]) || (/^\s*re\s*:/i.test(m.subject || '') && bySubject[subj(m.subject)]);
     if (!lead || lead.Status === 'Do Not Contact') { done(m); continue; }
     const text = String(m.text || '').split(/\n\s*On [^\n]{5,200}wrote:|\n-{2,}\s*Original Message|\nFrom: [^\n]*\n(?:Sent|Date): /i)[0].split('\n').filter(l => !l.trim().startsWith('>')).join('\n').trim().slice(0, 3000);
+    if (isAutomatic(m, text)) {
+      // keep it on the Replies page for reference, but never answer a machine
+      await store.append('Replies', [{ 'Reply ID': newId('R'), 'Received On': new Date(m.date || Date.now()).toISOString().slice(0, 16).replace('T', ' '), 'Lead ID': lead['Lead ID'], 'Business Name': lead['Business Name'],
+        'Contact Name': m.fromName || '', From: from, Inbox: m.inbox || '', Subject: m.subject || '', 'Their Message': text.slice(0, 4000), Category: 'automatic', Summary: 'Automatic message (ticket system / auto-response), not a person',
+        'Our Reply': '', 'Reply Status': 'Automatic - no reply needed', 'Message ID': m.messageId || '', References: '' }]).catch(() => {});
+      log('replies', `${lead['Business Name']}: automatic message from ${from}, not answered`);
+      done(m); continue;
+    }
+    if (state.savedReply[m.messageId]) {
+      const sr = (await store.read('Replies', true)).find(x => x['Reply ID'] === state.savedReply[m.messageId]);
+      if (sr && sr['Answered By']) { done(m); delete state.savedReply[m.messageId]; delete state.firstSeen[m.messageId]; persist(); continue; }
+    }
     const tpls = await templates('Reply to interested lead');
     const ask = () => gemini(P.reply(s, { lead, subject: m.subject, text }, tpls.length ? pick(tpls) : null), s.GEMINI_MODEL, { priority: 'reply' });
-    let a;
+    let a, aiFailed = false;
     try { a = (await ask()) || (await ask()); } catch (e) {
       if (aiUnavailable(e)) {
         // wait for the AI first (best answer); if it is still out after REPLY_FALLBACK_MINUTES, send a safe reply without it
@@ -298,12 +414,19 @@ async function checkReplies(s) {
         const waited = (Date.now() - got) / 60000, limit = Number(s.REPLY_FALLBACK_MINUTES ?? 60);
         if (!(limit >= 0) || waited < limit) {
           // NOT marked as read: answered on a later check
+          if (!state.savedReply[m.messageId]) {
+            const rid = newId('R');
+            await store.append('Replies', [{ 'Reply ID': rid, 'Received On': new Date(m.date || Date.now()).toISOString().slice(0, 16).replace('T', ' '), 'Lead ID': lead['Lead ID'], 'Business Name': lead['Business Name'],
+              'Contact Name': m.fromName || lead['Contact Name'] || '', From: from, Inbox: m.inbox || '', Subject: m.subject || '', 'Their Message': text.slice(0, 4000), Category: 'new', Summary: 'New reply. The AI answers it as soon as it is available, or answer it yourself now.',
+              'Our Reply': '', 'Reply Status': 'New - please answer (AI will answer soon)', 'Message ID': m.messageId || '', References: [...(m.references || []), m.messageId].filter(Boolean).join(' ').slice(0, 1500) }]).then(() => { state.savedReply[m.messageId] = rid; persist(); }).catch(() => {});
+            await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { 'Last Reply On': today() } }]).catch(() => {});
+          }
           waiting++; log('replies', `Reply from ${lead['Business Name']} (${from}) is waiting for the AI${limit >= 0 ? ` (a short reply goes out after ${limit} min if the AI is still out)` : ''}: ${e.message}`, 'warn');
           continue;
         }
         log('replies', `AI still unavailable after ${Math.round(waited)} min, answering ${from} without it`, 'warn');
         a = safeReply(s, lead, m, text);
-      } else { log('replies', 'AI error: ' + e.message, 'warn'); a = null; }
+      } else { log('replies', 'AI error: ' + e.message, 'warn'); a = null; aiFailed = true; }
     }
     a = a || { category: 'other', reply: '', summary: 'AI could not read this reply - please check it in Gmail.' };
     const reply = clean(a.reply);
@@ -316,6 +439,7 @@ async function checkReplies(s) {
         const tries = state.tries[m.messageId] = (state.tries[m.messageId] || 0) + 1; persist();
         if (tries < 4) { log('replies', `Could not send the reply to ${from}: ${e.message}, will try again`, 'error'); waiting++; continue; } // retried on the next check
         log('replies', `Gave up replying to ${from} after ${tries} tries: ${e.message}. Please answer them from Gmail.`, 'error');
+        alarm('reply', `Reply could not be sent to ${from}`, `${lead['Business Name']}: ${e.message}. Please answer them from the Replies page.`);
         a.summary = (a.summary || '') + ' (reply could not be sent, please answer from Gmail)';
       }
     }
@@ -325,10 +449,12 @@ async function checkReplies(s) {
     if (map[a.category]) set.Status = map[a.category];
     await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set }]);
     // keep the full conversation for the Replies page: who wrote, what they said, what we answered
-    const how = !needsReply ? 'No reply needed' : !replied ? 'Not sent - please answer' : draft ? 'Draft saved in Gmail' : a.safe ? 'Holding reply sent - please answer' : 'Agent replied';
-    await store.append('Replies', [{ 'Reply ID': newId('R'), 'Received On': new Date(m.date || Date.now()).toISOString().slice(0, 16).replace('T', ' '), 'Lead ID': lead['Lead ID'], 'Business Name': lead['Business Name'],
+    const how = aiFailed ? 'Not sent - please answer' : !needsReply ? 'No reply needed' : !replied ? 'Not sent - please answer' : draft ? 'Draft saved in Gmail' : a.safe ? 'Holding reply sent - please answer' : 'Agent replied';
+    const row = { 'Reply ID': state.savedReply[m.messageId] || newId('R'), 'Received On': new Date(m.date || Date.now()).toISOString().slice(0, 16).replace('T', ' '), 'Lead ID': lead['Lead ID'], 'Business Name': lead['Business Name'],
       'Contact Name': m.fromName || lead['Contact Name'] || '', From: from, Inbox: m.inbox || '', Subject: m.subject || '', 'Their Message': text.slice(0, 4000), Category: a.category, Summary: a.summary || '',
-      'Our Reply': replied ? reply : '', 'Reply Status': how, 'Message ID': m.messageId || '', References: [...(m.references || []), m.messageId].filter(Boolean).join(' ').slice(0, 1500) }]).catch(e => log('replies', 'Could not save to the Replies tab: ' + e.message, 'warn'));
+      'Our Reply': replied ? reply : '', 'Reply Status': how, 'Message ID': m.messageId || '', References: [...(m.references || []), m.messageId].filter(Boolean).join(' ').slice(0, 1500) };
+    if (state.savedReply[m.messageId]) { const { 'Reply ID': rid, ...set } = row; await store.update('Replies', 'Reply ID', [{ key: rid, set }]).catch(e => log('replies', 'Could not update the Replies tab: ' + e.message, 'warn')); delete state.savedReply[m.messageId]; persist(); }
+    else await store.append('Replies', [row]).catch(e => log('replies', 'Could not save to the Replies tab: ' + e.message, 'warn'));
     log('replies', `${lead['Business Name']}: ${a.category}${replied ? (draft ? ', draft saved' : ', replied') : ''}`);
     if (a.category === 'interested') {
       const alert = yes(s.ALERT_TEAM_FOR_EMAIL_LEADS) && s.TEAM_LEADER_EMAIL;
@@ -342,8 +468,76 @@ async function checkReplies(s) {
         `${lead['Business Name']} (${from}) replied while the AI was unavailable. The agent sent a short holding reply saying our team will get back to them.\n\nWhat they said:\n${text.slice(0, 1500)}\n\nPlease answer them personally from Gmail (aavoraa.marketing@gmail.com).`);
     }
   }
-  return `Checked ${msgs.length} new emails, ${handled} from leads answered` + (waiting ? `, ${waiting} waiting to be answered` : '');
+  const later = await answerHeld(s).catch(e => { log('replies', 'AI follow-up: ' + e.message, 'warn'); return 0; });
+  return `Checked ${msgs.length} new emails, ${handled} from leads answered` + (waiting ? `, ${waiting} waiting to be answered` : '') + (later ? `, ${later} answered by AI after a holding reply` : '');
 }
+// Replies that only got a short holding reply (the AI was out) or could not be answered: once the AI is back,
+// it writes the real answer and sends it in the same email thread. Machines are marked and skipped.
+async function aiAnswerFor(s, r, extra = '') {
+  const lead = (await store.read('Raw Leads')).find(x => x['Lead ID'] === r['Lead ID']) || { 'Business Name': r['Business Name'], 'Contact Name': r['Contact Name'], Website: '' };
+  const tpls = await templates('Reply to interested lead');
+  const note = r['Our Reply'] ? `\n(Our earlier message in this thread: [[[${String(r['Our Reply']).slice(-800)}]]]. Do not repeat it; now give the real, helpful answer.)` : '';
+  return gemini(P.reply(s, { lead, subject: r.Subject, text: String(r['Their Message'] || '') + note + extra }, tpls.length ? pick(tpls) : null), s.GEMINI_MODEL, { priority: 'reply' });
+}
+async function answerHeld(s) {
+  if (!yes(s.AI_FOLLOW_UP_HELD ?? 'yes') || !ai.canUse('reply')) return 0;
+  const rows = (await store.read('Replies', true)).filter(r => /Holding reply sent|Not sent - please answer/i.test(r['Reply Status'] || '') && !r['Answered By']);
+  const week = new Date(Date.now() - 14 * 86400e3).toISOString().slice(0, 10);
+  let n = 0;
+  for (const r of rows.filter(r => String(r['Received On']).slice(0, 10) >= week).slice(0, 5)) {
+    if (isAutomatic({ from: r.From, subject: r.Subject }, String(r['Their Message'] || ''))) {
+      await store.update('Replies', 'Reply ID', [{ key: r['Reply ID'], set: { Category: 'automatic', 'Reply Status': 'Automatic - no reply needed', Summary: 'Automatic message (ticket system / auto-response), not a person' } }]);
+      continue;
+    }
+    let a;
+    try { a = await aiAnswerFor(s, r); } catch (e) { if (aiUnavailable(e)) break; throw e; }
+    const reply = clean((a || {}).reply);
+    if (!reply) { await store.update('Replies', 'Reply ID', [{ key: r['Reply ID'], set: { 'Reply Status': 'No reply needed', Category: (a && a.category) || r.Category } }]); continue; }
+    const draft = String(s.REPLY_MODE || 'send').toLowerCase() === 'draft';
+    const msg = { to: r.From, from: r.Inbox || undefined, subject: 'Re: ' + String(r.Subject || '').replace(/^re:\s*/i, ''), text: reply + '\n\n' + signature(s), fromName: senderName(s), inReplyTo: r['Message ID'] || undefined, references: r.References || r['Message ID'] || undefined };
+    if (draft) await mail.saveDraft(msg); else await mail.send(msg);
+    const stamp = new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 16).replace('T', ' ');
+    await store.update('Replies', 'Reply ID', [{ key: r['Reply ID'], set: { 'Our Reply': [r['Our Reply'], `[AI, ${stamp}] ${reply}`].filter(Boolean).join('\n\n').slice(0, 8000), 'Reply Status': draft ? 'Draft saved in Gmail' : 'Agent replied', 'Answered By': 'AI', Category: (a && a.category) || r.Category, Summary: (a && a.summary) || r.Summary } }]);
+    log('replies', `AI answered ${r['Business Name'] || r.From} (after the holding reply)`); n++;
+  }
+  return n;
+}
+// AI-written answer for the Replies page; a person reads it, edits it and presses Send
+async function replyDraft(id) {
+  const r = (await store.read('Replies', true)).find(x => x['Reply ID'] === id);
+  if (!r) throw new Error('Reply not found');
+  if (r.Category === 'automatic') throw new Error('This is an automatic message (not a person), so it does not need an answer.');
+  const s = await store.settings();
+  let a;
+  try { a = await aiAnswerFor(s, r); } catch (e) { if (aiUnavailable(e)) throw new Error('The AI is not available right now: ' + e.message); throw e; }
+  const reply = clean((a || {}).reply);
+  if (!reply) throw new Error('The AI thinks this message needs no answer' + (a && a.category ? ` (${String(a.category).replace(/_/g, ' ')})` : '') + '. You can still write one yourself.');
+  return { text: reply };
+}
+
+// Interested (Hot / Warm) -> Qualified: a person confirms the lead after the call: they want to work with us,
+// and their requirement is filled in. Works the same for email, LinkedIn and phone leads.
+async function confirmQualified(id, d, by) {
+  const q = (await store.read('Qualified Leads', true)).find(r => r['Lead ID'] === id);
+  if (!q) throw new Error('Lead not found');
+  const need = (k, label) => { const v = String(d[k] || '').trim(); if (!v) throw new Error(`Fill in "${label}" first.`); return v.slice(0, 2000); };
+  const set = { Stage: 'Qualified', 'Confirmed On': today(), 'Confirmed By': by,
+    'Service Needed': need('service', 'Service they want'), 'Requirement Details': need('requirement', 'Their requirement'),
+    'Call Done On': String(d.callOn || '').slice(0, 20) || today(), Budget: String(d.budget || '').slice(0, 200), Timeline: String(d.timeline || '').slice(0, 200),
+    'Decision Maker': String(d.decisionMaker || '').slice(0, 200), 'Next Step': String(d.nextStep || q['Next Step'] || '').slice(0, 500) };
+  if (!d.readyToWork) throw new Error('Tick "They want to work with AAVORAA" to confirm.');
+  await store.update('Qualified Leads', 'Lead ID', [{ key: id, set }]);
+  log('qualified', `${q['Business Name'] || q['Contact Name']} confirmed as a qualified lead by ${by}`);
+  const s = await store.settings();
+  if (s.TEAM_LEADER_EMAIL) await alertTeam(s, `Qualified lead confirmed: ${q['Business Name'] || q['Contact Name']} - ${set['Service Needed']}`,
+    `${by} confirmed this lead after the call. They want to work with ${s.COMPANY}.\n\nBusiness: ${q['Business Name'] || '-'}\nContact: ${q['Contact Name'] || '-'} | ${q.Email || '-'} | ${q.Phone || '-'}\nLinkedIn: ${q.LinkedIn || '-'}\nSource: ${q.Source}\n\nService: ${set['Service Needed']}\nRequirement: ${set['Requirement Details']}\nBudget: ${set.Budget || '-'}\nTimeline: ${set.Timeline || '-'}\nDecision maker: ${set['Decision Maker'] || '-'}\nCall on: ${set['Call Done On']}\nNext step: ${set['Next Step'] || '-'}`).catch(() => {});
+  return set;
+}
+async function unconfirmQualified(id, by) {
+  await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { Stage: 'Interested', 'Confirmed On': '', 'Confirmed By': '' } }]);
+  log('qualified', `${id} moved back to interested by ${by}`);
+}
+
 async function upsertQualified(q) {
   const rows = await store.read('Qualified Leads', true);
   if (rows.find(r => r['Lead ID'] === q['Lead ID'])) { const { 'Lead ID': id, ...set } = q; await store.update('Qualified Leads', 'Lead ID', [{ key: id, set }]); }
@@ -376,8 +570,10 @@ function linkedinPlain(s, p) {
 
 async function linkedinProspects(s, opts = {}) {
   const industry = opts.industry || pick(list(s.INDUSTRIES)), city = opts.city || pick(list(s.CITIES));
-  const query = `site:linkedin.com/in ("founder" OR "co-founder" OR "CEO" OR "owner" OR "managing director") "${industry}" "${city}"`;
-  log('linkedin', `Searching LinkedIn via Google: ${industry} in ${city}`);
+  // the free web search gives about 10 results a search and no OR: one search per role instead
+  const query = web.useApify() ? `site:linkedin.com/in ("founder" OR "co-founder" OR "CEO" OR "owner" OR "managing director") "${industry}" "${city}"`
+    : ['founder', 'CEO', 'owner'].map(role => `linkedin ${role} ${industry} ${city}`).join('\n');
+  log('linkedin', `Searching LinkedIn via ${web.useApify() ? 'Google (Apify)' : 'free web search'}: ${industry} in ${city}`);
   const pages = await web.googleSearch(query);
   const keyOf = u => (String(u || '').toLowerCase().split('/in/')[1] || '').split(/[/?#]/)[0];
   const existing = new Set((await store.read('LinkedIn Leads')).map(r => keyOf(r['LinkedIn URL'])).filter(Boolean));
@@ -441,7 +637,7 @@ async function syncQualifiedEmail(id, email) {
   const q = (await store.read('Qualified Leads', true)).find(r => r['Lead ID'] === id);
   if (q && String(q.Email || '').toLowerCase() !== String(email).toLowerCase()) await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { Email: email } }]);
 }
-const NOT_COMPANY_SITE =/(^|\.)(linkedin|facebook|instagram|twitter|x|youtube|wikipedia|crunchbase|glassdoor|indeed|zoominfo|bloomberg|yelp|tripadvisor|justdial|indiamart|google|apollo|rocketreach|signalhire|pitchbook|dnb|owler|ambitionbox|naukri|tracxn|medium|github|reddit|quora|amazon)\.[a-z.]+$/;
+const NOT_COMPANY_SITE =/(^|\.)(linkedin|facebook|instagram|twitter|x|youtube|wikipedia|crunchbase|glassdoor|indeed|zoominfo|bloomberg|yelp|tripadvisor|justdial|indiamart|google|apollo|rocketreach|signalhire|pitchbook|dnb|owler|ambitionbox|naukri|naukrigulf|jooble|bayt|gulftalent|monster|tracxn|medium|github|reddit|quora|amazon)\.[a-z.]+$/;
 // For LinkedIn prospects: Google their company, take its own website, find an email, add it to Raw Leads so it is pitched like any other lead
 async function emailLinkedInCompanies(s, rows) {
   const todo = rows.filter(r => r.Company && r.Company.length > 1).slice(0, 10);
@@ -562,7 +758,7 @@ async function dailyReport(s) {
 
 // ---------------------------------------------------------------- scheduler
 const JOBS = {
-  find: { name: 'Find leads (Google Maps)', fn: findLeads, every: s => Number(s.FIND_EVERY_HOURS || 8) * 3600e3 },
+  find: { name: 'Find leads (all sources, until the daily target)', fn: findToTarget, every: s => Number(s.LEADS_PER_DAY ?? 200) > 0 ? 30 * 60e3 : Number(s.FIND_EVERY_HOURS || 8) * 3600e3 },
   send: { name: 'Send pitches & follow-ups (every 5 min, paced)', fn: sendEmails, every: () => 5 * 60e3 },
   replies: { name: 'Read & answer replies', fn: checkReplies, every: () => 5 * 60e3 },
   linkedin: { name: 'Find LinkedIn prospects', fn: linkedinProspects, every: s => Number(s.LINKEDIN_EVERY_HOURS || 12) * 3600e3 },
@@ -627,7 +823,7 @@ async function tick() {
 function start() {
   if (timer) return;
   // add any new columns / settings this version needs to the Google Sheet
-  if (config.isConfigured()) store.ensureTabs().then(() => log('agent', 'Google Sheet tabs checked')).catch(e => log('agent', 'Could not update the Sheet tabs: ' + e.message, 'warn'));
+  if (config.isConfigured()) store.ensureTabs().then(() => log('agent', (store.kind && store.kind() === 'supabase' ? 'Supabase tables' : 'Google Sheet tabs') + ' checked')).catch(e => log('agent', 'Could not check the ' + (store.kind && store.kind() === 'supabase' ? 'Supabase tables' : 'Sheet tabs') + ': ' + e.message, 'warn'));
   timer = setInterval(tick, 60000); setTimeout(tick, 5000); log('agent', 'Agent engine started');
 }
 function status() {
@@ -793,15 +989,16 @@ async function callResult(id, status, note, by) {
   const what = status === 'Messaged' ? 'WhatsApp message sent' : 'call: ' + status;
   const set = { 'Call Status': status, 'Called By': by, Notes: [lead.Notes, `${today()}: ${what}${note ? ' - ' + note : ''} (${by})`].filter(Boolean).join(' | ').slice(0, 1500) };
   if (status === 'Not Interested') set.Status = 'Not Interested'; // stops follow-up emails too
-  if (status === 'Interested') set.Status = 'Interested';
+  if (status === 'Interested' || status === 'Ready to work') set.Status = 'Interested';
   await store.update('Raw Leads', 'Lead ID', [{ key: id, set }]);
   log('calls', `${lead['Business Name']}: ${status} (${by})`);
-  if (status === 'Interested') {
+  if (status === 'Interested' || status === 'Ready to work') {
     const s = await store.settings();
     const q = { 'Lead ID': id, 'Date Qualified': today(), Source: 'Phone / WhatsApp', 'Business Name': lead['Business Name'], 'Contact Name': lead['Contact Name'], Email: lead.Email, LinkedIn: lead.LinkedIn, Phone: lead.Phone, Website: lead.Website, Country: lead.Country, 'Service Needed': lead['Best Service'] || '', 'Lead Score': 'Hot', 'Their Message': note, Summary: 'Interested on the phone / WhatsApp', 'Next Step': 'Follow up and book a call', Owner: s.TEAM_LEADER_NAME || '', 'Team Alerted': s.TEAM_LEADER_EMAIL ? today() : '' };
     await upsertQualified(q);
+    if (status === 'Ready to work') await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { Stage: 'Qualified', 'Confirmed On': today(), 'Confirmed By': by, 'Call Done On': today(), 'Requirement Details': note || q['Service Needed'] || '' } }]);
     if (s.TEAM_LEADER_EMAIL) await alertTeam(s, `Hot lead (phone/WhatsApp): ${lead['Business Name']}`,
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, linkedinAnswer, _internals: { personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { confirmQualified, unconfirmQualified, alarms: () => state.alarms, clearAlarms: () => { state.alarms = []; persist(); }, inboxHealth, resumeInbox, foundToday, start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, replyDraft, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, linkedinAnswer, _internals: { heuristicFit, sendProblem, pauseInbox, inboxPaused, alarm, findToTarget, isAutomatic, answerHeld, personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

@@ -1,5 +1,6 @@
 // Gemini AI + all prompts.
 const config = require('./config');
+const meter = require('./usage');
 const { TONES } = require('./schema');
 
 let last = 0;
@@ -49,6 +50,25 @@ async function pickModel(key, wanted) {
   modelCache.chosen = bestModel(list);
   return modelCache.chosen;
 }
+// Free Gemini keys have a separate daily limit for EACH model. When one model's free requests are used up,
+// the next one in this list is used: the best Gemini Flash, other Gemini Flash / Flash-Lite models, then Google's
+// free Gemma models (much higher daily limits). So customer replies keep getting answered by AI all day.
+const sizeOf = n => { const m = String(n).match(/(\d+)b/); return m ? Number(m[1]) : 0; };
+async function modelChain(key, wanted) {
+  const first = await pickModel(key, wanted);
+  const list = (await listModels(key).catch(() => [first])).filter(n => !retired.has(n));
+  const flash = list.filter(n => /^gemini-\d+(\.\d+)?-flash(-lite)?(-latest)?$/.test(n)).sort((a, b) => verOf(b) - verOf(a) || /lite/.test(a) - /lite/.test(b));
+  const gemma = list.filter(n => /^gemma-\d/.test(n) && /-it$/.test(n) && !/e\d+b|nano/i.test(n)).sort((a, b) => sizeOf(b) - sizeOf(a) || verOf(b) - verOf(a));
+  // newest full models, then the lighter "lite" ones (often free when the big ones are overloaded), then Gemma
+  const full = flash.filter(n => !/lite/.test(n)), lite = flash.filter(n => /lite/.test(n));
+  return [...new Set([first, ...full.slice(0, 3), ...lite.slice(0, 2), ...gemma.slice(0, 2)])];
+}
+const isGemma = n => /^gemma/.test(n);
+const blockedModel = m => ((usage.models || {})[m] || 0) > Date.now();
+let chainCache = [];
+// the day's budget for Gemini = AI_DAILY_LIMIT for each Gemini model + 300 for Gemma (Google's own limits stop us earlier if needed)
+const knownChain = () => chainCache.length ? chainCache : (usage.chain || []);
+const effLimit = () => provider() !== 'gemini' || !knownChain().length ? dailyLimit : knownChain().reduce((t, m) => t + (isGemma(m) ? 300 : dailyLimit), 0);
 const gone = msg => /no longer available|not found|is not supported|deprecated|retired|update your code/i.test(msg);
 
 // ---- daily AI budget. Free Gemini keys allow only a few requests a day (20 per model in late 2026), and
@@ -60,23 +80,28 @@ const USAGE = path.join(config.dir, 'ai-usage.json');
 const quotaDay = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date());
 let usage = (() => { try { return JSON.parse(fs.readFileSync(USAGE, 'utf8')); } catch (e) { return {}; } })();
 let dailyLimit = 20;
-// Which AI writes the emails: ChatGPT (OpenAI) once its key is saved, otherwise Gemini.
-const provider = () => (config.get().openaiKey ? 'openai' : 'gemini');
+// Which AI writes the emails: free Google Gemini, unless ChatGPT (paid) is chosen on the Connections page.
+// If ChatGPT is chosen but its key is refused or has no credit, the free Gemini key (when saved) takes over until the key is fixed.
+let oaBroken = { until: 0, key: '', why: '' };
+const oaOk = () => !(oaBroken.until > Date.now() && oaBroken.key === String(config.get().openaiKey || '').slice(-8));
+const provider = () => (config.get().aiProvider === 'openai' && config.get().openaiKey && (oaOk() || !config.get().geminiKey) ? 'openai' : 'gemini');
+let onProblem = () => {};
 const aiName = () => (provider() === 'openai' ? 'ChatGPT' : 'Gemini');
 const activeKey = () => (provider() === 'openai' ? config.get().openaiKey : config.get().geminiKey);
 // a different key has its own quota: forget the old key's usage and pause (only a fingerprint is stored, never the key)
 const keyTag = () => require('crypto').createHash('sha256').update(provider() + ':' + String(activeKey() || '')).digest('hex').slice(0, 12);
 function today() {
   const tag = keyTag();
-  if (usage.key !== tag) usage = { day: quotaDay(), used: 0, blockedUntil: 0, key: tag };
-  else if (usage.day !== quotaDay()) usage = { day: quotaDay(), used: 0, blockedUntil: usage.blockedUntil || 0, key: tag };
+  if (usage.key !== tag) usage = { day: quotaDay(), used: 0, blockedUntil: 0, key: tag, models: {} };
+  else if (usage.day !== quotaDay()) usage = { day: quotaDay(), used: 0, blockedUntil: usage.blockedUntil || 0, key: tag, models: usage.models || {} };
+  if (!usage.models) { usage.models = {}; if (usage.blockedUntil > Date.now()) { usage.legacyBlock = usage.blockedUntil; usage.blockedUntil = 0; } } // older version blocked every model
   return usage;
 }
 const saveUsage = () => { try { fs.writeFileSync(USAGE, JSON.stringify(usage)); } catch (e) {} };
 function setDailyLimit(n) { const v = Math.floor(Number(n)); if (v > 0) dailyLimit = v; }
 function caps() {
-  const reserve = Math.max(1, Math.min(6, Math.ceil(dailyLimit * 0.3)));
-  return { reply: dailyLimit, send: Math.max(0, dailyLimit - reserve), low: Math.max(0, Math.floor(dailyLimit * 0.35)) };
+  const L = effLimit(), reserve = Math.max(1, Math.min(L > 100 ? 30 : 6, Math.ceil(L * 0.3)));
+  return { reply: L, send: Math.max(0, L - reserve), low: Math.max(0, Math.floor(L * 0.35)) };
 }
 // AI could not be used right now (quota, budget kept for replies, network). The work should wait, not fail for good.
 class AIUnavailable extends Error { constructor(msg, code) { super(msg); this.code = code; this.aiUnavailable = true; } }
@@ -88,7 +113,7 @@ function canUse(priority = 'low') {
 }
 function aiStatus() {
   const u = today();
-  return { day: u.day, used: u.used, limit: dailyLimit, caps: caps(), blockedUntil: u.blockedUntil > Date.now() ? new Date(u.blockedUntil).toISOString() : null };
+  return { day: u.day, used: u.used, limit: effLimit(), models: knownChain().map(m => ({ model: m, free: !blockedModel(m) })), caps: caps(), blockedUntil: u.blockedUntil > Date.now() ? new Date(u.blockedUntil).toISOString() : null };
 }
 // "Please retry in 3h36m59.6s" or RetryInfo "13019s" -> milliseconds
 function retryAfter(j, msg) {
@@ -109,30 +134,51 @@ async function gemini(prompt, model, opts = {}) {
     if (attempt === 0) { if (!canUse(priority)) throw new AIUnavailable(`AI budget for today is kept for ${priority === 'low' ? 'emails and replies' : 'customer replies'}`, 'budget'); today().used++; }
     return mockAI(prompt);
   }
+  if (attempt === 0 && provider() === 'gemini' && config.get().geminiKey && !chainCache.length) {
+    try { chainCache = await modelChain(config.get().geminiKey, model); today().chain = chainCache; saveUsage(); } catch (e) {}
+  }
   if (attempt === 0) {
     const u = today();
     if (u.blockedUntil > Date.now()) throw new AIUnavailable(`${aiName()} is out of requests, AI is back at ${new Date(u.blockedUntil).toLocaleString()}`, 'quota');
-    if (!canUse(priority)) throw new AIUnavailable(`AI budget for today (${u.used}/${dailyLimit}) is kept for ${priority === 'low' ? 'emails and customer replies' : 'customer replies'}`, 'budget');
+    if (!canUse(priority)) throw new AIUnavailable(`AI budget for today (${u.used}/${effLimit()}) is kept for ${priority === 'low' ? 'emails and customer replies' : 'customer replies'}`, 'budget');
   }
-  if (provider() === 'openai') return openaiCall(prompt, opts);
+  if (provider() === 'openai') {
+    try { return await openaiCall(prompt, opts); } catch (e) {
+      if (!(config.get().geminiKey && /not accepted|no credit|quota|billing|invalid.api.key/i.test(e.message))) throw e;
+      oaBroken = { until: Date.now() + 6 * 3600e3, key: String(config.get().openaiKey || '').slice(-8), why: e.message };
+      onProblem('ChatGPT is not working, using the free Gemini AI instead', e.message + ' Until you fix it on the Connections page, the free Gemini key writes the emails and replies.');
+      return gemini(prompt, model, { ...opts, attempt: 0 });
+    }
+  }
   const key = config.get().geminiKey;
-  if (!key) throw new Error('AI key is missing: add your ChatGPT (OpenAI) API key on the Connections page.');
-  const use = await pickModel(key, model);
+  if (!key) throw new AIUnavailable('No free Gemini key yet (Connections page), so your templates are used', 'nokey');
+  const chain = chainCache = await modelChain(key, model); usage.chain = chain;
+  if (usage.legacyBlock) { if (usage.legacyBlock > Date.now()) usage.models[chain[0]] = usage.legacyBlock; delete usage.legacyBlock; saveUsage(); }
+  const use = chain.find(m => !blockedModel(m));
+  if (!use) {
+    usage.blockedUntil = Math.min(...chain.map(m => usage.models[m] || Date.now() + 3600e3)); usage.used = Math.max(usage.used, effLimit()); saveUsage();
+    throw new AIUnavailable(`All free Gemini models are used up for today, AI is back at ${new Date(usage.blockedUntil).toLocaleString()}`, 'quota');
+  }
   const gap = 6500 - (Date.now() - last); // free tier: about 10 requests a minute
   if (gap > 0) await new Promise(r => setTimeout(r, gap));
   last = Date.now();
   let res;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(use)}:generateContent`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: AbortSignal.timeout(90000), // never wait forever
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.7, responseMimeType: 'application/json' } }),
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: AbortSignal.timeout(opts.fast ? 11000 : 90000), // never wait forever
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: isGemma(use) ? { temperature: 0.7 } : { temperature: 0.7, responseMimeType: 'application/json' } }), // Gemma has no JSON mode: the prompt asks for JSON and it is read from the text
     });
   } catch (e) {
+    // this model is too slow / hanging right now: set it aside for 30 minutes and use the next free model straight away
+    if (/timeout|aborted/i.test(e.message) && chain.some(m => m !== use && !blockedModel(m))) {
+      usage.models[use] = Date.now() + 30 * 60e3; saveUsage(); console.warn(`[ai] ${use} is not answering, trying the next model`);
+      return gemini(prompt, model, opts);
+    }
     // no internet / Google unreachable: wait a bit and retry, then give up for now (the job tries again later)
-    if (attempt < 2) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
-    throw new AIUnavailable('Gemini could not be reached (' + e.message + '), will try again later', 'network');
+    if (attempt < 2 && !opts.fast) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
+    throw new AIUnavailable(/timeout|aborted/i.test(e.message) ? "Google's free AI is too slow right now" : "Google's free AI could not be reached (" + e.message + ')', 'network');
   }
-  today().used++; saveUsage();
+  today().used++; saveUsage(); meter.add('ai', 'requests'); meter.add('ai', provider() === 'openai' ? 'chatgpt' : 'gemini');
   const j = await res.json().catch(() => ({}));
   const msg = (j.error && j.error.message) || String(res.status);
   if (!res.ok && (res.status === 404 || res.status === 400) && gone(msg) && attempt < 2) {
@@ -144,18 +190,24 @@ async function gemini(prompt, model, opts = {}) {
     const wait = retryAfter(j, msg);
     if (isDailyQuota(msg, wait)) {
       // the day's free requests are used up: stop asking until Google resets them, instead of failing every job
-      usage.blockedUntil = Date.now() + (wait || 3600e3); usage.used = Math.max(usage.used, dailyLimit); saveUsage();
-      throw new AIUnavailable(`Gemini daily free limit reached, AI is back at ${new Date(usage.blockedUntil).toLocaleString()}`, 'quota');
+      // this model's free requests are used up for today: switch to the next free model straight away
+      usage.models[use] = Date.now() + (wait || 3600e3); saveUsage();
+      console.warn(`[ai] ${use}: daily free limit reached, switching to the next free model`);
+      return gemini(prompt, model, opts);
     }
-    if (attempt < 3) { await new Promise(r => setTimeout(r, Math.max(wait, 20000 * (attempt + 1)))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
+    if (attempt < 3 && !opts.fast) { await new Promise(r => setTimeout(r, Math.max(wait, 20000 * (attempt + 1)))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
+    if (opts.fast && !opts.switched) { usage.models[use] = Date.now() + 60e3; return gemini(prompt, model, { ...opts, switched: true }); }
     throw new AIUnavailable('Gemini is busy (too many requests a minute), will try again later', 'rate');
   }
   if (res.status >= 500) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, 20000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
-    throw new AIUnavailable('Gemini is having problems (' + res.status + '), will try again later', 'server');
+    // this model is overloaded (503) or failing: set it aside for 20 minutes and use the next free model straight away
+    if (chain.some(m => m !== use && !blockedModel(m))) { usage.models[use] = Date.now() + 20 * 60e3; saveUsage(); console.warn(`[ai] ${use} answered ${res.status}, trying the next model`); return gemini(prompt, model, opts); }
+    if (attempt < 3 && !opts.fast) { await new Promise(r => setTimeout(r, 20000 * (attempt + 1))); return gemini(prompt, model, { ...opts, attempt: attempt + 1 }); }
+    throw new AIUnavailable(res.status === 503 ? "Google's free AI is overloaded right now" : "Google's free AI is having problems (" + res.status + ')', 'server');
   }
   if (!res.ok) throw new Error('Gemini: ' + msg);
   const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).filter(p => !p.thought).map(p => p.text || '').join('');
+  const um = j.usageMetadata || {}; meter.add('ai', 'tokens', um.totalTokenCount || 0); meter.add('ai', 'tokensIn', um.promptTokenCount || 0); meter.add('ai', 'tokensOut', (um.totalTokenCount || 0) - (um.promptTokenCount || 0));
   return parseJSON(text);
 }
 // ---- ChatGPT (OpenAI API). Needs an API key from platform.openai.com with credit (a ChatGPT Plus plan does not include it).
@@ -187,14 +239,14 @@ async function openaiCall(prompt, opts = {}) {
   let res;
   try {
     res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(90000), // never wait forever
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(opts.fast ? 30000 : 90000), // never wait forever
       body: JSON.stringify({ model: use, messages: [{ role: 'user', content: prompt }], response_format: { type: 'json_object' } }),
     });
   } catch (e) {
-    if (attempt < 2) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
+    if (attempt < 2 && !opts.fast) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
     throw new AIUnavailable('ChatGPT could not be reached (' + e.message + '), will try again later', 'network');
   }
-  today().used++; saveUsage();
+  today().used++; saveUsage(); meter.add('ai', 'requests'); meter.add('ai', provider() === 'openai' ? 'chatgpt' : 'gemini');
   const j = await res.json().catch(() => ({}));
   const err = j.error || {}, msg = err.message || String(res.status);
   if (res.status === 401) throw new Error('ChatGPT: this API key was not accepted. Create a new one at platform.openai.com/api-keys and paste it on the Connections page.');
@@ -208,15 +260,16 @@ async function openaiCall(prompt, opts = {}) {
       throw new AIUnavailable('ChatGPT: your OpenAI account has no credit left. Add credit at platform.openai.com/settings/organization/billing', 'quota');
     }
     const wait = Number(res.headers && res.headers.get && res.headers.get('retry-after')) * 1000 || 0;
-    if (attempt < 3) { await new Promise(r => setTimeout(r, Math.max(wait, 10000 * (attempt + 1)))); return again(); }
+    if (attempt < 3 && !opts.fast) { await new Promise(r => setTimeout(r, Math.max(wait, 10000 * (attempt + 1)))); return again(); }
     throw new AIUnavailable('ChatGPT is busy (too many requests a minute), will try again later', 'rate');
   }
   if (res.status >= 500) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
+    if (attempt < 3 && !opts.fast) { await new Promise(r => setTimeout(r, 15000 * (attempt + 1))); return again(); }
     throw new AIUnavailable('ChatGPT is having problems (' + res.status + '), will try again later', 'server');
   }
   if (!res.ok) throw new Error('ChatGPT: ' + msg);
   oaCache.chosen = oaCache.chosen || use;
+  const uu = j.usage || {}; meter.add('ai', 'tokens', uu.total_tokens || 0); meter.add('ai', 'tokensIn', uu.prompt_tokens || 0); meter.add('ai', 'tokensOut', uu.completion_tokens || 0);
   return parseJSON(((j.choices && j.choices[0] && j.choices[0].message) || {}).content);
 }
 // called by the agent before each job with the Settings values
@@ -281,13 +334,15 @@ Return ONLY a JSON object:
  "best_service": "the ONE most relevant service from our list",
  "website_issues": "2-3 short, specific, polite observations separated by ' ; ' (based only on the data above)",
  "pitch_angle": "one sentence: the specific opportunity we would mention to them",
+ "what_they_have": "one short line: what they already have online (website quality, booking, social, reviews...)",
+ "what_they_need": "one short line: their most likely requirement we can solve, and how we would develop it",
  "contact_name": "owner or founder full name only if clearly written in the website text, else empty",
  "language": "main language of the website, e.g. English",
  "is_real_business": true or false}`;
   },
   email(s, lead, stage, tpl) {
     const L = lead;
-    const base = `${who(s)}\n${rules(s)} ${langRule(s, L)}\n\nLead:\nBusiness: ${L['Business Name']}\nContact name: ${L['Contact Name'] || 'unknown, so greet with "Hi there" or "Hi ' + L['Business Name'] + ' team"'}\nIndustry: ${L.Industry} | Location: ${L.City} ${L.Country}\nWebsite: ${L.Website}\nWhat we noticed: ${L['Website Issues'] || 'not analysed'}\nBest service for them: ${L['Best Service'] || 'choose the most relevant one from our services'}\nOpportunity: ${L['Pitch Angle'] || ''}`;
+    const base = `${who(s)}\n${rules(s)} ${langRule(s, L)}\n\nLead:\nBusiness: ${L['Business Name']}\nContact name: ${L['Contact Name'] || 'unknown, so greet with "Hi there" or "Hi ' + L['Business Name'] + ' team"'}\nIndustry: ${L.Industry} | Location: ${L.City} ${L.Country}\nWebsite: ${L.Website}\nWhat we noticed: ${L['Website Issues'] || 'not analysed'}\nWhat they already have: ${L['What They Have'] || 'unknown'}\nWhat they most likely need (our AI agent's analysis): ${L['What They Need'] || 'unknown'}\nBest service for them: ${L['Best Service'] || 'choose the most relevant one from our services'}\nOpportunity: ${L['Pitch Angle'] || ''}`;
     let task;
     if (stage === 0) task = `Write the FIRST cold email (70-120 words). Open with one specific, genuine observation about their business. In one or two sentences explain how the best service could help them. End with a soft, low-pressure question, for example offering a free short audit or a 15-minute call. Final line exactly: "If this isn't relevant, just reply 'no' and I won't email again."\nSubject: 2-6 words, mostly lowercase, personal, no clickbait.`;
     else if (stage === 1) task = `Our first email (subject "${L['Email Subject']}") got no reply. Write a short, friendly FOLLOW-UP (40-70 words) that adds one new useful idea or quick tip related to the best service. No guilt-tripping. End with a simple yes/no question. Subject must be "".`;
@@ -327,7 +382,35 @@ function mockAI(prompt) {
   if (prompt.includes('A lead replied')) return { category: /interest|yes|call/i.test(prompt.split('Their reply')[1] || '') ? 'interested' : 'question', lead_score: 'Hot', service_needed: 'SEO', summary: 'Wants a call next week', next_step: 'Book a call', reply: 'Thank you, happy to set up a short call. Would Tuesday or Wednesday suit you?' };
   if (prompt.includes('connection_note')) return { fit_score: 8, best_service: 'Performance Marketing', connection_note: 'Hi, I liked your work, would be glad to connect.', first_message: 'Thanks for connecting. One idea that helps businesses like yours is...' };
   if (prompt.includes('suggested_reply')) return { category: 'interested', lead_score: 'Warm', service_needed: 'SEO', summary: 'Open to a call', next_step: 'Message on LinkedIn', suggested_reply: 'Great, would a 15-minute call this week work?' };
+  if (prompt.includes('You are Aavo')) { const m = (prompt.split('Conversation so far:')[1] || '').toLowerCase(); return /start|run/.test(m) ? { say: 'Sure.', action: { name: 'run_job', args: { job: 'find' } } } : /find|search/.test(m) ? { say: 'Here you go.', action: { name: 'search', args: { query: (m.match(/(?:find|search)s+([a-z ]+)/) || [, 'co'])[1].trim() } } } : { say: 'Here are your numbers.', action: { name: 'stats', args: {} } }; }
   return { subject: 'quick idea for you', body: 'Hi there, I noticed your website could load faster on mobile. Would a free short audit help?\n\nIf this isn\'t relevant, just reply \'no\' and I won\'t email again.' };
 }
 
-module.exports = { gemini, askAI: gemini, currentModel, bestModel, P, clean, fill, leadVars, firstName, AIUnavailable, aiUnavailable, canUse, aiStatus, setDailyLimit, configure, provider, aiName };
+
+// Speech to text for the assistant's microphone: free Gemini (audio in), or OpenAI's transcription when ChatGPT is chosen.
+async function transcribe(b64, mime) {
+  if (process.env.AAVORAA_MOCK === '1') return 'show today numbers';
+  if (!b64 || b64.length < 200) throw new Error('No sound was recorded. Hold the mic button and speak.');
+  if (b64.length > 14e6) throw new Error('The recording is too long. Keep it under a minute.');
+  if (provider() === 'openai') {
+    const fd = new FormData(); fd.append('model', 'gpt-4o-mini-transcribe'); fd.append('file', new Blob([Buffer.from(b64, 'base64')], { type: mime || 'audio/webm' }), 'voice.webm');
+    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: 'Bearer ' + config.get().openaiKey }, body: fd, signal: AbortSignal.timeout(60000) });
+    const j = await r.json().catch(() => ({})); meter.add('ai', 'requests');
+    if (!r.ok) throw new Error('Voice: ' + ((j.error && j.error.message) || r.status));
+    return String(j.text || '').trim();
+  }
+  const key = config.get().geminiKey;
+  if (!key) throw new AIUnavailable('Voice needs the free Gemini key (Connections page). You can still type.', 'nokey');
+  const chain = await modelChain(key, 'auto');
+  const use = chain.find(m => !isGemma(m) && !blockedModel(m));
+  if (!use) throw new AIUnavailable('The free voice model is used up for today. Please type instead.', 'quota');
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(use) + ':generateContent', { method: 'POST', signal: AbortSignal.timeout(60000),
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify({ contents: [{ parts: [{ text: 'Write down exactly what is said in this recording (English, Tamil or Tanglish; keep Tamil in English letters). Return only the words, nothing else.' }, { inline_data: { mime_type: (mime || 'audio/webm').split(';')[0], data: b64 } }] }], generationConfig: { temperature: 0 } }) });
+  const j = await r.json().catch(() => ({})); today().used++; saveUsage(); meter.add('ai', 'requests'); meter.add('ai', 'tokens', (j.usageMetadata || {}).totalTokenCount || 0);
+  if (r.status === 429) { usage.models[use] = Date.now() + 3600e3; saveUsage(); throw new AIUnavailable('Voice is busy right now, please type or try again in a minute.', 'rate'); }
+  if (!r.ok) throw new Error('Voice: ' + ((j.error && j.error.message) || r.status));
+  return ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map(p => p.text || '').join('').trim();
+}
+
+module.exports = { setProblemHandler: fn => { onProblem = fn; }, aiProblem: () => (oaOk() ? '' : oaBroken.why), transcribe, gemini, askAI: gemini, currentModel, bestModel, P, clean, fill, leadVars, firstName, AIUnavailable, aiUnavailable, canUse, aiStatus, setDailyLimit, configure, provider, aiName };

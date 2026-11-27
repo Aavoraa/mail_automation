@@ -81,12 +81,24 @@ async function canEditConnections(req) {
 app.get('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
   const c = config.get(); const mask = v => v ? '•••• saved' : '';
-  res.json({ sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
+  res.json({ waPhoneId: c.waPhoneId || '', waToken: mask(c.waToken), googlePlacesKey: mask(c.googlePlacesKey), tomtomKey: mask(c.tomtomKey), geoapifyKey: mask(c.geoapifyKey), hereKey: mask(c.hereKey), storage: c.storage === 'supabase' ? 'supabase' : 'sheet', supabaseUrl: c.supabaseUrl || '', supabaseKey: mask(c.supabaseKey), supabaseSql: require('./supabase').SETUP_SQL, sheetUrl: c.sheetUrl || '', serviceAccountEmail: c.serviceAccount ? c.serviceAccount.client_email : '', gmailUser: c.gmailUser || '', gmailAppPassword: mask(c.gmailAppPassword), aiProvider: c.aiProvider === 'openai' ? 'openai' : 'gemini', leadSource: c.leadSource === 'apify' ? 'apify' : 'free', openaiKey: mask(c.openaiKey), geminiKey: mask(c.geminiKey), apifyToken: mask(c.apifyToken), inboxes: (c.extraInboxes || []).map(x => ({ user: x.user, added: x.added })), network: lanUrls() });
 }));
 app.post('/api/connections', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
   const b = req.body || {}; const patch = {};
   if (b.sheetUrl) patch.sheetUrl = String(b.sheetUrl).trim();
+  if (b.supabaseUrl !== undefined && String(b.supabaseUrl).trim()) {
+    const u = String(b.supabaseUrl).trim().replace(/\/+$/, '').replace(/\/rest\/v1$/, '');
+    if (!/^https:\/\/[a-z0-9-]+\.supabase\.(co|in)$/i.test(u) && !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(u)) throw new Error('The Supabase Project URL looks like https://abcdefgh.supabase.co (Project Settings → Data API).');
+    patch.supabaseUrl = u;
+  }
+  if (b.supabaseKey && !String(b.supabaseKey).startsWith('••')) {
+    const k = String(b.supabaseKey).replace(/[\s\u200b-\u200d\ufeff"'`]/g, '');
+    if (k.length < 30) throw new Error('That does not look like a full Supabase key. Copy the secret key from Project Settings → API Keys.');
+    patch.supabaseKey = k;
+  }
+  // choosing Google Sheet again is allowed any time; moving to Supabase goes through "Move to Supabase" (it copies the data first)
+  if (b.storage === 'sheet') patch.storage = 'sheet';
   if (b.serviceAccountJson) {
     let sa; try { sa = JSON.parse(b.serviceAccountJson); } catch (e) { throw new Error('That key file is not valid JSON. Upload the .json file Google gave you.'); }
     if (!sa.client_email || !sa.private_key) throw new Error('This JSON is not a service account key (missing client_email / private_key).');
@@ -105,7 +117,17 @@ app.post('/api/connections', wrap(async (req, res) => {
     }
     patch.openaiKey = k;
   }
-  if (b.geminiKey && !String(b.geminiKey).startsWith('••')) patch.geminiKey = String(b.geminiKey).trim();
+  if (b.geminiKey && !String(b.geminiKey).startsWith('••')) {
+    const k = String(b.geminiKey).replace(/[\s\u200b-\u200d\ufeff"'`]/g, '');
+    if (/^sk-/.test(k)) throw new Error('That is a ChatGPT (OpenAI) key. The free Gemini key comes from aistudio.google.com/apikey.');
+    if (k.length < 20) throw new Error('That does not look like a full Gemini API key. Copy the whole key from aistudio.google.com/apikey.');
+    patch.geminiKey = k;
+  }
+  if (b.aiProvider !== undefined) patch.aiProvider = b.aiProvider === 'openai' ? 'openai' : 'gemini';
+  if (b.waPhoneId !== undefined) { const v = String(b.waPhoneId).replace(/D/g, ''); if (v && v.length < 8) throw new Error('The WhatsApp phone number ID is a long number (WhatsApp → API setup → Phone number ID).'); patch.waPhoneId = v; }
+  if (b.waToken !== undefined && !String(b.waToken).startsWith('••')) { const v = String(b.waToken).replace(/s/g, ''); if (v && v.length < 40) throw new Error('That WhatsApp access token looks too short. Copy the whole token.'); patch.waToken = v; }
+  for (const k of ['googlePlacesKey', 'tomtomKey', 'geoapifyKey', 'hereKey']) if (b[k] !== undefined && !String(b[k]).startsWith('••')) { const v = String(b[k]).replace(/[\s"'`]/g, ''); if (v && v.length < 10) throw new Error('That key looks too short. Copy the whole key.'); patch[k] = v; }
+  if (b.leadSource !== undefined) patch.leadSource = b.leadSource === 'apify' ? 'apify' : 'free';
   if (b.apifyToken && !String(b.apifyToken).startsWith('••')) patch.apifyToken = String(b.apifyToken).trim();
   config.set(patch);
   res.json({ ok: true, serviceAccountEmail: config.get().serviceAccount ? config.get().serviceAccount.client_email : '' });
@@ -132,14 +154,23 @@ app.post('/api/connections/test', wrap(async (req, res) => {
   if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Not allowed.' });
   const what = (req.body || {}).what;
   if (what === 'sheet') { const r = await store.ensureTabs(); return res.json({ ok: true, msg: `Connected to "${r.title}". Tabs are ready.` }); }
+  if (what === 'supabase') { await store.supabase().createTables(); return res.json({ ok: true, msg: 'Supabase connected. The tables are ready.' }); }
   if (what === 'gmail') { await mail.test(); return res.json({ ok: true, msg: 'Gmail connected (sending and reading).' }); }
   if (what === 'openai' || what === 'gemini') {
     const ai = require('./ai');
     if (what === 'openai' && !config.get().openaiKey) throw new Error('Paste your ChatGPT (OpenAI) API key first.');
+    if (what === 'gemini' && !config.get().geminiKey) throw new Error('Paste your free Gemini API key first (aistudio.google.com/apikey).');
+    if (ai.provider() !== (what === 'openai' ? 'openai' : 'gemini')) throw new Error(`Choose ${what === 'openai' ? 'ChatGPT' : 'Gemini (free)'} under "Which AI writes the emails" and save first.`);
     ai.configure(await store.settings().catch(() => ({})));
     const a = await gemini('Return ONLY this JSON: {"ok": true}', 'auto', { priority: 'reply' });
     if (!a) throw new Error(`${ai.aiName()} answered but not as expected.`);
     return res.json({ ok: true, msg: `${ai.aiName()} is working (model: ${ai.currentModel() || 'auto'}).` });
+  }
+  if (what === 'whatsapp') return res.json({ ok: true, msg: await require('./whatsapp').test() });
+  if (['googlePlaces', 'tomtom', 'geoapify', 'here'].includes(what)) return res.json({ ok: true, msg: await require('./free').testSource(what) });
+  if (what === 'free') {
+    const n = await require('./free').testSearch();
+    return res.json({ ok: true, msg: `Free lead finding works (a test web search found ${n} results). No key or payment needed.` });
   }
   if (what === 'apify') {
     if (process.env.AAVORAA_MOCK === '1') return res.json({ ok: true, msg: 'Apify connected.' });
@@ -149,6 +180,20 @@ app.post('/api/connections/test', wrap(async (req, res) => {
     return res.json({ ok: true, msg: `Apify connected (${j.data && j.data.username}).` });
   }
   throw new Error('Unknown test');
+}));
+// Move all data to Supabase: create the tables, copy every tab from the Google Sheet (if one is connected), then switch over.
+app.post('/api/connections/supabase/move', wrap(async (req, res) => {
+  if (!(await canEditConnections(req))) return res.status(403).json({ error: 'Connections can only be changed by the owner on the main PC.' });
+  const c = config.get();
+  if (!c.supabaseUrl || !c.supabaseKey) throw new Error('Save the Supabase Project URL and secret key first.');
+  if (c.storage === 'supabase') return res.json({ ok: true, msg: 'The app already saves to Supabase.' });
+  const supa = store.supabase();
+  let report = [];
+  if (c.sheetUrl && c.serviceAccount) report = await supa.copyFrom(store.sheet, m => engine.log('agent', 'Moving to Supabase: ' + m));
+  else { await supa.createTables(); await supa.seedDefaults(); report = ['No Google Sheet connected: Supabase starts empty.']; }
+  config.set({ storage: 'supabase' });
+  engine.log('agent', 'Data storage switched to Supabase. ' + report.join('; '));
+  res.json({ ok: true, msg: 'Done. The app now saves everything to Supabase. ' + report.join(' · '), report });
 }));
 app.post('/api/setup/owner', wrap(async (req, res) => {
   if (!isLocal(req)) throw new Error('Create the owner account on the main PC.');
@@ -171,30 +216,38 @@ function lanUrls() {
 
 // ---------------------------------------------------------------- dashboard
 app.get('/api/dashboard', need(), wrap(async (req, res) => {
-  const [s, raw, qual, li] = await Promise.all([store.settings(), store.read('Raw Leads'), store.read('Qualified Leads'), store.read('LinkedIn Leads')]);
+  const [s, raw, allQ, li, reps] = await Promise.all([store.settings(), store.read('Raw Leads'), store.read('Qualified Leads'), store.read('LinkedIn Leads'), store.read('Replies').catch(() => [])]);
+  // a "reply" is a real person writing back (email or LinkedIn): bounces and automatic messages are counted separately
+  const people = reps.filter(r => !['automatic', 'bounce'].includes(r.Category));
+  const liReplied = li.filter(r => String(r['Their Reply'] || '').trim());
+  const repliedLeads = new Set(people.map(r => r['Lead ID'] || r.From));
+  for (const r of raw) if (r['Last Reply On'] && ['interested', 'question', 'referral', 'not_interested', 'unsubscribe', 'other'].includes(r['Reply Category']) && !reps.some(x => x['Lead ID'] === r['Lead ID'])) repliedLeads.add(r['Lead ID']); // replies from before the Replies page existed
+  const qual = allQ.filter(r => r.Stage === 'Qualified'), hot = allQ.filter(r => r.Stage !== 'Qualified');
   const t = new Date(Date.now() + 5.5 * 3600e3);
   const series = [];
   for (let i = 13; i >= 0; i--) {
     const d = new Date(t.getTime() - i * 86400000).toISOString().slice(0, 10);
     series.push({ date: d,
       found: raw.filter(r => r['Date Found'] === d).length + li.filter(r => r['Date Found'] === d).length,
-      emailed: engine.sentOn(raw, d), replies: raw.filter(r => r['Last Reply On'] === d).length,
-      qualified: qual.filter(r => r['Date Qualified'] === d).length });
+      emailed: engine.sentOn(raw, d), replies: people.filter(r => String(r['Received On']).slice(0, 10) === d).length,
+      qualified: qual.filter(r => r['Confirmed On'] === d).length, interested: hot.filter(r => r['Date Qualified'] === d).length });
   }
   const by = (arr, k) => arr.reduce((m, r) => { const v = String(r[k] || 'Unknown'); m[v] = (m[v] || 0) + 1; return m; }, {});
   const c = f => raw.filter(f).length;
   const lim = engine.dailyLimit(s);
   res.json({
     agent: { on: ['yes', 'on', 'true', '1'].includes(String(s.AGENT_ON).toLowerCase()), replyMode: s.REPLY_MODE, tone: s.TONE, todayLimit: lim.limit, sentToday: engine.sentOn(raw, today()), started: lim.started, startDate: s.START_DATE, sheetUrl: config.get().sheetUrl },
-    totals: { raw: raw.length, withEmail: c(r => r.Email), emailed: c(r => r['Pitched On']), replied: c(r => r['Last Reply On']), interested: c(r => r.Status === 'Interested'), qualified: qual.length, linkedin: li.length, linkedinToConnect: li.filter(r => r.Status === 'To Connect').length, bounced: c(r => r.Status === 'Bounced'), doNotContact: c(r => r.Status === 'Do Not Contact'), waiting: c(r => r.Status === 'New') },
-    series, rawStatus: by(raw, 'Status'), services: qual.length ? by(qual, 'Service Needed') : by(raw.filter(r => r['Best Service']), 'Best Service'), countries: by(raw, 'Country'),
-    recentQualified: qual.slice(-8).reverse(),
+    totals: { raw: raw.length, withEmail: c(r => r.Email), emailed: c(r => r['Pitched On']), replied: repliedLeads.size + liReplied.length, repliedEmail: repliedLeads.size, repliedLinkedIn: liReplied.length, automatic: reps.filter(r => r.Category === 'automatic').length, waitingAnswer: people.filter(r => /please answer|Not sent/i.test(r['Reply Status'] || '')).length, interested: hot.length, qualified: qual.length, linkedin: li.length, linkedinToConnect: li.filter(r => r.Status === 'To Connect').length, bounced: c(r => r.Status === 'Bounced'), doNotContact: c(r => r.Status === 'Do Not Contact'), waiting: c(r => r.Status === 'New') },
+    series, rawStatus: by(raw, 'Status'), services: allQ.length ? by(allQ, 'Service Needed') : by(raw.filter(r => r['Best Service']), 'Best Service'), countries: by(raw, 'Country'),
+    recentQualified: qual.slice(-8).reverse(), recentInterested: hot.slice(-8).reverse(),
   });
 }));
 
 // ---------------------------------------------------------------- leads
 const strip = rows => rows.map(({ _row, ...r }) => r);
 app.get('/api/leads/raw', need('owner', 'leader'), wrap(async (req, res) => res.json(strip(await store.read('Raw Leads')).reverse())));
+app.post('/api/leads/qualified/:id/confirm', need('owner', 'leader'), wrap(async (req, res) => res.json({ ok: true, ...(await engine.confirmQualified(req.params.id, req.body || {}, req.user.name)) })));
+app.post('/api/leads/qualified/:id/unconfirm', need('owner', 'leader'), wrap(async (req, res) => { await engine.unconfirmQualified(req.params.id, req.user.name); res.json({ ok: true }); }));
 app.get('/api/leads/qualified', need('owner', 'leader'), wrap(async (req, res) => res.json(strip(await store.read('Qualified Leads')).reverse())));
 app.get('/api/leads/linkedin', need(), wrap(async (req, res) => res.json(strip(await store.read('LinkedIn Leads')).reverse())));
 const RAW_STATUSES = ['New', 'Pitched', 'Follow-up 1', 'Follow-up 2', 'Replied', 'Interested', 'Not Interested', 'Do Not Contact', 'Bounced', 'No Email', 'Low Fit', 'Send Failed', 'Bad Email'];
@@ -226,12 +279,81 @@ app.get('/api/notify', need(), wrap(async (req, res) => {
   const mailOk = req.user.role !== 'linkedin';
   const [rep, li, qual] = await Promise.all([mailOk ? store.read('Replies') : [], store.read('LinkedIn Leads'), mailOk ? store.read('Qualified Leads') : []]);
   res.json({
-    gmail: rep.map(r => ({ id: r['Reply ID'], who: r['Contact Name'] || r['Business Name'] || r.From, text: String(r['Their Message'] || '').slice(0, 120) })),
+    gmail: rep.filter(r => r.Category !== 'automatic').map(r => ({ id: r['Reply ID'], who: r['Contact Name'] || r['Business Name'] || r.From, text: String(r['Their Message'] || '').slice(0, 120) })),
     linkedin: li.filter(r => String(r['Their Reply'] || '').trim()).map(r => ({ id: liKey(r), who: r.Name, text: String(r['Their Reply']).slice(0, 120) })),
-    qualified: qual.map(r => ({ id: r['Lead ID'], who: r['Business Name'] || r['Contact Name'], text: r.Summary || r['Service Needed'] || '' })),
+    accepted: li.filter(r => r.Status === 'Connected').map(r => ({ id: r['Lead ID'], who: r.Name, text: 'Accepted your connection request. Send them the first message.' })),
+    alarm: engine.alarms().slice(0, 60).map(a => ({ id: a.id, who: a.title, text: a.text })),
+    qualified: qual.filter(r => r.Stage !== 'Qualified').map(r => ({ id: r['Lead ID'], who: r['Business Name'] || r['Contact Name'], text: r.Summary || r['Service Needed'] || '' })),
   });
 }));
 
+// LinkedIn auto-connect (runs in the Windows app on the main PC)
+app.get('/api/linkedin/bot', need(), wrap(async (req, res) => res.json(global.liBot ? await global.liBot.status() : { available: false })));
+app.post('/api/linkedin/bot/sendall', need(), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app on the main PC.'); res.json({ ok: true, msg: await global.liBot.sendAll(req.user.name) }); }));
+app.post('/api/linkedin/bot/run', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); res.json({ ok: true, msg: await global.liBot.runNow() }); }));
+app.post('/api/linkedin/bot/signin', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); global.liBot.signIn(); res.json({ ok: true }); }));
+app.post('/api/linkedin/bot/signout', need('owner'), wrap(async (req, res) => { if (!global.liBot) throw new Error('Only in the Windows app.'); await global.liBot.signOut(); res.json({ ok: true }); }));
+app.post('/api/linkedin/bot/switch', need('owner'), wrap(async (req, res) => { await store.saveSettings({ LINKEDIN_AUTO_CONNECT: req.body && req.body.on ? 'yes' : 'no' }); res.json({ ok: true }); }));
+// ---------------------------------------------------------------- alarms, inbox health, token dashboard, bills
+// One button: pitch everyone on every channel (email + LinkedIn + WhatsApp)
+app.post('/api/pitch/all', need('owner'), wrap(async (req, res) => res.json(await require('./pitch').pitchEverything(req.user.name))));
+app.get('/api/pitch/status', need(), wrap(async (req, res) => res.json(require('./pitch').status())));
+app.get('/api/alarms', need(), wrap(async (req, res) => res.json(engine.alarms())));
+app.delete('/api/alarms', need('owner', 'leader'), wrap(async (req, res) => { engine.clearAlarms(); res.json({ ok: true }); }));
+app.get('/api/inboxes', need('owner', 'leader'), wrap(async (req, res) => {
+  const s = await store.settings(), raw = await store.read('Raw Leads'), day = today(), main = (require('./mail').accounts()[0] || {}).user;
+  const list = engine.inboxHealth(s).map(i => ({ ...i, sentToday: raw.filter(r => String(r['Sent From'] || main).toLowerCase() === i.user && [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(day)).length }));
+  const target = Number(s.EMAILS_PER_DAY_TARGET || 200), perInbox = Number(s.DAILY_MAX_LIMIT || 50);
+  res.json({ list, target, perInbox, needed: Math.ceil(target / Math.max(1, perInbox)) });
+}));
+app.post('/api/inboxes/:user/resume', need('owner'), wrap(async (req, res) => { engine.resumeInbox(String(req.params.user).toLowerCase()); res.json({ ok: true }); }));
+// Token & usage dashboard: everything the app uses (AI, mail, lead platforms), combined, and per lead
+app.get('/api/usage', need('owner', 'leader'), wrap(async (req, res) => {
+  const meter = require('./usage'), ai = require('./ai'), s = await store.settings(); ai.configure(s);
+  const t = meter.sum(1), w = meter.sum(7), m = meter.sum(30), st = ai.aiStatus();
+  const raw = await store.read('Raw Leads'), day = today();
+  const leadsToday = raw.filter(r => String(r['Date Found']) === day).length;
+  const inb = engine.inboxHealth(s), sentToday = raw.filter(r => [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(day)).length;
+  const per = (x, n) => n ? Math.round(x / n) : 0;
+  const leads30 = (m.leads && m.leads.found) || 0, aiTok30 = (m.ai && m.ai.tokens) || 0, aiReq30 = (m.ai && m.ai.requests) || 0;
+  const srch = g => Object.values((g && g.search) || {}).reduce((a, b) => a + b, 0);
+  res.json({
+    ai: { provider: ai.aiName(), model: ai.currentModel(), requestsToday: st.used, requestsLeft: Math.max(0, st.limit - st.used), limit: st.limit, models: st.models || [], blockedUntil: st.blockedUntil,
+      tokensToday: (t.ai && t.ai.tokens) || 0, tokens7: (w.ai && w.ai.tokens) || 0, tokens30: aiTok30 },
+    mail: { sentToday, capacityToday: inb.filter(i => !i.paused).reduce((a, i) => a + i.limit, 0), inboxes: inb.length, paused: inb.filter(i => i.paused).length, sent30: (m.mail && m.mail.sent) || 0 },
+    platform: { searchesToday: srch(t), searches30: srch(m), bySource: (m.search || {}), leadsBySource: (m.sourceLeads || {}), apify: config.get().leadSource === 'apify' },
+    leads: { today: leadsToday, target: Number(s.LEADS_PER_DAY ?? 200), qualityToday: raw.filter(r => String(r['Date Found']) === day && r.Quality === 'yes').length, qualityTarget: '10-30', found30: leads30, analysed30: (m.leads && m.leads.analysed) || 0 },
+    perLead: { tokens: per(aiTok30, leads30), aiRequests: Math.round((aiReq30 / Math.max(1, leads30)) * 10) / 10, searches: Math.round((srch(m) / Math.max(1, leads30)) * 100) / 100, emails: Math.round((((m.mail && m.mail.sent) || 0) / Math.max(1, leads30)) * 100) / 100 },
+    series: meter.series(14).map(d => ({ day: d.day, tokens: (d.ai && d.ai.tokens) || 0, ai: (d.ai && d.ai.requests) || 0, sent: (d.mail && d.mail.sent) || 0, leads: (d.leads && d.leads.found) || 0 })),
+  });
+}));
+// Bills: every tool's monthly cost in one place (ChatGPT API, mail, lead platforms, our service, Claude...)
+const BILL_DEFAULTS = [['ChatGPT API (OpenAI)', 'https://platform.openai.com/settings/organization/billing'], ['Mail (Google Workspace / Gmail)', 'https://admin.google.com/ac/billing'], ['Platform charges (Apify, Google Places, ...)', 'https://console.apify.com/billing'], ['Our service charges', ''], ['Claude (optional)', 'https://claude.ai/settings/billing'], ['Supabase (database)', 'https://supabase.com/dashboard/org/_/billing']];
+app.get('/api/bills', need('owner'), wrap(async (req, res) => {
+  let rows = await store.read('Bills', true).catch(() => []);
+  if (!rows.length) { await store.append('Bills', BILL_DEFAULTS.map(([Item, link]) => ({ Item, 'Monthly Amount (Rs)': '', 'Billing Link': link }))); rows = await store.read('Bills', true); }
+  res.json(strip(rows));
+}));
+app.put('/api/bills', need('owner'), wrap(async (req, res) => {
+  const list = Array.isArray(req.body) ? req.body.slice(0, 50) : [];
+  const have = await store.read('Bills', true);
+  const clean = o => ({ 'Monthly Amount (Rs)': String(o['Monthly Amount (Rs)'] ?? '').replace(/[^\d.]/g, '').slice(0, 12), 'Paid On': String(o['Paid On'] || '').slice(0, 20), 'Paid By': String(o['Paid By'] || '').slice(0, 60), Notes: String(o.Notes || '').slice(0, 300), 'Billing Link': /^https?:\/\//.test(o['Billing Link'] || '') ? String(o['Billing Link']).slice(0, 300) : '' });
+  const upd = [], add = [];
+  for (const o of list) { const it = String(o.Item || '').trim().slice(0, 80); if (!it) continue; (have.some(h => h.Item === it) ? upd : add).push(have.some(h => h.Item === it) ? { key: it, set: clean(o) } : { Item: it, ...clean(o) }); }
+  if (upd.length) await store.update('Bills', 'Item', upd); if (add.length) await store.append('Bills', add);
+  res.json({ ok: true });
+}));
+// ---------------------------------------------------------------- Aavo, the in-app assistant (chat + voice)
+app.post('/api/assistant/chat', need(), wrap(async (req, res) => {
+  const b = req.body || {}; const history = (Array.isArray(b.history) ? b.history : []).slice(-12).map(m => ({ role: m.role === 'user' ? 'user' : 'aavo', text: String(m.text || '').slice(0, 2000), draft: m.draft, confirm: m.confirm && typeof m.confirm === 'object' ? { name: String(m.confirm.name || ''), args: m.confirm.args || {} } : undefined, done: !!m.done }));
+  res.json(await require('./assistant').chat(req.user, history, String(b.page || ''), b.auto === true));
+}));
+app.post('/api/assistant/confirm', need(), wrap(async (req, res) => {
+  const b = req.body || {}; res.json(await require('./assistant').act(String(b.name || ''), b.args || {}, req.user, true));
+}));
+app.post('/api/assistant/voice', need(), express.json({ limit: '20mb' }), wrap(async (req, res) => {
+  const b = req.body || {}; res.json({ text: await require('./ai').transcribe(String(b.audio || ''), String(b.mime || 'audio/webm')) });
+}));
 app.post('/api/leads/linkedin/:id/reply', need(), wrap(async (req, res) => {
   const b = req.body || {};
   if (b.channel === 'email' && req.user.role === 'linkedin') throw new Error('Only the owner or team leader can send emails.');
@@ -262,13 +384,15 @@ app.post('/api/leads/raw/:id/email', need('owner', 'leader'), wrap(async (req, r
   res.json({ ok: true, ...(await engine.emailLead(req.params.id, { to: b.to, subject: String(b.subject || '').slice(0, 300), text: String(b.text || '').slice(0, 20000) }, req.user.name)) });
 }));
 
+app.post('/api/replies/answer-all', need('owner'), wrap(async (req, res) => res.json(await require('./assistant').act('answer_all_replies', {}, req.user, true))));
+app.post('/api/replies/:id/draft', need('owner', 'leader'), wrap(async (req, res) => res.json(await engine.replyDraft(req.params.id))));
 app.post('/api/replies/:id/answer', need('owner', 'leader'), wrap(async (req, res) => {
   await engine.answerReply(req.params.id, (req.body || {}).text, req.user.name);
   res.json({ ok: true });
 }));
 
 // ---------------------------------------------------------------- call / WhatsApp tasks (sent by a person, so no account can be banned)
-const CALL_STATUSES = ['Messaged', 'No Answer', 'Interested', 'Not Interested', 'Wrong Number'];
+const CALL_STATUSES = ['Messaged', 'No Answer', 'Interested', 'Ready to work', 'Not Interested', 'Wrong Number'];
 const DIAL = { IN: '91', AU: '61', US: '1', CA: '1', GB: '44', UK: '44', AE: '971', SG: '65', MY: '60', SA: '966', QA: '974', OM: '968', BH: '973', KW: '965', IE: '353', NZ: '64', ES: '34', PT: '351', DE: '49', NL: '31', BE: '32', FR: '33', IT: '39', PL: '48', CZ: '420', BR: '55', MX: '52', ZA: '27', KE: '254', NG: '234', PH: '63', ID: '62', TH: '66', LK: '94', PK: '92', BD: '880', NP: '977', HK: '852', JP: '81' };
 const CITY_COUNTRY = { dubai: 'AE', 'abu dhabi': 'AE', sharjah: 'AE', riyadh: 'SA', doha: 'QA', muscat: 'OM', london: 'GB', manchester: 'GB', birmingham: 'GB', dublin: 'IE', 'new york': 'US', 'los angeles': 'US', houston: 'US', chicago: 'US', miami: 'US', dallas: 'US', toronto: 'CA', vancouver: 'CA', sydney: 'AU', melbourne: 'AU', auckland: 'NZ', singapore: 'SG', 'kuala lumpur': 'MY', madrid: 'ES', barcelona: 'ES', lisbon: 'PT', berlin: 'DE', munich: 'DE', amsterdam: 'NL', brussels: 'BE', paris: 'FR', milan: 'IT', warsaw: 'PL', prague: 'CZ', 'sao paulo': 'BR', 'mexico city': 'MX', johannesburg: 'ZA', nairobi: 'KE', mumbai: 'IN', bengaluru: 'IN', chennai: 'IN', coimbatore: 'IN', hyderabad: 'IN', delhi: 'IN', pune: 'IN', kochi: 'IN' };
 // "+61 2 9000 0000" -> "61290000000"; "02 9000 0000" + Australia -> "61290000000"
