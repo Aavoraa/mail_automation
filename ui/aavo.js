@@ -67,9 +67,9 @@
   const fab = document.createElement('button'); fab.id = 'aavo-fab'; fab.title = 'Aavo, your assistant'; fab.setAttribute('aria-label', 'Open Aavo, your assistant');
   fab.innerHTML = ROBOT + '<span class="hi">Hi! I\'m Aavo. Ask me anything 👋</span>';
   const box = document.createElement('section'); box.id = 'aavo'; box.className = 'closed'; box.setAttribute('aria-label', 'Aavo assistant');
-  box.innerHTML = `<div class="aavo-head">${ROBOT}<div><b>Aavo</b><span>Your AAVORAA assistant · type or talk</span></div><button id="aavoAuto" title="Do it straight away: Aavo carries out your commands without asking first">⚡</button><button id="aavoVoice" title="Speak answers out loud">🔊</button><button id="aavoX" title="Close">✕</button></div>
+  box.innerHTML = `<div class="aavo-head">${ROBOT}<div><b>Aavo</b><span>Your lead assistant · type or talk</span></div><button id="aavoAuto" title="Do it straight away: Aavo carries out your commands without asking first">⚡</button><button id="aavoVoice" title="Speak answers out loud">🔊</button><button id="aavoX" title="Close">✕</button></div>
     <div class="aavo-msgs" id="aavoMsgs" aria-live="polite"></div>
-    <div class="aavo-chips">${['Pitch everything now', "Today's numbers", 'Email all LinkedIn leads', 'Connect 10 on LinkedIn', 'Answer all replies', 'Send all emails now', 'Find new leads now', 'Any alarms?'].map(c => `<button>${c}</button>`).join('')}</div>
+    <div class="aavo-chips">${['Pitch everything now', "Today's numbers", 'Email all LinkedIn leads', 'Connect all on LinkedIn', 'Answer all replies', 'Send all emails now', 'Find new leads now', 'Any alarms?'].map(c => `<button>${c}</button>`).join('')}</div>
     <div class="aavo-in"><button class="aavo-mic" id="aavoMic" title="Talk (click, speak, click again)">🎤</button><textarea id="aavoTxt" placeholder="Type a message…" rows="1"></textarea><button class="aavo-send" id="aavoGo" title="Send">➤</button></div>`;
   document.body.append(fab, box);
   const $m = box.querySelector('#aavoMsgs'), $t = box.querySelector('#aavoTxt');

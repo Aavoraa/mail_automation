@@ -293,8 +293,24 @@ function rules(s) {
     `exclamation marks, emojis, em dashes, bullet lists, prices, guarantees, made-up client names or results, or fake familiarity. Do not add a signature, we add it.` +
     (s.EXTRA_INSTRUCTIONS ? ` Also always follow this: ${s.EXTRA_INSTRUCTIONS}` : '');
 }
+// Business profiles: what is being pitched (a product or a service, any company). A lead found or added for a
+// profile carries its id in "Profile"; every prompt for that lead then uses the profile's company, offer and targets.
+let PROFILES = {};
+function setProfiles(rows) { PROFILES = {}; for (const p of rows || []) if (p && p['Profile ID']) PROFILES[p['Profile ID']] = p; }
+const profiles = () => Object.values(PROFILES);
+function overlay(s, p) {
+  if (!p) return s;
+  const o = { ...s, PROFILE_ID: p['Profile ID'], PROFILE_NAME: p.Name || '' };
+  const map = { Company: 'COMPANY', Website: 'WEBSITE', Tagline: 'TAGLINE', 'What We Sell': 'SERVICES', Details: 'OFFER_DETAILS', 'Ideal Customer': 'IDEAL_CUSTOMER', Industries: 'INDUSTRIES', Cities: 'CITIES', 'Call To Action': 'CTA', 'Offer Type': 'OFFER_TYPE', Address: 'COMPANY_ADDRESS' };
+  for (const [k, v] of Object.entries(map)) if (String(p[k] || '').trim()) o[v] = String(p[k]).trim();
+  if (String(p.Company || '').trim() && p.Company !== s.COMPANY) { o.COMPANY_DESCRIPTION = ''; if (!String(p.Address || '').trim()) o.COMPANY_ADDRESS = ''; } // another company: not AAVORAA's description or address
+  return o;
+}
+function withProfile(s, lead) { const id = lead && (lead.Profile || lead.PROFILE_ID); return id && PROFILES[id] && s.PROFILE_ID !== id ? overlay(s, PROFILES[id]) : s; }
+const sells = s => String(s.OFFER_TYPE || 'service').toLowerCase() === 'product' ? 'Our products' : String(s.OFFER_TYPE || '').toLowerCase() === 'both' ? 'Our products and services' : 'Our services';
 function who(s) {
-  return `You are ${s.SENDER_NAME}, ${s.SENDER_TITLE || 'Business Development Executive'} at ${s.COMPANY} (${s.WEBSITE}), a digital and technology company (tagline: "${s.TAGLINE}").\nOur services: ${s.SERVICES}.`;
+  return `You are ${s.SENDER_NAME}, ${s.SENDER_TITLE || 'Business Development Executive'} at ${s.COMPANY}${s.WEBSITE ? ' (' + s.WEBSITE + ')' : ''}${s.COMPANY_DESCRIPTION ? ', ' + s.COMPANY_DESCRIPTION : ''}${s.TAGLINE ? ` (tagline: "${s.TAGLINE}")` : ''}.\n${sells(s)}: ${s.SERVICES}.` +
+    (s.OFFER_DETAILS ? `\nAbout our offer (true facts you may use): ${String(s.OFFER_DETAILS).slice(0, 800)}` : '') + (s.IDEAL_CUSTOMER ? `\nOur ideal customer: ${s.IDEAL_CUSTOMER}` : '') + (s.CTA ? `\nThe next step we offer: ${s.CTA}` : '');
 }
 function langRule(s, lead) {
   const m = String(lead.Notes || '').match(/Site language: ([^|]+)/);
@@ -317,10 +333,10 @@ function leadVars(lead, s) {
 // ---------- prompts
 const P = {
   analyse(s, L) {
-    return `You are a senior growth consultant at ${s.COMPANY}, a digital and technology company.
-Our services: ${s.SERVICES}.
+    return `You are a senior sales researcher at ${s.COMPANY}${s.COMPANY_DESCRIPTION ? ', ' + s.COMPANY_DESCRIPTION : ''}.
+${sells(s)}: ${s.SERVICES}.${s.OFFER_DETAILS ? '\nAbout our offer: ' + String(s.OFFER_DETAILS).slice(0, 600) : ''}${s.IDEAL_CUSTOMER ? '\nOur ideal customer: ' + s.IDEAL_CUSTOMER : ''}
 
-Study this business honestly and decide how we could genuinely help them.
+Study this business honestly and decide whether and how our offer would genuinely help them (as a customer of our products or services).
 Business: ${L.name}
 Category: ${L.category}
 Location: ${L.city} ${L.country}
@@ -330,8 +346,8 @@ Automatic website checks: ${JSON.stringify(L.checks)}
 Website text (first part): [[[${L.siteText}]]]
 
 Return ONLY a JSON object:
-{"fit_score": number 1-10 for how likely they need AND can afford our services,
- "best_service": "the ONE most relevant service from our list",
+{"fit_score": number 1-10 for how likely they need AND can afford our offer,
+ "best_service": "the ONE most relevant product or service from our list",
  "website_issues": "2-3 short, specific, polite observations separated by ' ; ' (based only on the data above)",
  "pitch_angle": "one sentence: the specific opportunity we would mention to them",
  "what_they_have": "one short line: what they already have online (website quality, booking, social, reviews...)",
@@ -341,16 +357,18 @@ Return ONLY a JSON object:
  "is_real_business": true or false}`;
   },
   email(s, lead, stage, tpl) {
+    s = withProfile(s, lead);
     const L = lead;
     const base = `${who(s)}\n${rules(s)} ${langRule(s, L)}\n\nLead:\nBusiness: ${L['Business Name']}\nContact name: ${L['Contact Name'] || 'unknown, so greet with "Hi there" or "Hi ' + L['Business Name'] + ' team"'}\nIndustry: ${L.Industry} | Location: ${L.City} ${L.Country}\nWebsite: ${L.Website}\nWhat we noticed: ${L['Website Issues'] || 'not analysed'}\nWhat they already have: ${L['What They Have'] || 'unknown'}\nWhat they most likely need (our AI agent's analysis): ${L['What They Need'] || 'unknown'}\nBest service for them: ${L['Best Service'] || 'choose the most relevant one from our services'}\nOpportunity: ${L['Pitch Angle'] || ''}`;
     let task;
-    if (stage === 0) task = `Write the FIRST cold email (70-120 words). Open with one specific, genuine observation about their business. In one or two sentences explain how the best service could help them. End with a soft, low-pressure question, for example offering a free short audit or a 15-minute call. Final line exactly: "If this isn't relevant, just reply 'no' and I won't email again."\nSubject: 2-6 words, mostly lowercase, personal, no clickbait.`;
+    if (stage === 0) task = `Write the FIRST cold email (70-120 words). Open with one specific, genuine observation about their business. In one or two sentences explain how the best product or service could help them. End with a soft, low-pressure question${s.CTA ? ` that offers our next step (${s.CTA})` : ', for example offering a free short audit or a 15-minute call'}. Final line exactly: "If this isn't relevant, just reply 'no' and I won't email again."\nSubject: 2-6 words, mostly lowercase, personal, no clickbait.`;
     else if (stage === 1) task = `Our first email (subject "${L['Email Subject']}") got no reply. Write a short, friendly FOLLOW-UP (40-70 words) that adds one new useful idea or quick tip related to the best service. No guilt-tripping. End with a simple yes/no question. Subject must be "".`;
     else task = `Two emails got no reply. Write a final, polite closing email (30-50 words): respect their time, say this is the last note, leave the door open. No pressure. Subject must be "".`;
     if (tpl) task += `\n\nUse this TEMPLATE as the base. Keep its structure, intent and key sentences; fill every {{placeholder}} with real details; personalise lightly so it sounds natural for this lead; keep it about the same length.\nTemplate subject: ${tpl.Subject || '(none)'}\nTemplate body:\n[[[${tpl.Body}]]]`;
     return `${base}\n\n${task}\nReturn ONLY JSON: {"subject": "...", "body": "..."}`;
   },
   reply(s, d, tpl) {
+    s = withProfile(s, d.lead);
     const L = d.lead;
     const booking = s.BOOKING_LINK ? `Share this booking link for the call: ${s.BOOKING_LINK}` : 'Ask for two or three times that suit them, and their time zone.';
     return `${who(s)}\nA lead replied to our outreach email. Read their reply and decide what to do.\n\nLead: ${L['Business Name']} | contact: ${L['Contact Name'] || 'unknown'} | website: ${L.Website}\nWe pitched: ${L['Best Service']} - ${L['Pitch Angle']}\nTheir reply (subject "${d.subject}"):\n[[[${d.text}]]]\n\nHow to write the reply:\n- ${rules(s)}\n- 40-110 words. Same language they wrote in. Thank them, by name if known.\n- Interested or asking for details: answer briefly and suggest a 15-20 minute call. ${booking}\n- Asking about price: say pricing depends on scope and we will share a clear, tailored quote after a short call. Never invent prices, timelines, guarantees, past clients or case studies.\n- Pointing us to another person: thank them and ask politely for the right contact.\n- Not interested: thank them sincerely in 1-2 sentences and confirm we will not email again.\n- Asking to stop / unsubscribe / remove, or an auto-reply / out-of-office: reply must be "".` +
@@ -363,10 +381,26 @@ Return ONLY a JSON object:
       (msgTpl ? `Base the first message on this template: [[[${msgTpl.Body}]]]\n` : '') +
       `Return ONLY JSON:\n{"fit_score": 1-10, "best_service": "one service from our list",\n "connection_note": "LinkedIn connection request note, max 250 characters, friendly, mentions something specific about them, NO selling",\n "first_message": "message to send after they accept, 50-90 words, gives one useful idea related to the best service, ends with a soft question"}`;
   },
+  whatsappReply(s, r, chat, latest) {
+    s = withProfile(s, r);
+    const booking = s.BOOKING_LINK ? `If they are interested, suggest a short call and share this booking link: ${s.BOOKING_LINK}` : 'If they are interested, suggest a short call and ask which day and time suit them.';
+    return `${who(s)}\nWhatsApp reply from a lead. Write our next WhatsApp message (20-70 words, friendly, no subject, no signature, plain text, at most one emoji).\n\nLead: ${r['Business Name'] || ''} | contact: ${r['Contact Name'] || 'unknown'} | ${r.City || ''} ${r.Country || ''}\nService that fits them: ${r['Best Service'] || 'not clear yet'}\n` +
+      (chat ? `Conversation so far: [[[${String(chat).slice(-2000)}]]]\n` : '') +
+      `Their LATEST WhatsApp message (answer this): [[[${latest}]]]\n\n${rules(s)} Same language they wrote in. Answer what they asked. If they say no or ask us to stop, thank them politely in one line and do not pitch. Never invent prices, timelines, guarantees or past clients. ${booking}\nReturn ONLY JSON: {"reply": "...", "interested": true or false}`;
+  },
   linkedinReply(s, r) {
+    s = withProfile(s, r);
     return `${who(s)}\nLinkedIn conversation with ${r.Name} (${r.Title} at ${r.Company}):\nOur message: [[[${r['First Message']}]]]\nTheir reply: [[[${r['Their Reply'] || '(no text pasted, team marked them as interested)'}]]]\n\n${rules(s)} Keep it short (30-80 words), same language as them. If interested, suggest a short call${s.BOOKING_LINK ? ' and share this link: ' + s.BOOKING_LINK : ''}.${r.Email ? '' : ' We do not have their email address yet: if they are interested, also ask politely for the best email to send the details to.'}\nReturn ONLY JSON:\n{"category": "interested" | "question" | "not_interested" | "other", "lead_score": "Hot" | "Warm" | "Cold",\n "service_needed": "", "summary": "one sentence", "next_step": "short next step", "suggested_reply": "LinkedIn reply text, or empty if not interested"}`;
   },
+  interestedFollowUp(s, q, channel, n, history) {
+    s = withProfile(s, q);
+    const booking = s.BOOKING_LINK ? `Share this booking link for a short call: ${s.BOOKING_LINK}` : 'Ask which day and time this week suits them for a short 15-minute call.';
+    return `${who(s)}\nFOLLOW-UP ${n} to an interested lead who has gone quiet. Write a short, friendly ${channel === 'linkedin' ? 'LinkedIn message (25-70 words, no subject, no signature)' : 'email (35-90 words, no signature)'} that re-opens the conversation.\n\nLead: ${q['Business Name'] || ''} | contact: ${q['Contact Name'] || 'unknown'} | country: ${q.Country || ''}\nWhat they were interested in: ${q['Service Needed'] || q.Summary || 'our services'}\nWhat they told us: [[[${String(q['Their Message'] || '').slice(0, 800)}]]]\n` +
+      (history ? `What we already sent them: [[[${String(history).slice(-1200)}]]]\n` : '') +
+      `\n${rules(s)} ${n === 1 ? 'Remind them kindly of their interest and offer one concrete next step.' : 'This is the last follow-up: keep it very short, give them an easy yes / not now, no pressure.'} Never repeat earlier messages word for word. Never invent prices, timelines or past clients. ${booking}\nReturn ONLY JSON: {"reply": "..."}`;
+  },
   qualifiedReply(s, q, channel, latest, history) {
+    s = withProfile(s, q);
     const booking = s.BOOKING_LINK ? `If a call is the next step, share this booking link: ${s.BOOKING_LINK}` : 'If a call is the next step, ask for two or three times that suit them, and their time zone.';
     return `${who(s)}\nThis is a QUALIFIED lead: they already said they are interested. Write our next ${channel === 'linkedin' ? 'LinkedIn message (30-90 words, no subject, no signature)' : 'email (40-120 words, no signature)'}.\n\nLead: ${q['Business Name'] || ''} | contact: ${q['Contact Name'] || 'unknown'} | country: ${q.Country || ''}\nService they need: ${q['Service Needed'] || 'not clear yet'}\nBudget: ${q.Budget || 'unknown'} | Timeline: ${q.Timeline || 'unknown'}\nWhat they said before: [[[${q['Their Message'] || ''}]]]\nSummary: ${q.Summary || ''}\nOur team's next step: ${q['Next Step'] || ''}\n` +
       (history ? `What we already sent them: [[[${String(history).slice(-1500)}]]]\n` : '') +
@@ -378,6 +412,8 @@ Return ONLY a JSON object:
 // ---------- mock AI for tests
 function mockAI(prompt) {
   if (prompt.includes('"fit_score": number')) return { fit_score: 7, best_service: 'SEO & AI Search Visibility', website_issues: 'No meta description ; footer shows 2021', pitch_angle: 'More enquiries from Google search', contact_name: '', language: 'English', is_real_business: true };
+  if (prompt.includes('to an interested lead who has gone quiet')) return { reply: 'Hi, just checking in on the website idea we discussed. Would a quick 15-minute call this week help?' };
+  if (prompt.includes('WhatsApp reply from a lead')) return { reply: 'Thanks for your reply! Would a quick 15-minute call this week work for you?', interested: /interest|yes|call|price|cost/i.test(prompt.split('LATEST WhatsApp message')[1] || '') };
   if (prompt.includes('QUALIFIED lead')) return { reply: 'Thanks for your interest. Would a 15-minute call on Tuesday or Wednesday work for you?' };
   if (prompt.includes('A lead replied')) return { category: /interest|yes|call/i.test(prompt.split('Their reply')[1] || '') ? 'interested' : 'question', lead_score: 'Hot', service_needed: 'SEO', summary: 'Wants a call next week', next_step: 'Book a call', reply: 'Thank you, happy to set up a short call. Would Tuesday or Wednesday suit you?' };
   if (prompt.includes('connection_note')) return { fit_score: 8, best_service: 'Performance Marketing', connection_note: 'Hi, I liked your work, would be glad to connect.', first_message: 'Thanks for connecting. One idea that helps businesses like yours is...' };
@@ -413,4 +449,4 @@ async function transcribe(b64, mime) {
   return ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map(p => p.text || '').join('').trim();
 }
 
-module.exports = { setProblemHandler: fn => { onProblem = fn; }, aiProblem: () => (oaOk() ? '' : oaBroken.why), transcribe, gemini, askAI: gemini, currentModel, bestModel, P, clean, fill, leadVars, firstName, AIUnavailable, aiUnavailable, canUse, aiStatus, setDailyLimit, configure, provider, aiName };
+module.exports = { setProfiles, profiles, withProfile, overlay, who, setProblemHandler: fn => { onProblem = fn; }, aiProblem: () => (oaOk() ? '' : oaBroken.why), transcribe, gemini, askAI: gemini, currentModel, bestModel, P, clean, fill, leadVars, firstName, AIUnavailable, aiUnavailable, canUse, aiStatus, setDailyLimit, configure, provider, aiName };

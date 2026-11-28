@@ -25,13 +25,13 @@ const ACTIONS = {
   send_imported: ['Pitch (email) all the leads you imported / gave, straight away, first in line', '{}', true, ['owner', 'leader']],
   send_emails_now: ['Email all waiting leads now (first emails + due follow-ups), up to today\'s limit, from all inboxes', '{}', true, ['owner']],
   email_linkedin_leads: ['Send an email to every LinkedIn lead that has an email address and was not emailed yet ("send mail to all in LinkedIn")', '{}', true, ['owner']],
-  linkedin_connect_now: ['Send LinkedIn connection requests now to the next people in the queue', '{"count": number 1-25}', true, ['owner', 'leader', 'linkedin']],
+  linkedin_connect_now: ['Send LinkedIn connection requests now ("connect all" = everyone waiting, within the limits)', '{"count": number, or "all"}', true, ['owner', 'leader', 'linkedin']],
   find_leads: ['Search for new business leads now (optionally a given industry and city)', '{"industry": "optional", "city": "optional", "count": optional number}', true, ['owner', 'leader']],
   find_linkedin: ['Search for new LinkedIn prospects now (optionally a given industry and city)', '{"industry": "optional", "city": "optional"}', true, ['owner', 'leader']],
   answer_all_replies: ['Answer every client reply that is waiting (AI writes and sends the email answers, and sends the prepared LinkedIn replies)', '{}', true, ['owner']],
-  set_setting: ['Change a setting', `{"key": one of ${JSON.stringify(['DAILY_MAX_LIMIT', 'DAILY_START_LIMIT', 'LEADS_PER_DAY', 'LINKEDIN_CONNECT_PER_DAY', 'LINKEDIN_AUTO_CONNECT', 'TONE', 'SEND_HOURS', 'SEND_PACING', 'REPLY_MODE', 'INDUSTRIES', 'CITIES', 'FOLLOWUP_1_DAYS', 'FOLLOWUP_2_DAYS'])}, "value": "new value"}`, true, ['owner']],
+  set_setting: ['Change a setting', `{"key": one of ${JSON.stringify(['DAILY_MAX_LIMIT', 'DAILY_START_LIMIT', 'EMAIL_WARMUP', 'LEADS_PER_DAY', 'LINKEDIN_CONNECT_PER_DAY', 'LINKEDIN_CONNECT_PER_WEEK', 'LINKEDIN_MESSAGES_PER_DAY', 'WHATSAPP_PER_DAY', 'LINKEDIN_AUTO_CONNECT', 'TONE', 'SEND_HOURS', 'SEND_PACING', 'REPLY_MODE', 'INDUSTRIES', 'CITIES', 'FOLLOWUP_1_DAYS', 'FOLLOWUP_2_DAYS'])}, "value": "new value"}`, true, ['owner']],
 };
-const SETTABLE = { DAILY_MAX_LIMIT: [1, 100], DAILY_START_LIMIT: [1, 100], LEADS_PER_DAY: [0, 1000], LINKEDIN_CONNECT_PER_DAY: [1, 25], FOLLOWUP_1_DAYS: [1, 60], FOLLOWUP_2_DAYS: [1, 90] };
+const SETTABLE = { DAILY_MAX_LIMIT: [1, 500], DAILY_START_LIMIT: [1, 50], WEEKLY_INCREASE: [0, 25], LEADS_PER_DAY: [0, 2000], LINKEDIN_CONNECT_PER_DAY: [1, 100], LINKEDIN_CONNECT_PER_WEEK: [1, 200], LINKEDIN_MESSAGES_PER_DAY: [1, 150], WHATSAPP_PER_DAY: [0, 1000], FOLLOWUP_1_DAYS: [1, 60], FOLLOWUP_2_DAYS: [1, 90] };
 const newId = p => p + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
 const validEmail = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e || '').trim());
 const allowed = (role) => Object.entries(ACTIONS).filter(([, a]) => a[3].includes(role));
@@ -143,7 +143,7 @@ async function act(name, args = {}, user, confirmed = false) {
     }
     case 'linkedin_connect_now': {
       if (!global.liBot) return { text: 'LinkedIn works only in the Windows app on the main PC.' };
-      return { text: await global.liBot.connectBatch(Math.max(1, Math.min(25, Number(args.count) || 10))), page: 'linkedin' };
+      return { text: await global.liBot.connectBatch(/all|every/i.test(String(args.count)) || !args.count ? 'all' : Math.max(1, Math.min(200, Number(args.count) || 10))), page: 'linkedin' };
     }
     case 'find_leads': {
       const o = { force: true, ...(args.industry ? { industry: String(args.industry) } : {}), ...(args.city ? { city: String(args.city) } : {}), ...(args.count ? { max: Math.min(50, Number(args.count) || 25) } : {}) };
@@ -157,7 +157,8 @@ async function act(name, args = {}, user, confirmed = false) {
     }
     case 'answer_all_replies': {
       const s = await store.settings(); let n = 0;
-      for (let i = 0; i < 5; i++) { const k = await engine._internals.answerHeld(s).catch(() => 0); n += k; if (!k) break; }
+      for (let i = 0; i < 5; i++) { const k = await engine._internals.answerHeld(s, { force: true }).catch(() => 0); n += k; if (!k) break; }
+      if (!n && !ai.canUse('reply')) return { text: 'The AI cannot answer right now (its free requests for today are used up or it is busy). Try again later, or answer from the cards below.' };
       const li = global.liBot ? await global.liBot.sendAll(user.name + ' (via Aavo)').catch(e => e.message) : 'LinkedIn replies: only in the Windows app.';
       return { text: `✓ Email replies answered by AI: ${n}.\n✓ LinkedIn: ${li}` };
     }
@@ -166,6 +167,7 @@ async function act(name, args = {}, user, confirmed = false) {
       if (!allowedKeys.includes(key)) return { text: 'I can change: daily email limit, leads per day, LinkedIn requests per day, LinkedIn auto-connect on/off, tone, sending hours, pacing, reply mode, industries, cities, follow-up days.' };
       let v = String(args.value ?? '').trim();
       if (SETTABLE[key]) { const n = Number(v.replace(/[^\d.]/g, '')); if (!(n >= SETTABLE[key][0] && n <= SETTABLE[key][1])) return { text: `${key} must be between ${SETTABLE[key][0]} and ${SETTABLE[key][1]}.` }; v = String(Math.round(n)); }
+      if (key === 'EMAIL_WARMUP') v = /^(no|off|false|0|stop|disable)/i.test(v) ? 'no' : 'yes';
       if (key === 'LINKEDIN_AUTO_CONNECT') v = /^(yes|on|true|1|start|enable)/i.test(v) ? 'yes' : 'no';
       if (key === 'TONE') { const t = ['Warm & friendly', 'Formal & professional', 'Short & direct', 'Consultative expert'].find(x => x.toLowerCase().includes(v.toLowerCase().split(/\s+/)[0])); if (!t) return { text: 'Tone can be: Warm & friendly, Formal & professional, Short & direct, Consultative expert.' }; v = t; }
       if (key === 'SEND_PACING') v = /fast/i.test(v) ? 'fast' : 'even';
@@ -186,7 +188,7 @@ function describe(name, args) {
   if (name === 'send_imported') return 'Pitch all the leads you imported now';
   if (name === 'send_emails_now') return 'Email all waiting leads now';
   if (name === 'email_linkedin_leads') return 'Email every LinkedIn lead that has an email address';
-  if (name === 'linkedin_connect_now') return `Send ${args.count || 10} LinkedIn connection requests now`;
+  if (name === 'linkedin_connect_now') return /all/i.test(String(args.count)) || !args.count ? 'Connect everyone waiting on LinkedIn' : `Send ${args.count} LinkedIn connection requests now`;
   if (name === 'find_leads') return 'Search for new leads now' + (args.industry ? ` (${args.industry}${args.city ? ' in ' + args.city : ''})` : '');
   if (name === 'find_linkedin') return 'Search LinkedIn for new prospects now';
   if (name === 'answer_all_replies') return 'Answer every waiting client reply';
@@ -232,7 +234,7 @@ function fallback(text, history) {
   if (/(pitch|mail|email|send|anuppu).*(import|gave|given|uploaded|my list|my leads|my file|excel|sheet i)|(import|gave|uploaded).*(pitch|mail|email|send)/.test(t)) return { name: 'send_imported', args: {} };
   if (/\bpitch(ing)?\b/.test(t) && !/linkedin/.test(t)) return { name: 'send_emails_now', args: {} };
   if (/(mail|email).*(linkedin)|linkedin.*(mail|email)/.test(t)) return { name: 'email_linkedin_leads', args: {} };
-  if (/connect/.test(t) && /linkedin|people|request|\d/.test(t)) return { name: 'linkedin_connect_now', args: { count: Number((t.match(/\d+/) || [10])[0]) } };
+  if (/connect/.test(t) && /linkedin|people|request|all|every|\d/.test(t)) return { name: 'linkedin_connect_now', args: { count: /\d+/.test(t) ? Number(t.match(/\d+/)[0]) : 'all' } };
   if (/(answer|reply)\s+(to\s+)?(all|every)/.test(t)) return { name: 'answer_all_replies', args: {} };
   if (/(send|mail).*\b(e?mails?)\b|\b(e?mail)\b.*\b(all|every)\b.*\bleads?\b|send all (e)?mails/.test(t) && !/linkedin/.test(t)) return { name: 'send_emails_now', args: {} };
   if (/send all|linkedin.*send|send.*linkedin|linkedin.*message/.test(t)) return { name: 'linkedin_send_all', args: {} };

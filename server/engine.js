@@ -19,13 +19,24 @@ const list = s => String(s || '').split(',').map(x => x.trim()).filter(Boolean);
 const pick = a => a[Math.floor(Math.random() * a.length)];
 const yes = v => ['yes', 'on', 'true', '1'].includes(String(v || '').toLowerCase());
 const validEmail = e => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e || '').trim());
-const signature = s => ['Warm regards,', s.SENDER_NAME, [s.SENDER_TITLE, s.COMPANY].filter(Boolean).join(' | '), [s.WEBSITE, s.COMPANY_ADDRESS].filter(Boolean).join(' | ')].filter(Boolean).join('\n');
+const signature = s => ['Warm regards,', s.SENDER_NAME, [s.SENDER_TITLE, s.COMPANY].filter(Boolean).join(' | '), s.SENDER_LINKEDIN ? 'LinkedIn: ' + s.SENDER_LINKEDIN : '', [s.WEBSITE, s.COMPANY_ADDRESS].filter(Boolean).join(' | ')].filter(Boolean).join('\n');
+// Settings as seen by one inbox: each inbox can have its own sender (name, title, LinkedIn) for the email text, signature and From name
+// the settings for one lead from one inbox: the lead's business profile + that inbox's sender
+const forLead = (s, lead, user) => as(ai.withProfile(s, lead), user);
+function as(s, user) {
+  const a = mail.accounts().find(x => x.user === String(user || '').toLowerCase());
+  if (!a || !(a.senderName || a.senderLinkedIn || a.senderTitle)) return s;
+  return { ...s, SENDER_NAME: a.senderName || s.SENDER_NAME, SENDER_TITLE: a.senderTitle || s.SENDER_TITLE, SENDER_LINKEDIN: a.senderLinkedIn || (a.senderName ? '' : s.SENDER_LINKEDIN) };
+}
 const senderName = s => `${s.SENDER_NAME} | ${s.COMPANY}`;
 
 function dailyLimit(s) {
   const start = toISO(s.START_DATE) || today();
   const weeks = Math.max(0, Math.floor(days(start, today()) / 7));
-  return { started: days(start, today()) >= 0, limit: Math.min(Number(s.DAILY_MAX_LIMIT || 50), Number(s.DAILY_START_LIMIT || 20) + weeks * Number(s.WEEKLY_INCREASE || 10)) };
+  const max = Math.min(500, Number(s.DAILY_MAX_LIMIT || 50)); // 500 a day is Gmail's own limit
+  // warm-up off: the full daily maximum from day one
+  if (String(s.EMAIL_WARMUP || 'yes').toLowerCase() === 'no') return { started: days(start, today()) >= 0, limit: max };
+  return { started: days(start, today()) >= 0, limit: Math.min(max, Number(s.DAILY_START_LIMIT || 20) + weeks * Number(s.WEEKLY_INCREASE || 10)) };
 }
 function sentOn(rows, d) { return rows.filter(r => [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(d)).length; }
 
@@ -54,7 +65,7 @@ function alarm(kind, title, text) {
 // An inbox with a problem is paused and the others take over its emails.
 function pauseInbox(user, hours, reason) {
   const h = state.inboxHealth[user] = state.inboxHealth[user] || {};
-  h.pausedUntil = Date.now() + hours * 3600e3; h.reason = reason; h.fails = 0; persist();
+  h.pausedUntil = Date.now() + hours * 3600e3; h.lastPauseEnd = h.pausedUntil; h.reason = reason; h.fails = 0; persist();
   alarm('inbox', `Inbox paused: ${user}`, `${reason}. Paused for ${hours} hours; the other inboxes send its emails meanwhile.`);
 }
 const inboxPaused = user => ((state.inboxHealth[user] || {}).pausedUntil || 0) > Date.now();
@@ -117,7 +128,18 @@ async function discoverEmail(s, website, domain, fromApify = []) {
   return { email: '', how: '', html: site.html, contactHtml: site.contactHtml };
 }
 
+// ---- business profiles (Products & services page)
+let profTurn = 0;
+async function loadProfiles() { try { ai.setProfiles(await store.read('Profiles')); } catch (e) {} return ai.profiles(); }
+// the profile to find leads for: the one asked for, else the active profiles in turn (none = the base Settings)
+function nextProfile(id) {
+  const all = ai.profiles(); if (id) return all.find(p => p['Profile ID'] === id) || null;
+  const act = all.filter(p => yes(p.Active ?? 'yes')); if (!act.length) return null;
+  return act[(profTurn++) % act.length];
+}
 async function findLeads(s, opts = {}) {
+  const prof = opts.noProfile ? null : nextProfile(opts.profile);
+  if (prof) { s = ai.overlay(s, prof); log('find', `For "${prof.Name}"`); }
   const industries = list(s.INDUSTRIES), cities = list(s.CITIES);
   if (!industries.length || !cities.length) throw new Error('Add industries and cities in Settings.');
   const industry = opts.industry || pick(industries), city = opts.city || pick(cities);
@@ -157,6 +179,7 @@ async function findLeads(s, opts = {}) {
       // every lead with an email is emailed; the fit score only decides the order (best first)
       'Fit Score': fit || heuristicFit(L) || '', Status: email ? 'New' : 'No Email',
       'What They Have': clean(a.what_they_have || '').slice(0, 500) || heuristicHave(L), 'What They Need': clean(a.what_they_need || '').slice(0, 500),
+      Profile: prof ? prof['Profile ID'] : '', ...(sl => ({ Instagram: sl.instagram, Facebook: sl.facebook, 'X / Twitter': sl.x, TikTok: sl.tiktok }))(web.socialLinks(html + ' ' + contact)),
       Quality: email && (fit || heuristicFit(L)) >= Number(s.QUALITY_FIT_SCORE || 7) ? 'yes' : '',
       Notes: [a.language ? 'Site language: ' + a.language : '', found.how && found.how !== 'website' ? `Email ${found.how}` : ''].filter(Boolean).join(' | '),
     });
@@ -204,8 +227,46 @@ async function writeEmail(s, lead, stage) {
   return null;
 }
 
+// The address a bounce notice is about. Taken from the notice's own fields ("wasn't delivered to X", Final-Recipient,
+// X-Failed-Recipients) and never one of our own inboxes (a notice always contains our own address too).
+function failedRecipient(text, own) {
+  const t = String(text || ''), norm = x => String(x || '').toLowerCase().replace(/[.,;:>)\]]+$/, '').replace(/^[<(\[]+/, '');
+  const pats = [/x-failed-recipients:\s*([^\s,;<>]+@[^\s,;<>]+)/i, /final-recipient:\s*rfc822;\s*<?([^\s<>]+@[^\s<>]+)/i, /original-recipient:\s*rfc822;\s*<?([^\s<>]+@[^\s<>]+)/i,
+    /(?:wasn'?t|was not|could ?n[o']t be|not) delivered to\s*<?([^\s<>]+@[^\s<>]+)/i, /(?:delivery to the following recipients? failed[^@]*?|recipient address rejected[^@]*?|to these recipients[^@]*?)<?([^\s<>:]+@[^\s<>:]+)/i];
+  for (const p of pats) { const m = t.match(p); if (m && !own.has(norm(m[1]))) return norm(m[1]); }
+  return '';
+}
+
+// "Do not contact" list (Settings / the Don't contact button): exact emails or whole domains
+function blockedBy(s, email) {
+  const e = String(email || '').toLowerCase().trim(), dom = e.split('@')[1] || '';
+  if (!e) return '';
+  for (const raw of String(s.DO_NOT_CONTACT || '').split(/[\n,;]+/)) {
+    const x = raw.trim().toLowerCase().replace(/^@/, ''); if (!x) continue;
+    if (x.includes('@') ? x === e : (dom === x || dom.endsWith('.' + x))) return x;
+  }
+  return '';
+}
+
+// Addresses that often bounce: only guessed (info@ their domain), placeholders, image names, system senders.
+// Bounces above about 5% make Gmail block the inbox, so these leads go to Call / WhatsApp instead.
+function doubtfulEmail(email, lead, s) {
+  const e = String(email || '').toLowerCase().trim(), [local = '', domain = ''] = e.split('@');
+  if (mail.accounts().some(a => a.user === e)) return 'this is one of your own sending inboxes';
+  if (!yes(s.GUESS_EMAILS ?? 'no') && /guessed \(info@/i.test(String(lead.Notes || ''))) return 'the email was only guessed (info@ their domain), not found anywhere';
+  if (/\.(png|jpe?g|gif|webp|svg|css|js)$/.test(e) || /@\d+x\./.test(e)) return 'not a real address (image or file name)';
+  if (/^(example|test|email|name|yourname|your\.?name|user|username|first\.?last|john\.?doe|someone|abc|xyz)$/.test(local) || /(^|\.)(example|domain|yourdomain|email|test|sentry|wixpress|sentry-next)\.(com|io|net|org)$/.test(domain)) return 'placeholder address';
+  if (/^(no-?reply|do-?not-?reply|mailer-daemon|postmaster|bounce|abuse)(\b|$)/.test(local)) return 'system address that nobody reads';
+  return '';
+}
+
 // Warm-up limit of one inbox: the main Gmail counts from START_DATE, an extra inbox from the day it was added
-function inboxLimit(s, a) { return dailyLimit({ ...s, START_DATE: a.main ? s.START_DATE : (a.added || today()) }); }
+function inboxLimit(s, a) {
+  const o = { ...s, START_DATE: a.main ? s.START_DATE : (a.added || today()) };
+  if (Number(a.perDay) > 0) o.DAILY_MAX_LIMIT = String(a.perDay); // this inbox's own daily limit
+  if (a.warmup) o.EMAIL_WARMUP = a.warmup; // 'no' = old account, full limit from day one
+  return dailyLimit(o);
+}
 const sentFrom = (r, main) => String(r['Sent From'] || main || '').toLowerCase();
 const mxCache = new Map();
 async function domainTakesMail(email) {
@@ -226,25 +287,41 @@ async function sendEmails(s, opts = {}) {
   const rows = await store.read('Raw Leads', true);
   const day = today(), even = String(s.SEND_PACING || 'even').toLowerCase() !== 'fast';
   const elapsed = isNaN(h1) || isNaN(h2) ? 1 : Math.min(1, Math.max(0, (istMinutes() - h1 * 60) / ((h2 - h1) * 60)));
-  const cap = {}, info = [];
-  let total = 0, limitAll = 0;
+  const cap = {}, info = [], rem = {};
+  let total = 0, limitAll = 0, doneAll = 0;
+  const oneByOne = String(s.SEND_ORDER || 'spread').toLowerCase() === 'one-by-one';
   for (const a of accs) {
-    if (inboxPaused(a.user)) { cap[a.user] = 0; info.push(`${a.user.split('@')[0]} paused`); continue; }
+    if (inboxPaused(a.user)) { cap[a.user] = 0; rem[a.user] = 0; info.push(`${a.user.split('@')[0]} paused`); continue; }
     const { started, limit } = inboxLimit(s, a);
     const done = rows.filter(r => sentFrom(r, main) === a.user && [r['Pitched On'], r['Follow-up 1 On'], r['Follow-up 2 On']].map(String).includes(day)).length;
     let allowed = started ? limit - done : 0;
+    rem[a.user] = Math.max(0, allowed); doneAll += done;
     if (!opts.force && !opts.imports && even) allowed = Math.min(allowed, Math.ceil(limit * elapsed) + 1 - done);
     if (!opts.force && !opts.imports) allowed = Math.min(allowed, 1);
     cap[a.user] = Math.max(0, allowed); limitAll += started ? limit : 0;
     info.push(`${a.user.split('@')[0]} ${done}/${started ? limit : 0}`);
   }
+  // one by one: the first inbox sends until its daily limit is used, then the next one takes over, and so on.
+  // The day's total is still spread over the sending hours (a few emails every 5 minutes).
+  let leftRun = 0;
+  if (oneByOne) {
+    for (const u of Object.keys(cap)) cap[u] = rem[u];
+    leftRun = Object.values(rem).reduce((x, y) => x + y, 0);
+    if (!opts.force && !opts.imports) { if (even) leftRun = Math.min(leftRun, Math.ceil(limitAll * elapsed) + 1 - doneAll); leftRun = Math.min(leftRun, 6); }
+    if (opts.max) leftRun = Math.min(leftRun, opts.max);
+    leftRun = Math.max(0, leftRun); total = leftRun;
+  } else {
   if (opts.max) { let left = opts.max; for (const u of Object.keys(cap)) { cap[u] = Math.min(cap[u], left); left -= cap[u]; } }
   for (const u of Object.keys(cap)) total += cap[u];
+  }
   if (total <= 0) return `Waiting (sent today: ${info.join(', ')})`;
   const f1 = Number(s.FOLLOWUP_1_DAYS || 3), f2 = Number(s.FOLLOWUP_2_DAYS || 7);
   const due = [];
-  for (const r of opts.imports ? [] : rows) {
+  const only = opts.ids ? new Set(opts.ids) : null;
+  const dncFix = [];
+  for (const r of opts.imports || only ? [] : rows) {
     if (!validEmail(r.Email) || !r['Message ID'] || !r['Pitched On']) continue;
+    if (['Pitched', 'Follow-up 1'].includes(r.Status) && blockedBy(s, r.Email)) { dncFix.push({ key: r['Lead ID'], set: { Status: 'Do Not Contact' } }); continue; }
     const age = days(r['Pitched On'], day);
     if (r.Status === 'Pitched' && age >= f1) due.push({ lead: r, stage: 1 });
     // follow-up 2: f2 days after the first email AND a few days after follow-up 1 (never two follow-ups in a row when one went out late)
@@ -254,22 +331,38 @@ async function sendEmails(s, opts = {}) {
   const retry = r => r.Status === 'Send Failed' && !r['Pitched On'] && /Gemini|ChatGPT|fetch failed|AI /i.test(String(r.Notes || '').split(' | ').pop());
   const waiting = r => r.Status === 'New' || r.Status === 'Low Fit' || retry(r); // low-fit leads are emailed too, just after the best ones
   const contacted = new Set(rows.filter(r => r.Status && !waiting(r)).map(r => String(r.Email || '').toLowerCase().trim()));
-  const fresh = [];
+  const fresh = [], doubtFix = [];
   // your imported leads always go first, then the best-fitting ones
   const imported = r => /^Import/i.test(String(r.Source || ''));
-  for (const r of rows.filter(r => waiting(r) && validEmail(r.Email) && (!opts.imports || imported(r))).sort((a, b) => (imported(b) - imported(a)) || Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0))) {
-    const e = String(r.Email).toLowerCase().trim(); if (contacted.has(e)) continue; contacted.add(e); fresh.push({ lead: r, stage: 0 });
+  for (const r of rows.filter(r => waiting(r) && validEmail(r.Email) && (!opts.imports || imported(r)) && (!only || only.has(r['Lead ID']))).sort((a, b) => (imported(b) - imported(a)) || Number(b['Fit Score'] || 0) - Number(a['Fit Score'] || 0))) {
+    const e = String(r.Email).toLowerCase().trim(); if (contacted.has(e)) continue; contacted.add(e);
+    if (blockedBy(s, e)) { dncFix.push({ key: r['Lead ID'], set: { Status: 'Do Not Contact', Notes: [r.Notes, `${day}: on the Do not contact list`].filter(Boolean).join(' | ').slice(-1500) } }); continue; }
+    const why = doubtfulEmail(e, r, s); if (why) { doubtFix.push({ key: r['Lead ID'], set: { Status: 'No Email', Notes: [r.Notes, `${day}: not emailed - ${why}`].filter(Boolean).join(' | ').slice(-1500) } }); continue; } // never takes a sending slot
+    fresh.push({ lead: r, stage: 0 });
   }
+  if (dncFix.length) { await store.update('Raw Leads', 'Lead ID', dncFix).catch(() => {}); log('send', `${dncFix.length} lead(s) skipped: on the Do not contact list`); }
+  if (doubtFix.length) { await store.update('Raw Leads', 'Lead ID', doubtFix).catch(() => {}); log('send', `${doubtFix.length} lead(s) not emailed (guessed, doubtful or our own address) - moved to Call / WhatsApp`, 'warn'); }
   // follow-ups go out from the inbox that sent the first email (same thread); new pitches from the inbox with most room left
   const jobs = [];
+  if (oneByOne) {
+    for (const j of due) { if (leftRun <= 0) break; const u = accs.some(a => a.user === sentFrom(j.lead, main)) ? sentFrom(j.lead, main) : main; if (cap[u] > 0) { cap[u]--; leftRun--; jobs.push({ ...j, from: u }); } }
+    for (const j of fresh) { if (leftRun <= 0) break; const u = Object.keys(cap).find(x => cap[x] > 0); if (!u) break; cap[u]--; leftRun--; jobs.push({ ...j, from: u }); } // first inbox with room left, in order
+  } else {
   for (const j of due) { const u = accs.some(a => a.user === sentFrom(j.lead, main)) ? sentFrom(j.lead, main) : main; if (cap[u] > 0) { cap[u]--; jobs.push({ ...j, from: u }); } }
   for (const j of fresh) { const u = Object.keys(cap).sort((a, b) => cap[b] - cap[a])[0]; if (!u || cap[u] <= 0) break; cap[u]--; jobs.push({ ...j, from: u }); }
+  }
   let sent = 0;
   if (jobs.length) log('send', `Emailing ${jobs.length} lead(s) now (${due.length} follow-ups due, ${fresh.length} new waiting; sent today: ${info.join(', ')})`);
   for (const [i, { lead, stage, from }] of jobs.entries()) {
     if (!yes((await store.settings()).AGENT_ON)) { log('send', 'Agent switched off, stopping'); break; }
     const to = String(lead.Email).trim();
     // check the address can receive email before using a send (bounces hurt the inbox's reputation)
+    const doubt = stage === 0 && doubtfulEmail(to, lead, s);
+    if (doubt) {
+      log('send', `Not emailing ${lead['Business Name']}: ${doubt} (moved to Call / WhatsApp)`, 'warn');
+      await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'No Email', Notes: [lead.Notes, `${day}: not emailed - ${doubt}`].filter(Boolean).join(' | ').slice(-1500) } }]).catch(() => {});
+      continue;
+    }
     if (stage === 0 && !(await domainTakesMail(to))) {
       log('send', `Skipped ${lead['Business Name']}: ${to.split('@')[1]} cannot receive email`, 'warn');
       await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Bad Email', Notes: [lead.Notes, `${day}: ${to.split('@')[1]} has no mail server`].filter(Boolean).join(' | ') } }]).catch(() => {});
@@ -277,20 +370,21 @@ async function sendEmails(s, opts = {}) {
     }
     log('send', `${i + 1}/${jobs.length}: writing ${['first email', 'follow-up 1', 'follow-up 2'][stage]} for ${lead['Business Name']}`);
     let e;
-    try { e = await writeEmail(s, lead, stage); } catch (err) {
+    const sx = forLead(s, lead, from);
+    try { e = await writeEmail(sx, lead, stage); } catch (err) {
       if (aiUnavailable(err)) { log('send', `Waiting for the AI before emailing more leads: ${err.message}`, 'warn'); break; } // lead stays as it is and is tried next run
       log('send', `Could not write an email for ${lead['Business Name']}: ${err.message}, will retry later`, 'warn'); continue;
     }
     if (!e) { log('send', `AI could not write an email for ${lead['Business Name']}, will retry later`, 'warn'); continue; }
     if (e.noAI) log('send', `AI not available, using the "${e.tpl.Name || 'template'}" email for ${lead['Business Name']}`, 'warn');
     try {
-      const text = e.body + '\n\n' + signature(s);
+      const text = e.body + '\n\n' + signature(sx);
       if (stage === 0) {
-        const r = await mail.send({ to, from, subject: e.subject || ('quick idea for ' + lead['Business Name']), text, fromName: senderName(s) });
+        const r = await mail.send({ to, from, subject: e.subject || ('quick idea for ' + lead['Business Name']), text, fromName: senderName(sx) });
         await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Pitched', 'Pitched On': day, 'Email Subject': e.subject, 'Message ID': r.messageId, 'Thread ID': r.messageId, 'Template Used': e.tpl ? e.tpl.Name : 'AI', 'Sent From': r.from || from } }]);
       } else {
         const subj = 'Re: ' + String(lead['Email Subject'] || '').replace(/^re:\s*/i, '');
-        await mail.send({ to, from, subject: subj, text, fromName: senderName(s), inReplyTo: lead['Message ID'], references: lead['Message ID'] });
+        await mail.send({ to, from, subject: subj, text, fromName: senderName(sx), inReplyTo: lead['Message ID'], references: lead['Message ID'] });
         const col = stage === 1 ? 'Follow-up 1 On' : 'Follow-up 2 On';
         await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: stage === 1 ? 'Follow-up 1' : 'Follow-up 2', [col]: day } }]);
       }
@@ -304,8 +398,10 @@ async function sendEmails(s, opts = {}) {
       if (other) {
         cap[other]--; if (paused) for (const j of jobs.slice(i + 1)) if (j.from === from && j.stage === 0) j.from = other;
         try {
-          const text = e.body + '\n\n' + signature(s);
-          const r = await mail.send({ to, from: other, subject: e.subject || ('quick idea for ' + lead['Business Name']), text, fromName: senderName(s) });
+          const so = forLead(s, lead, other);
+          if (so.SENDER_NAME !== sx.SENDER_NAME) { const e2 = await writeEmail(so, lead, 0).catch(() => null); if (e2 && e2.body) e = e2; } // the other inbox has its own sender: rewrite in their name
+          const text = e.body + '\n\n' + signature(so);
+          const r = await mail.send({ to, from: other, subject: e.subject || ('quick idea for ' + lead['Business Name']), text, fromName: senderName(so) });
           await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Pitched', 'Pitched On': day, 'Email Subject': e.subject, 'Message ID': r.messageId, 'Thread ID': r.messageId, 'Template Used': e.tpl ? e.tpl.Name : 'AI', 'Sent From': r.from || other } }]);
           sent++; meter.add('mail', 'sent'); log('send', `Switched inbox: pitched ${lead['Business Name']} (${to}) from ${other} instead of ${from}`);
           continue;
@@ -344,6 +440,7 @@ function isAutomatic(m, text) {
   if (m.auto) return true;
   if (/^(no-?reply|do-?not-?reply|donotreply|noreply-|notifications?|notify|mailer|bounces?|alerts?|news(letter)?|marketing|updates?|system|automated?)[@.+_-]/.test(from)) return true;
   const ticket = /type your reply above this line|reply above this line|ticket\s*(#|no\.?|number|id)|request\s*#\s*\d|case\s*#\s*\d|\(#\d{4,}\)|your (ticket|request|case) (has been|was) (received|created)|we('ve| have) received your (message|request|email|enquiry|inquiry)|thanks? (you )?for contacting|this is an automated|automatically generated|do not reply (to )?this|please do not reply|rate (our|your) (support|experience)|feedback on (your )?ticket|how did we do/;
+  if (/no longer (with|at|works? (at|for|with)|employed)|ha(s|ve) (left|moved on from) (the|our) (company|business|organi[sz]ation|team)|your (e-?mail|message) (has been|was|will be) (passed|forwarded|redirected|sent) (on|to)|(this|the) (e-?mail( address)?|mailbox|inbox|account) is (no longer|not) (monitored|in use|active|checked)|is no longer (monitored|in use|active)|please (re)?direct (your|all|future)/.test(t)) return true;
   return ticket.test(t);
 }
 
@@ -374,16 +471,20 @@ async function checkReplies(s) {
     if (!from || mine.has(from)) { done(m); continue; }
     if (/mailer-daemon|postmaster/.test(from)) {
       const low = String(m.text).toLowerCase();
-      const lead = rows.find(r => r.Email && low.includes(String(r.Email).toLowerCase().trim()));
+      const failed = failedRecipient(m.text, mine);
+      const lead = (failed && rows.find(r => String(r.Email || '').toLowerCase().trim() === failed)) || (!failed && rows.find(r => r.Email && !mine.has(String(r.Email).toLowerCase().trim()) && low.includes(String(r.Email).toLowerCase().trim())));
       if (lead) {
         await store.update('Raw Leads', 'Lead ID', [{ key: lead['Lead ID'], set: { Status: 'Bounced', 'Reply Category': 'bounce' } }]); log('replies', `Bounced: ${lead.Email}`); // a bounce is not a reply
         const why = (low.match(/address not found|user unknown|does not exist|no such user|mailbox (unavailable|full|not found)|recipient (address )?rejected|domain not found|message blocked|spam/) || ['not delivered'])[0];
         alarm('bounce', `Email not delivered (${why}): ${lead.Email}`, `${lead['Business Name']}. The lead is marked Bounced and gets no more emails.`);
         // too many bounces hurt the inbox: pause it before Gmail blocks it
-        const inbox = sentFrom(lead, mail.accounts()[0] && mail.accounts()[0].user), week = new Date(Date.now() - 7 * 86400e3).toISOString().slice(0, 10);
-        const mine = rows.filter(r => sentFrom(r, mail.accounts()[0].user) === inbox && String(r['Pitched On']) >= week);
-        const bounced = mine.filter(r => r.Status === 'Bounced' || r['Lead ID'] === lead['Lead ID']).length;
-        if (bounced >= 3 && bounced / Math.max(1, mine.length) > 0.05 && !inboxPaused(inbox)) pauseInbox(inbox, 24, `${bounced} of its last ${mine.length} emails bounced (over 5%) - check the lead emails`);
+        // counted from the last 7 days, or from when its last pause ended: old bounces never pause it again
+        const inbox = sentFrom(lead, mail.accounts()[0] && mail.accounts()[0].user), h = state.inboxHealth[inbox] = state.inboxHealth[inbox] || {};
+        const since = Math.max(Date.now() - 7 * 86400e3, h.lastPauseEnd || 0), sinceDay = new Date(since + 5.5 * 3600e3).toISOString().slice(0, 10);
+        h.bounces = [...(h.bounces || []).filter(t => t > Date.now() - 7 * 86400e3), Date.now()]; persist();
+        const bounced = h.bounces.filter(t => t >= since).length;
+        const mine = rows.filter(r => sentFrom(r, mail.accounts()[0].user) === inbox && String(r['Pitched On']) >= sinceDay).length;
+        if (bounced >= 3 && bounced / Math.max(1, mine) > 0.05 && !inboxPaused(inbox)) pauseInbox(inbox, 24, `${bounced} of its last ${mine} emails bounced (over 5%) - the app now skips guessed and doubtful addresses`);
       } else alarm('bounce', 'An email was not delivered', String(m.subject || '').slice(0, 120));
       done(m); continue;
     }
@@ -403,8 +504,23 @@ async function checkReplies(s) {
       const sr = (await store.read('Replies', true)).find(x => x['Reply ID'] === state.savedReply[m.messageId]);
       if (sr && sr['Answered By']) { done(m); delete state.savedReply[m.messageId]; delete state.firstSeen[m.messageId]; persist(); continue; }
     }
+    {
+      const norm = x => String(x || '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 160);
+      const prev = (await store.read('Replies', true)).filter(x => String(x.From || '').toLowerCase() === from && x['Message ID'] !== m.messageId && Date.now() - new Date(String(x['Received On'] || '').replace(' ', 'T') + ':00Z').getTime() < 48 * 3600e3);
+      const again = prev.some(x => norm(x['Their Message']) === norm(text));
+      const autoAnswered = prev.filter(x => /Agent replied|Draft saved|Holding reply/i.test(x['Reply Status'] || '')).length;
+      if (again || autoAnswered >= 2) {
+        await store.append('Replies', [{ 'Reply ID': newId('R'), 'Received On': new Date(m.date || Date.now()).toISOString().slice(0, 16).replace('T', ' '), 'Lead ID': lead['Lead ID'], 'Business Name': lead['Business Name'],
+          'Contact Name': m.fromName || lead['Contact Name'] || '', From: from, Inbox: m.inbox || '', Subject: m.subject || '', 'Their Message': text.slice(0, 4000),
+          Category: again ? 'automatic' : 'other', Summary: again ? 'The same message again (an auto-responder): not answered, so the agent never loops with a machine' : 'The agent already answered this address twice in 2 days: please answer personally',
+          'Our Reply': '', 'Reply Status': again ? 'Automatic - no reply needed' : 'Please answer personally', 'Message ID': m.messageId || '', References: '' }]).catch(() => {});
+        log('replies', `${lead['Business Name']}: ${again ? 'same message again (auto-responder), not answered' : 'already answered twice in 2 days, left for a person'}`, 'warn');
+        done(m); continue;
+      }
+    }
     const tpls = await templates('Reply to interested lead');
-    const ask = () => gemini(P.reply(s, { lead, subject: m.subject, text }, tpls.length ? pick(tpls) : null), s.GEMINI_MODEL, { priority: 'reply' });
+    const sm = forLead(s, lead, m.inbox);
+    const ask = () => gemini(P.reply(sm, { lead, subject: m.subject, text }, tpls.length ? pick(tpls) : null), s.GEMINI_MODEL, { priority: 'reply' });
     let a, aiFailed = false;
     try { a = (await ask()) || (await ask()); } catch (e) {
       if (aiUnavailable(e)) {
@@ -434,7 +550,7 @@ async function checkReplies(s) {
     const draft = String(s.REPLY_MODE || 'send').toLowerCase() === 'draft';
     let replied = false;
     if (needsReply) {
-      const msg = { to: from, from: m.inbox, subject: 'Re: ' + String(m.subject || '').replace(/^re:\s*/i, ''), text: reply + '\n\n' + signature(s), fromName: senderName(s), inReplyTo: m.messageId, references: [...(m.references || []), m.messageId].join(' ') };
+      const msg = { to: from, from: m.inbox, subject: 'Re: ' + String(m.subject || '').replace(/^re:\s*/i, ''), text: reply + '\n\n' + signature(sm), fromName: senderName(sm), inReplyTo: m.messageId, references: [...(m.references || []), m.messageId].join(' ') };
       try { if (draft) await mail.saveDraft(msg); else await mail.send(msg); replied = true; } catch (e) {
         const tries = state.tries[m.messageId] = (state.tries[m.messageId] || 0) + 1; persist();
         if (tries < 4) { log('replies', `Could not send the reply to ${from}: ${e.message}, will try again`, 'error'); waiting++; continue; } // retried on the next check
@@ -477,11 +593,13 @@ async function aiAnswerFor(s, r, extra = '') {
   const lead = (await store.read('Raw Leads')).find(x => x['Lead ID'] === r['Lead ID']) || { 'Business Name': r['Business Name'], 'Contact Name': r['Contact Name'], Website: '' };
   const tpls = await templates('Reply to interested lead');
   const note = r['Our Reply'] ? `\n(Our earlier message in this thread: [[[${String(r['Our Reply']).slice(-800)}]]]. Do not repeat it; now give the real, helpful answer.)` : '';
-  return gemini(P.reply(s, { lead, subject: r.Subject, text: String(r['Their Message'] || '') + note + extra }, tpls.length ? pick(tpls) : null), s.GEMINI_MODEL, { priority: 'reply' });
+  return gemini(P.reply(as(s, r.Inbox), { lead, subject: r.Subject, text: String(r['Their Message'] || '') + note + extra }, tpls.length ? pick(tpls) : null), s.GEMINI_MODEL, { priority: 'reply' });
 }
-async function answerHeld(s) {
-  if (!yes(s.AI_FOLLOW_UP_HELD ?? 'yes') || !ai.canUse('reply')) return 0;
-  const rows = (await store.read('Replies', true)).filter(r => /Holding reply sent|Not sent - please answer/i.test(r['Reply Status'] || '') && !r['Answered By']);
+async function answerHeld(s, opts = {}) {
+  if ((!opts.force && !yes(s.AI_FOLLOW_UP_HELD ?? 'yes')) || !ai.canUse('reply')) return 0;
+  // opts.force = the one-click "Answer all with AI": also replies still marked New for more than 10 minutes
+  const old = r => Date.now() - new Date(String(r['Received On'] || '').replace(' ', 'T') + ':00+05:30').getTime() > 10 * 60e3;
+  const rows = (await store.read('Replies', true)).filter(r => (/Holding reply sent|Not sent - please answer/i.test(r['Reply Status'] || '') || (opts.force && /^New - please answer/i.test(r['Reply Status'] || '') && old(r))) && !r['Answered By']);
   const week = new Date(Date.now() - 14 * 86400e3).toISOString().slice(0, 10);
   let n = 0;
   for (const r of rows.filter(r => String(r['Received On']).slice(0, 10) >= week).slice(0, 5)) {
@@ -494,7 +612,7 @@ async function answerHeld(s) {
     const reply = clean((a || {}).reply);
     if (!reply) { await store.update('Replies', 'Reply ID', [{ key: r['Reply ID'], set: { 'Reply Status': 'No reply needed', Category: (a && a.category) || r.Category } }]); continue; }
     const draft = String(s.REPLY_MODE || 'send').toLowerCase() === 'draft';
-    const msg = { to: r.From, from: r.Inbox || undefined, subject: 'Re: ' + String(r.Subject || '').replace(/^re:\s*/i, ''), text: reply + '\n\n' + signature(s), fromName: senderName(s), inReplyTo: r['Message ID'] || undefined, references: r.References || r['Message ID'] || undefined };
+    const msg = { to: r.From, from: r.Inbox || undefined, subject: 'Re: ' + String(r.Subject || '').replace(/^re:\s*/i, ''), text: reply + '\n\n' + signature(as(s, r.Inbox)), fromName: senderName(as(s, r.Inbox)), inReplyTo: r['Message ID'] || undefined, references: r.References || r['Message ID'] || undefined };
     if (draft) await mail.saveDraft(msg); else await mail.send(msg);
     const stamp = new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 16).replace('T', ' ');
     await store.update('Replies', 'Reply ID', [{ key: r['Reply ID'], set: { 'Our Reply': [r['Our Reply'], `[AI, ${stamp}] ${reply}`].filter(Boolean).join('\n\n').slice(0, 8000), 'Reply Status': draft ? 'Draft saved in Gmail' : 'Agent replied', 'Answered By': 'AI', Category: (a && a.category) || r.Category, Summary: (a && a.summary) || r.Summary } }]);
@@ -539,6 +657,7 @@ async function unconfirmQualified(id, by) {
 }
 
 async function upsertQualified(q) {
+  if (!q.Profile) { const src = (await store.read('Raw Leads')).find(x => x['Lead ID'] === q['Lead ID']) || (await store.read('LinkedIn Leads')).find(x => x['Lead ID'] === q['Lead ID']); if (src && src.Profile) q.Profile = src.Profile; }
   const rows = await store.read('Qualified Leads', true);
   if (rows.find(r => r['Lead ID'] === q['Lead ID'])) { const { 'Lead ID': id, ...set } = q; await store.update('Qualified Leads', 'Lead ID', [{ key: id, set }]); }
   else await store.append('Qualified Leads', [q]);
@@ -569,6 +688,8 @@ function linkedinPlain(s, p) {
 }
 
 async function linkedinProspects(s, opts = {}) {
+  const prof = opts.noProfile ? null : nextProfile(opts.profile);
+  if (prof) s = ai.overlay(s, prof);
   const industry = opts.industry || pick(list(s.INDUSTRIES)), city = opts.city || pick(list(s.CITIES));
   // the free web search gives about 10 results a search and no OR: one search per role instead
   const query = web.useApify() ? `site:linkedin.com/in ("founder" OR "co-founder" OR "CEO" OR "owner" OR "managing director") "${industry}" "${city}"`
@@ -588,7 +709,7 @@ async function linkedinProspects(s, opts = {}) {
   const rows = [];
   for (const p of people) {
     const a = await linkedinMessages(s, p);
-    rows.push({ 'Lead ID': newId('LI'), 'Date Found': today(), Name: p.name, Title: p.title, Company: p.company, Industry: industry, Location: city, 'LinkedIn URL': p.url, 'Fit Score': a.fit_score || '', 'Best Service': a.best_service || '', 'Connection Note': clean(a.connection_note).slice(0, 280), 'First Message': clean(a.first_message), Status: 'To Connect', Notes: a.plain ? 'Messages written without AI' : '' });
+    rows.push({ Profile: prof ? prof['Profile ID'] : '', 'Lead ID': newId('LI'), 'Date Found': today(), Name: p.name, Title: p.title, Company: p.company, Industry: industry, Location: city, 'LinkedIn URL': p.url, 'Fit Score': a.fit_score || '', 'Best Service': a.best_service || '', 'Connection Note': clean(a.connection_note).slice(0, 280), 'First Message': clean(a.first_message), Status: 'To Connect', Notes: a.plain ? 'Messages written without AI' : '' });
   }
   await store.append('LinkedIn Leads', rows);
   // also reach them by email: find their company's website and email address, and queue it for pitching
@@ -661,7 +782,7 @@ async function emailLinkedInCompanies(s, rows) {
     const own = personalEmail(r.Name, found.all || []);
     const email = own || found.email;
     const id = newId('L');
-    add.push({ 'Lead ID': id, 'Date Found': today(), Source: 'LinkedIn', 'Business Name': r.Company, Industry: r.Industry, City: r.Location, Website: website, Email: email,
+    add.push({ Profile: r.Profile || '', 'Lead ID': id, 'Date Found': today(), Source: 'LinkedIn', 'Business Name': r.Company, Industry: r.Industry, City: r.Location, Website: website, Email: email,
       'Contact Name': r.Name, LinkedIn: r['LinkedIn URL'], Status: email ? 'New' : 'No Email',
       Notes: [`From LinkedIn: ${r.Name}, ${r.Title}`, found.how && found.how !== 'website' ? `Email ${found.how}` : ''].filter(Boolean).join(' | ') });
     known.set(d, add[add.length - 1]);
@@ -766,6 +887,7 @@ const JOBS = {
   recheck: { name: 'Re-check leads without email + email LinkedIn companies', fn: recheck, every: () => 6 * 3600e3 },
   report: { name: 'Daily report (8:30 PM)', fn: dailyReport, every: null },
   importSend: { name: 'Email imported leads now (starts after every import)', fn: sendImported, every: null },
+  social: { name: 'Scheduled social media posts', fn: s => require('./social').runScheduled(s, (m, l) => log('social', m, l)), every: () => 5 * 60e3 },
 };
 
 // Right after an import: find emails for imported rows that only have a website, then email all imported leads straight away
@@ -785,6 +907,7 @@ async function sendImported(s, opts = {}) {
 const EXCLUSIVE = ['send', 'importSend']; // never two sending runs at once (no lead can be emailed twice)
 
 async function run(id, opts = {}) {
+  if (running[id] && id === 'send' && opts.ids) { const t0 = Date.now(); while (running.send && Date.now() - t0 < 5 * 60e3) await sleep(2000); } // a button press waits for the regular run
   if (running[id]) return 'Already running';
   if (EXCLUSIVE.includes(id)) {
     if (id === 'send' && running.importSend) return 'Imported leads are being emailed right now';
@@ -794,6 +917,7 @@ async function run(id, opts = {}) {
   try {
     const s = await store.settings();
     ai.configure(s);
+    await loadProfiles();
     const msg = await JOBS[id].fn(s, opts);
     state.lastResult[id] = { ok: true, msg, at: new Date().toISOString() };
     return msg;
@@ -842,7 +966,7 @@ async function answerReply(id, text, by) {
   const body = String(text || '').trim();
   if (body.length < 2) throw new Error('Write your answer first.');
   const s = await store.settings();
-  await mail.send({ to: r.From, from: r.Inbox || undefined, subject: 'Re: ' + String(r.Subject || '').replace(/^re:\s*/i, ''), text: body + '\n\n' + signature(s), fromName: senderName(s), inReplyTo: r['Message ID'] || undefined, references: r.References || r['Message ID'] || undefined });
+  await mail.send({ to: r.From, from: r.Inbox || undefined, subject: 'Re: ' + String(r.Subject || '').replace(/^re:\s*/i, ''), text: body + '\n\n' + signature(as(s, r.Inbox)), fromName: senderName(as(s, r.Inbox)), inReplyTo: r['Message ID'] || undefined, references: r.References || r['Message ID'] || undefined });
   const stamp = new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 16).replace('T', ' ');
   await store.update('Replies', 'Reply ID', [{ key: id, set: { 'Our Reply': [r['Our Reply'], `[${by}, ${stamp}] ${body}`].filter(Boolean).join('\n\n').slice(0, 8000), 'Reply Status': 'Answered by ' + by, 'Answered By': by } }]);
   const lead = (await store.read('Raw Leads', true)).find(x => x['Lead ID'] === r['Lead ID']);
@@ -857,7 +981,8 @@ async function draftFor(id) {
   if (!lead) throw new Error('Lead not found');
   const s = await store.settings(), stage = nextStage(lead);
   let e;
-  try { e = await writeEmail(s, lead, stage); } catch (err) { e = null; }
+  const accs0 = mail.accounts(), fromD = lead['Sent From'] || (accs0[0] && accs0[0].user);
+  try { e = await writeEmail(as(s, fromD), lead, stage); } catch (err) { e = null; }
   if (!e) e = fromTemplate({ ...PLAIN[stage], Name: 'Plain' }, leadVars(lead, s), stage);
   const threaded = stage > 0;
   return { subject: threaded ? 'Re: ' + String(lead['Email Subject'] || '').replace(/^re:\s*/i, '') : e.subject, body: e.body, threaded, to: lead.Email || '' };
@@ -879,7 +1004,7 @@ async function emailLead(id, { to, subject, text }, by) {
   const day = today();
   const threaded = !!lead['Message ID'] && to.toLowerCase() === String(lead.Email || '').toLowerCase().trim();
   const subj = String(subject || '').trim() || (threaded ? 'Re: ' + String(lead['Email Subject'] || '').replace(/^re:\s*/i, '') : 'quick idea for ' + lead['Business Name']);
-  const r = await mail.send({ to, from, subject: subj, text: body + '\n\n' + signature(s), fromName: senderName(s), ...(threaded ? { inReplyTo: lead['Message ID'], references: lead['Message ID'] } : {}) });
+  const r = await mail.send({ to, from, subject: subj, text: body + '\n\n' + signature(as(s, from)), fromName: senderName(as(s, from)), ...(threaded ? { inReplyTo: lead['Message ID'], references: lead['Message ID'] } : {}) });
   const set = { Email: to, Notes: [lead.Notes, `${day}: ${by} emailed them from the app`].filter(Boolean).join(' | ').slice(0, 1500) };
   if (!lead['Pitched On']) Object.assign(set, { Status: 'Pitched', 'Pitched On': day, 'Email Subject': subj, 'Message ID': r.messageId, 'Thread ID': r.messageId, 'Template Used': 'Written by ' + by, 'Sent From': r.from || from });
   else if (['New', 'Low Fit', 'No Email', 'Bad Email', 'Send Failed', 'Bounced'].includes(lead.Status)) set.Status = 'Pitched';
@@ -918,7 +1043,7 @@ async function qualifiedReply(id, { channel, text, to }, by) {
     const from = accs.some(a => a.user === prev) ? prev : main;
     const thread = raw && raw['Message ID'] && String(raw.Email || '').toLowerCase().trim() === to.toLowerCase();
     const subject = thread ? 'Re: ' + String(raw['Email Subject'] || '').replace(/^re:\s*/i, '') : `${s.COMPANY} - next steps${q['Service Needed'] ? ' for ' + q['Service Needed'] : ''}`;
-    await mail.send({ to, from, subject, text: body + '\n\n' + signature(s), fromName: senderName(s), ...(thread ? { inReplyTo: raw['Message ID'], references: raw['Message ID'] } : {}) });
+    await mail.send({ to, from, subject, text: body + '\n\n' + signature(as(s, from)), fromName: senderName(as(s, from)), ...(thread ? { inReplyTo: raw['Message ID'], references: raw['Message ID'] } : {}) });
     where = `email to ${to}`;
   } else if (channel === 'linkedin') {
     where = 'LinkedIn';
@@ -960,6 +1085,58 @@ async function markLi(r, channel, body, by) {
   await store.update('LinkedIn Leads', 'Lead ID', [{ key: r['Lead ID'], set }]);
 }
 
+// Follow-up 1 / 2 to an INTERESTED lead who went quiet (Interested leads page): by email when we have their email,
+// otherwise queued on LinkedIn (the account connected to them sends it with "Send all on LinkedIn" / automatically).
+async function interestedFollowUp(id, n, by) {
+  n = Number(n) === 2 ? 2 : 1;
+  const q = await qualifiedLead(id), s = await store.settings();
+  if (q.Stage === 'Qualified') throw new Error('This lead is already qualified.');
+  const li = (await store.read('LinkedIn Leads', true)).find(r => r['Lead ID'] === id || (q.LinkedIn && r['LinkedIn URL'] === q.LinkedIn));
+  const channel = validEmail(q.Email) ? 'email' : li ? 'linkedin' : '';
+  if (!channel) throw new Error('No email address or LinkedIn for this lead. Add their email first.');
+  let text = '';
+  try { const a = await gemini(P.interestedFollowUp(s, q, channel, n, q['Our Replies']), s.GEMINI_MODEL, { priority: 'reply' }); if (a && a.reply) text = clean(a.reply); } catch (e) { if (!aiUnavailable(e)) log('replies', 'AI could not write the follow-up: ' + e.message, 'warn'); }
+  if (!text) { const name = ai.firstName(q['Contact Name']) || 'there'; text = n === 1 ? `Hi ${name}, just following up on your interest${q['Service Needed'] ? ' in ' + q['Service Needed'] : ''}. Would a short 15-minute call this week help? ${s.BOOKING_LINK ? 'You can pick a time here: ' + s.BOOKING_LINK : 'Which day suits you?'}` : `Hi ${name}, one last quick note: shall we set up that short call, or is now not the right time? Either answer is fine.`; }
+  const col = n === 1 ? 'Follow-up 1 On' : 'Follow-up 2 On';
+  if (channel === 'email') {
+    await qualifiedReply(id, { channel: 'email', text, to: q.Email }, by + ` (follow-up ${n})`);
+  } else {
+    await store.update('LinkedIn Leads', 'Lead ID', [{ key: li['Lead ID'], set: { 'Queued Message': text } }]);
+  }
+  await store.update('Qualified Leads', 'Lead ID', [{ key: id, set: { [col]: today() } }]);
+  log('replies', `Follow-up ${n} to interested lead ${q['Business Name'] || q['Contact Name']} ${channel === 'email' ? 'emailed' : 'queued on LinkedIn'} (${by})`);
+  return { channel, text };
+}
+// which interested leads are due: follow-up 1 after 3 quiet days, follow-up 2 four days after follow-up 1
+function interestedDue(rows) {
+  const ago = d => { const t = Date.parse(String(d || '').slice(0, 10)); return isNaN(t) ? 999 : (Date.parse(today()) - t) / 86400e3; };
+  const out = [];
+  for (const q of rows) {
+    if (q.Stage === 'Qualified' || /not interested/i.test(q['Lead Score'] || '')) continue;
+    const quiet = ago(q['Last Contact On'] || q['Date Qualified']);
+    if (!q['Follow-up 1 On'] && quiet >= 3) out.push({ id: q['Lead ID'], n: 1 });
+    else if (q['Follow-up 1 On'] && !q['Follow-up 2 On'] && ago(q['Follow-up 1 On']) >= 4 && quiet >= 4) out.push({ id: q['Lead ID'], n: 2 });
+  }
+  return out;
+}
+let fuJob = { running: false, total: 0, done: 0, failed: 0, last: '' };
+function interestedFollowUpAll(by) {
+  if (fuJob.running) return `Already sending: ${fuJob.done} of ${fuJob.total} done.`;
+  return (async () => {
+    const due = interestedDue(await store.read('Qualified Leads', true));
+    if (!due.length) return 'Nobody is due for a follow-up right now (follow-up 1 goes 3 quiet days after their last contact, follow-up 2 four days after follow-up 1).';
+    fuJob = { running: true, total: due.length, done: 0, failed: 0, last: '' };
+    (async () => {
+      for (const [i, d] of due.entries()) {
+        try { await interestedFollowUp(d.id, d.n, by); fuJob.done++; } catch (e) { fuJob.failed++; log('replies', 'Follow-up skipped: ' + e.message, 'warn'); }
+        if (i < due.length - 1) await sleep(process.env.AAVORAA_MOCK === '1' ? 20 : 20000 + Math.random() * 20000);
+      }
+      fuJob.running = false; fuJob.last = `Sent ${fuJob.done} follow-up(s)${fuJob.failed ? ', ' + fuJob.failed + ' skipped' : ''}.`; log('replies', 'Interested follow-ups: ' + fuJob.last);
+    })();
+    return `Sending ${due.length} follow-up(s) (${due.filter(d => d.n === 1).length} first, ${due.filter(d => d.n === 2).length} second), one every 20-40 seconds. Email ones go now; LinkedIn ones are sent by the LinkedIn account connected to them.`;
+  })();
+}
+
 // Whole conversation with a qualified lead, oldest first: what they wrote (email replies, LinkedIn) and what we sent
 async function qualifiedThread(id) {
   const q = await qualifiedLead(id);
@@ -982,6 +1159,39 @@ async function qualifiedThread(id) {
   return { messages: out, email: q.Email || (li && li.Email) || '', emailHow: li && li['Email Found How'] || '' };
 }
 
+// ---- WhatsApp conversations (Call / WhatsApp page → Replies). WhatsApp does not let apps read your own WhatsApp,
+// so the team pastes what the client wrote; the AI drafts our answer; one click opens WhatsApp with it and saves it here.
+async function waLead(id) { const r = (await store.read('Raw Leads', true)).find(x => x['Lead ID'] === id); if (!r) throw new Error('Lead not found'); return r; }
+async function whatsappDraft(r, latest) {
+  const s = await store.settings();
+  try {
+    const a = await gemini(P.whatsappReply(s, r, r['WhatsApp Chat'] || '', String(latest || '').slice(0, 3000)), s.GEMINI_MODEL, { priority: 'reply' });
+    if (a && a.reply) return { text: clean(a.reply), ai: true, interested: !!a.interested };
+  } catch (e) { if (!aiUnavailable(e)) log('replies', 'AI could not write the WhatsApp answer: ' + e.message, 'warn'); }
+  const name = ai.firstName(r['Contact Name'] || '') || 'there';
+  return { text: `Hi ${name}, thank you for your reply! Would a short 15-minute call this week work for you? ${s.BOOKING_LINK ? 'You can pick a time here: ' + s.BOOKING_LINK : 'Which day and time suit you?'}`, ai: false, interested: false };
+}
+async function whatsappReplyIn(id, text, by) {
+  const r = await waLead(id), body = String(text || '').trim();
+  if (body.length < 1) throw new Error('Paste what they wrote on WhatsApp first.');
+  const chat = [r['WhatsApp Chat'], `[${stampNow()}, them] ${body}`].filter(Boolean).join('\n\n').slice(-8000);
+  const d = await whatsappDraft(r, body);
+  const set = { 'WhatsApp Chat': chat, 'WhatsApp Reply On': today(), 'WhatsApp Suggested': d.text, Notes: [r.Notes, `${today()}: replied on WhatsApp (saved by ${by})`].filter(Boolean).join(' | ').slice(-1500) };
+  if (!r['Call Status']) set['Call Status'] = 'Messaged';
+  if (['New', 'Low Fit', 'Pitched', 'Follow-up 1', 'Follow-up 2', 'No Email', 'Bad Email', 'Bounced', 'Send Failed'].includes(r.Status)) set.Status = 'Replied'; // stops the follow-up emails
+  await store.update('Raw Leads', 'Lead ID', [{ key: id, set }]);
+  log('replies', `${r['Business Name']} replied on WhatsApp - the ${d.ai ? 'AI' : 'app'} prepared an answer`);
+  return { draft: d.text, ai: d.ai, interested: d.interested };
+}
+async function whatsappRedraft(id) { const r = await waLead(id); const last = (String(r['WhatsApp Chat'] || '').split(/\n\n(?=\[)/).reverse().find(m => /^\[[^\]]*, them\]/.test(m)) || '').replace(/^\[[^\]]*\]\s*/, ''); const d = await whatsappDraft(r, last); await store.update('Raw Leads', 'Lead ID', [{ key: id, set: { 'WhatsApp Suggested': d.text } }]); return { draft: d.text, ai: d.ai }; }
+async function whatsappSentOut(id, text, by) {
+  const r = await waLead(id), body = String(text || '').trim();
+  if (body.length < 2) throw new Error('Write the message first.');
+  const chat = [r['WhatsApp Chat'], `[${stampNow()}, us, ${by}] ${body}`].filter(Boolean).join('\n\n').slice(-8000);
+  await store.update('Raw Leads', 'Lead ID', [{ key: id, set: { 'WhatsApp Chat': chat, 'WhatsApp Suggested': '', ...(r['Call Status'] ? {} : { 'Call Status': 'Messaged', 'Called By': by }) } }]);
+  log('replies', `${by} answered ${r['Business Name']} on WhatsApp`);
+}
+
 // Result of a call / WhatsApp message, clicked by a team member on the Call / WhatsApp page
 async function callResult(id, status, note, by) {
   const lead = (await store.read('Raw Leads', true)).find(r => r['Lead ID'] === id);
@@ -1001,4 +1211,4 @@ async function callResult(id, status, note, by) {
       `${by} reached ${lead['Business Name']} by phone / WhatsApp and they are interested.\n\nPhone: ${lead.Phone}\nEmail: ${lead.Email || '-'}\nWebsite: ${lead.Website || '-'}\nNote: ${note || '-'}`);
   }
 }
-module.exports = { confirmQualified, unconfirmQualified, alarms: () => state.alarms, clearAlarms: () => { state.alarms = []; persist(); }, inboxHealth, resumeInbox, foundToday, start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, replyDraft, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, linkedinAnswer, _internals: { heuristicFit, sendProblem, pauseInbox, inboxPaused, alarm, findToTarget, isAutomatic, answerHeld, personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };
+module.exports = { loadProfiles, nextProfile, forLead, interestedFollowUp, interestedFollowUpAll, interestedDue, fuJob: () => fuJob, blockedBy, senderFor: as, signature, failedRecipient, doubtfulEmail, whatsappReplyIn, whatsappRedraft, whatsappSentOut, confirmQualified, unconfirmQualified, alarms: () => state.alarms, clearAlarms: () => { state.alarms = []; persist(); }, inboxHealth, resumeInbox, foundToday, start, run, status, logs, JOBS, dailyLimit, sentOn, today, writeEmail, log, callResult, answerReply, replyDraft, draftFor, emailLead, qualifiedDraft, qualifiedReply, qualifiedThread, syncQualifiedEmail, linkedinAnswer, _internals: { heuristicFit, sendProblem, pauseInbox, inboxPaused, alarm, findToTarget, isAutomatic, answerHeld, personalEmail, knownLinkedInEmail, emailLinkedInCompanies, findLeads, sendEmails, sendImported, checkReplies, linkedinProspects, linkedinFollow, dailyReport, recheck, parseLinkedIn, discoverEmail } };

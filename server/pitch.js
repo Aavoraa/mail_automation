@@ -27,11 +27,11 @@ async function pitchEverything(by) {
   out.push(`✉ Email: pitching ${waiting} waiting lead(s)${imported ? ` (your ${imported} imported leads first)` : ''} + follow-ups due, one by one from your inboxes, up to today's limit`);
   // LinkedIn: connection requests up to today's safe limit + every prepared message (first messages, AI replies)
   if (global.liBot) {
-    const c = await global.liBot.connectBatch(25).catch(e => e.message);
+    const c = await global.liBot.connectBatch('all').catch(e => e.message);
     const m = await global.liBot.sendAll(by + ' (pitch everything)').catch(e => e.message);
     out.push('in LinkedIn: ' + String(c).replace(/^✓\s*/, '') + ' ' + String(m));
   } else out.push('in LinkedIn: runs only in the Windows app on the main PC');
-  out.push(whatsapp.ready() ? `🟢 WhatsApp: sending your approved template to leads (${String(s.WHATSAPP_PITCH_TO || 'interested') === 'all' ? 'all with a phone number' : 'who showed interest'}), up to ${s.WHATSAPP_PER_DAY || 50} today` : '🟢 WhatsApp: not connected yet, so it stays manual (Call / WhatsApp page: one click opens WhatsApp with the message ready). Connect the official WhatsApp Cloud API on the Connections page to send automatically.');
+  out.push(whatsapp.ready() ? `🟢 WhatsApp: sending your approved template to leads (${String(s.WHATSAPP_PITCH_TO || 'interested') === 'all' ? 'all with a phone number' : 'who showed interest'}), up to ${(Number(s.WHATSAPP_PER_DAY) || 50) * whatsapp.numbers().length} today across ${whatsapp.numbers().length} number${whatsapp.numbers().length > 1 ? 's' : ''} (switches to the next number when one is full)` : '🟢 WhatsApp: not connected yet, so it stays manual (Call / WhatsApp page: one click opens WhatsApp with the message ready). Connect the official WhatsApp Cloud API on the Connections page to send automatically.');
   return { running: true, text: '⚡ Pitching everything now:\n• ' + out.join('\n• ') + '\nProgress shows in Agent activity.' };
 }
 module.exports = { pitchEverything, status: () => job };

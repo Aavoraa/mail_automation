@@ -21,26 +21,70 @@ function normalize(phone, country) {
   d = d.replace(/^0+/, '');
   return d.length >= 7 ? code + d : '';
 }
-const ready = () => !!(config.get().waToken && config.get().waPhoneId);
-async function api(path, body) {
-  const c = config.get();
-  const r = await fetch('https://graph.facebook.com/v21.0/' + path, { method: body ? 'POST' : 'GET', headers: { Authorization: 'Bearer ' + c.waToken, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(30000) });
+// ---- several WhatsApp numbers: the main one (Connections) + extra numbers. Each has its own daily amount;
+// when one is full for the day or has a problem (Meta limit, restricted, token expired), the next one takes over.
+const fs = require('fs');
+const path = require('path');
+const HFILE = path.join(config.dir, 'whatsapp-numbers.json');
+let health = {}; try { health = JSON.parse(fs.readFileSync(HFILE, 'utf8')) || {}; } catch (e) {}
+const saveHealth = () => { try { fs.writeFileSync(HFILE, JSON.stringify(health)); } catch (e) {} };
+function numbers() {
+  const c = config.get(), out = [];
+  if (c.waPhoneId && c.waToken) out.push({ id: String(c.waPhoneId), token: c.waToken, label: c.waLabel || '', main: true, added: '' });
+  for (const x of c.waNumbers || []) {
+    if (!x || !x.id || out.some(o => o.id === String(x.id))) continue;
+    const token = x.token || c.waToken; // numbers in the same Meta business can share one token
+    if (token) out.push({ id: String(x.id), token, label: x.label || '', main: false, added: x.added || '' });
+  }
+  return out;
+}
+const ready = () => numbers().length > 0;
+const isPaused = id => !!(health[id] && health[id].pausedUntil > Date.now());
+function pauseNumber(id, hours, reason) { health[id] = { ...(health[id] || {}), pausedUntil: Date.now() + hours * 3600e3, reason, fails: 0 }; saveHealth(); }
+function resumeNumber(id) { if (health[id]) { health[id].pausedUntil = 0; health[id].fails = 0; saveHealth(); } }
+const nameOf = n => n.label || ('number ID …' + String(n.id).slice(-4));
+
+async function api(p, body, token) {
+  const r = await fetch('https://graph.facebook.com/v21.0/' + p, { method: body ? 'POST' : 'GET', headers: { Authorization: 'Bearer ' + (token || config.get().waToken), 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(30000) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) { const e = j.error || {}; throw Object.assign(new Error('WhatsApp: ' + (e.error_user_msg || e.message || r.status)), { code: e.code }); }
   return j;
 }
-async function test() {
-  if (!ready()) throw new Error('Paste the WhatsApp phone number ID and access token first.');
-  if (process.env.AAVORAA_MOCK === '1') return 'WhatsApp connected (test).';
-  const j = await api(encodeURIComponent(config.get().waPhoneId) + '?fields=display_phone_number,verified_name,quality_rating');
-  return `WhatsApp connected: ${j.verified_name || ''} ${j.display_phone_number || ''} (quality: ${j.quality_rating || 'unknown'}).`;
+// test one number (default: the main one). Returns { msg, label }
+async function testNumber(n) {
+  n = n || numbers()[0];
+  if (!n || !n.id || !n.token) throw new Error('Paste the WhatsApp phone number ID and access token first.');
+  if (process.env.AAVORAA_MOCK === '1') return { msg: 'WhatsApp connected (test).', label: '+00 test ' + String(n.id).slice(-4) };
+  const j = await api(encodeURIComponent(n.id) + '?fields=display_phone_number,verified_name,quality_rating', null, n.token);
+  return { msg: `WhatsApp connected: ${j.verified_name || ''} ${j.display_phone_number || ''} (quality: ${j.quality_rating || 'unknown'}).`, label: j.display_phone_number || '' };
 }
-async function sendTemplate(to, s, name) {
-  if (process.env.AAVORAA_MOCK === '1') { (global.__waSent = global.__waSent || []).push({ to, name }); return { id: 'wamid.mock' }; }
+async function test() {
+  const r = await testNumber();
+  if (r.label && !config.get().waLabel) config.set({ waLabel: r.label });
+  return r.msg;
+}
+async function sendTemplate(to, s, name, n) {
+  n = n || numbers()[0];
+  if (process.env.AAVORAA_MOCK === '1') {
+    const fail = (global.__waFail || {})[n.id]; if (fail) throw Object.assign(new Error('WhatsApp: ' + fail.msg), { code: fail.code });
+    (global.__waSent = global.__waSent || []).push({ to, name, from: n.id }); return { id: 'wamid.mock' };
+  }
   const params = String(s.WHATSAPP_TEMPLATE_PARAMS || 'name').toLowerCase() === 'none' ? [] : [{ type: 'body', parameters: [{ type: 'text', text: String(name || 'there').slice(0, 60) }] }];
-  const j = await api(encodeURIComponent(config.get().waPhoneId) + '/messages', { messaging_product: 'whatsapp', to, type: 'template', template: { name: s.WHATSAPP_TEMPLATE, language: { code: s.WHATSAPP_TEMPLATE_LANG || 'en' }, ...(params.length ? { components: params } : {}) } });
+  const j = await api(encodeURIComponent(n.id) + '/messages', { messaging_product: 'whatsapp', to, type: 'template', template: { name: s.WHATSAPP_TEMPLATE, language: { code: s.WHATSAPP_TEMPLATE_LANG || 'en' }, ...(params.length ? { components: params } : {}) } }, n.token);
   meter.add('mail', 'whatsapp');
   return { id: (j.messages && j.messages[0] && j.messages[0].id) || '' };
+}
+// What a WhatsApp error means for the NUMBER: pause it (and switch to the next) or only skip this one lead
+function numberProblem(n, e) {
+  const c = e.code, m = String(e.message || '');
+  if (c === 190) return pauseNumber(n.id, 6, 'access token expired or wrong'), true;
+  if (c === 131031 || c === 368) return pauseNumber(n.id, 48, 'number restricted or locked by WhatsApp'), true;
+  if (c === 131048 || /spam rate|messaging limit|limit (reached|hit)|tier/i.test(m)) return pauseNumber(n.id, 24, 'WhatsApp sending limit reached'), true;
+  if (c === 130429 || c === 80007 || c === 4) return pauseNumber(n.id, 1, 'too many messages too fast'), true;
+  if ([131056, 131049, 131047, 131026, 131021, 131051].includes(c)) return false; // about this lead only (pair limit, not on WhatsApp, ...)
+  const h = health[n.id] = health[n.id] || {}; h.fails = (h.fails || 0) + 1; saveHealth();
+  if (h.fails >= 3) return pauseNumber(n.id, 2, '3 messages failed in a row: ' + m.slice(0, 100)), true;
+  return false;
 }
 // who gets a WhatsApp pitch: by default only leads that showed interest (WhatsApp's rules: people should expect your message)
 function targets(rows, s) {
@@ -49,27 +93,64 @@ function targets(rows, s) {
     && (mode === 'all' ? true : mode === 'pitched' ? !!r['Pitched On'] : ['Interested', 'Replied'].includes(r.Status)));
 }
 const today = () => new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10);
-async function pitchAll(s, log = () => {}) {
-  if (!ready()) return { sent: 0, skipped: 0, note: 'not set up (Connections → WhatsApp Cloud API). Manual: Call / WhatsApp page.' };
+const perNumber = s => Math.max(0, Math.min(Number(s.WHATSAPP_PER_DAY || 50), 1000));
+const sentFromToday = (rows, nums, id, day) => rows.filter(r => r['WhatsApp Sent On'] === day && String(r['WhatsApp From'] || (nums[0] && nums[0].id)) === id).length;
+// dashboard: every number with today's count, its limit and whether it is paused
+function numberStatus(rows, s) {
+  const nums = numbers(), day = today(), lim = perNumber(s);
+  return nums.map(n => ({ id: n.id, label: nameOf(n), main: n.main, sentToday: sentFromToday(rows, nums, n.id, day), limit: lim, paused: isPaused(n.id), reason: isPaused(n.id) ? health[n.id].reason : '', pausedUntil: isPaused(n.id) ? new Date(health[n.id].pausedUntil).toISOString() : '' }));
+}
+async function pitchAll(s, log = () => {}, opts = {}) {
+  const nums = numbers();
+  if (!nums.length) return { sent: 0, skipped: 0, note: 'not set up (Connections → WhatsApp Cloud API). Manual: Call / WhatsApp page.' };
   if (!String(s.WHATSAPP_TEMPLATE || '').trim()) return { sent: 0, skipped: 0, note: 'no approved message template name in Settings → WhatsApp.' };
-  const rows = await store.read('Raw Leads', true), day = today();
-  const doneToday = rows.filter(r => r['WhatsApp Sent On'] === day).length, cap = Math.max(0, Math.min(Number(s.WHATSAPP_PER_DAY || 50), 250) - doneToday);
-  const list = targets(rows, s).slice(0, cap);
-  let sent = 0, skipped = 0;
+  const rows = await store.read('Raw Leads', true), day = today(), lim = perNumber(s);
+  const cap = {};
+  for (const n of nums) cap[n.id] = isPaused(n.id) ? 0 : Math.max(0, lim - sentFromToday(rows, nums, n.id, day));
+  const total = Object.values(cap).reduce((a, b) => a + b, 0);
+  // opts.ids: exactly these leads (the "To contact" list on the Call / WhatsApp page), in that order
+  const pick0 = opts.ids ? opts.ids.map(id => rows.find(r => r['Lead ID'] === id)).filter(r => r && r.Phone && !r['WhatsApp Sent On'] && !['Do Not Contact', 'Not Interested', 'Bounced'].includes(r.Status) && !['Wrong Number', 'Not Interested'].includes(r['Call Status'])) : targets(rows, s);
+  const list = pick0.slice(0, total);
+  let sent = 0, skipped = 0, stopped = '';
+  const pick = () => nums.filter(n => cap[n.id] > 0 && !isPaused(n.id)).sort((a, b) => cap[b.id] - cap[a.id])[0];
   for (const r of list) {
     const to = normalize(r.Phone, r.Country);
-    if (!to) { skipped++; continue; }
-    try {
-      await sendTemplate(to, s, r['Contact Name'] || r['Business Name']);
-      sent++;
-      await store.update('Raw Leads', 'Lead ID', [{ key: r['Lead ID'], set: { 'WhatsApp Sent On': day, 'Call Status': 'Messaged', 'Called By': 'WhatsApp (auto)', Notes: [r.Notes, `${day}: WhatsApp pitch sent (template ${s.WHATSAPP_TEMPLATE})`].filter(Boolean).join(' | ').slice(0, 1500) } }]);
-    } catch (e) {
-      log(`WhatsApp to ${r['Business Name']}: ${e.message}`);
-      if ([190, 131031, 131048, 131056, 368].includes(e.code)) return { sent, skipped, note: 'stopped: ' + e.message };
-      skipped++;
+    if (!to) { skipped++; if (opts.onSkip) opts.onSkip(r); continue; }
+    let done = false;
+    while (!done) {
+      const n = pick();
+      if (!n) { stopped = 'every WhatsApp number is full for today or paused'; break; }
+      try {
+        await sendTemplate(to, s, r['Contact Name'] || r['Business Name'], n);
+        cap[n.id]--; sent++; done = true; if (opts.onSent) opts.onSent(r);
+        if (health[n.id] && health[n.id].fails) { health[n.id].fails = 0; saveHealth(); }
+        await store.update('Raw Leads', 'Lead ID', [{ key: r['Lead ID'], set: { 'WhatsApp Sent On': day, 'WhatsApp From': n.id, 'Call Status': 'Messaged', 'Called By': 'WhatsApp (auto)', Notes: [r.Notes, `${day}: WhatsApp pitch sent from ${nameOf(n)} (template ${s.WHATSAPP_TEMPLATE})`].filter(Boolean).join(' | ').slice(0, 1500) } }]);
+      } catch (e) {
+        log(`WhatsApp to ${r['Business Name']} from ${nameOf(n)}: ${e.message}`);
+        if (numberProblem(n, e)) { cap[n.id] = 0; log(`WhatsApp ${nameOf(n)} paused (${health[n.id].reason}). Switching to the next number.`); continue; } // same lead, next number
+        skipped++; done = true; if (opts.onSkip) opts.onSkip(r);
+      }
     }
+    if (stopped) break;
     await new Promise(res => setTimeout(res, process.env.AAVORAA_MOCK === '1' ? 10 : 4000 + Math.random() * 5000));
   }
-  return { sent, skipped, note: list.length ? '' : (cap ? 'nobody to message (only leads that showed interest, see Settings → WhatsApp)' : 'today\'s WhatsApp limit is reached') };
+  const note = stopped ? 'stopped: ' + stopped : list.length ? '' : (total ? 'nobody to message (only leads that showed interest, see Settings → WhatsApp)' : 'today\'s WhatsApp limit is reached on every number');
+  return { sent, skipped, note, numbers: nums.length };
 }
-module.exports = { ready, test, pitchAll, normalize, targets };
+// One click on Call / WhatsApp: pitch every lead in the "To contact" list, in the background
+let job = { running: false, total: 0, done: 0, skipped: 0, last: '' };
+const canAuto = s => ready() && !!String(s.WHATSAPP_TEMPLATE || '').trim();
+function pitchList(ids, s, log = () => {}) {
+  if (job.running) return `Already sending: ${job.done} of ${job.total} done.`;
+  if (!ready()) throw new Error('Connect the official WhatsApp Cloud API first (Connections page).');
+  if (!String(s.WHATSAPP_TEMPLATE || '').trim()) throw new Error('Add the name of your approved WhatsApp message template first (Settings → WhatsApp).');
+  if (!ids.length) return 'Nobody to message right now.';
+  job = { running: true, total: ids.length, done: 0, skipped: 0, last: '' };
+  (async () => {
+    try { const r = await pitchAll(s, log, { ids, onSent: () => job.done++, onSkip: () => job.skipped++ }); job.last = `Sent ${r.sent} WhatsApp pitch(es)${r.skipped ? ', ' + r.skipped + ' skipped (no usable number)' : ''}${r.note ? ' - ' + r.note : ''}.`; const left = ids.length - r.sent - r.skipped; if (left > 0) job.last += ` ${left} more wait for tomorrow (daily limit per number; add another WhatsApp number to send more a day).`; }
+    catch (e) { job.last = 'Stopped: ' + e.message; }
+    job.running = false; log('Pitch all (Call / WhatsApp): ' + job.last);
+  })();
+  return `Sending the WhatsApp pitch to ${ids.length} lead(s) in the background, one every few seconds, within each number's daily limit. Progress shows on this page.`;
+}
+module.exports = { canAuto, pitchList, job: () => job, ready, test, testNumber, pitchAll, normalize, targets, numbers, numberStatus, resumeNumber, pauseNumber, perNumber };

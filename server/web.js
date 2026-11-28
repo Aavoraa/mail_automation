@@ -118,6 +118,18 @@ function contactUrl(website, html) {
   try { if (href && !/^mailto:|^tel:/i.test(href)) return new URL(href, website).href; } catch (e) {}
   return website.replace(/\/$/, '') + '/contact';
 }
+// Instagram / Facebook / X / TikTok profiles linked from a business website (for one-click social DMs)
+function socialLinks(html) {
+  const h = String(html || ''), get = re => { const m = h.match(re); return m ? m[0].replace(/[\/?#]+$/, '') : ''; };
+  const bad = /\/(sharer|share|intent|plugins|dialog|tr|p|reel|stories|explore|hashtag|search|home|watch|events|groups|photo|login)(\b|\/|\.php)/i;
+  const pick = re => { const all = h.match(new RegExp(re.source, 'gi')) || []; return (all.find(u => !bad.test(u)) || '').replace(/[\/?#]+$/, ''); };
+  return {
+    instagram: pick(/https?:\/\/(?:www\.)?instagram\.com\/[A-Za-z0-9_.]{2,30}\/?/),
+    facebook: pick(/https?:\/\/(?:www\.|m\.|web\.)?(?:facebook|fb)\.com\/[A-Za-z0-9_.\-]{3,60}\/?/),
+    x: pick(/https?:\/\/(?:www\.)?(?:twitter|x)\.com\/[A-Za-z0-9_]{2,15}\/?/),
+    tiktok: pick(/https?:\/\/(?:www\.)?tiktok\.com\/@[A-Za-z0-9_.]{2,30}\/?/),
+  };
+}
 function linkedinIn(html) { return (String(html).match(/https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/(?:company|in)\/[A-Za-z0-9_\-%.]+/i) || [''])[0]; }
 function bestEmail(all, domain) {
   const pref = ['info', 'contact', 'hello', 'sales', 'office', 'enquiries', 'enquiry', 'admin', 'team', 'marketing', 'support'];
@@ -138,4 +150,4 @@ function mockApify(actor, input = {}) {
   return [{ organicResults: [{ url: 'https://www.linkedin.com/in/jane-demo-' + Math.floor(Math.random() * 1e6), title: 'Jane Demo - Founder - Demo Interiors | LinkedIn', description: 'Founder at Demo Interiors, Dubai' }] }];
 }
 
-module.exports = { useApify, mapsSearch, googleSearch, getHtml, emailsFrom, findEmails, guessEmail, hasMx, decodeCf, strip, domainOf, checkSite, contactUrl, linkedinIn, bestEmail };
+module.exports = { socialLinks, useApify, mapsSearch, googleSearch, getHtml, emailsFrom, findEmails, guessEmail, hasMx, decodeCf, strip, domainOf, checkSite, contactUrl, linkedinIn, bestEmail };

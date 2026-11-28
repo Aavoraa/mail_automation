@@ -13,9 +13,10 @@ const clean = p => String(p || '').replace(/\s+/g, '');
 // [{ user, pass, added, main }] - the main Gmail first, then extra inboxes
 function accounts() {
   const c = config.get();
-  const out = c.gmailUser ? [{ user: String(c.gmailUser).toLowerCase(), pass: c.gmailAppPassword, added: '', main: true }] : [];
+  // perDay / warmup: this inbox's own daily limit (an old, trusted account can send more and needs no warm-up)
+  const out = c.gmailUser ? [{ user: String(c.gmailUser).toLowerCase(), pass: c.gmailAppPassword, added: '', main: true, perDay: Number(c.mainPerDay) || 0, warmup: c.mainWarmup || '', senderName: c.mainSenderName || '', senderTitle: c.mainSenderTitle || '', senderLinkedIn: c.mainSenderLinkedIn || '' }] : [];
   if (!out.length && MOCK) out.push({ user: 'agent@aavoraa.test', pass: 'x', added: '', main: true }); // tests
-  for (const x of c.extraInboxes || []) if (x && x.user && !out.some(o => o.user === String(x.user).toLowerCase())) out.push({ user: String(x.user).toLowerCase(), pass: x.pass, added: x.added || '', main: false });
+  for (const x of c.extraInboxes || []) if (x && x.user && !out.some(o => o.user === String(x.user).toLowerCase())) out.push({ user: String(x.user).toLowerCase(), pass: x.pass, added: x.added || '', main: false, perDay: Number(x.perDay) || 0, warmup: x.warmup || '', senderName: x.senderName || '', senderTitle: x.senderTitle || '', senderLinkedIn: x.senderLinkedIn || '' });
   return out;
 }
 const account = user => { const all = accounts(); return all.find(a => a.user === String(user || '').toLowerCase()) || all[0]; };
